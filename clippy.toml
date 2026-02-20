@@ -1,0 +1,6 @@
+disallowed-methods = [
+  { path = "str::split_whitespace", reason = "Do not parse SQL text to decide runtime behavior; use prepared-statement metadata from PostgreSQL." },
+]
+disallowed-macros = [
+  { path = "std::eprintln", reason = "Protocol/diagnostic runtime events must stay on stdout as structured outputs (code:error/code:log)." },
+]

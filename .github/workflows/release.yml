@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            ARCHIVE="afpsql-${TAG}-${{ matrix.target }}.zip"
+            cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" afpsql.exe && cd -
+          else
+            ARCHIVE="afpsql-${TAG}-${{ matrix.target }}.tar.gz"
+            tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        shell: bash
+        run: gh release upload "$TAG" "$ARCHIVE" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: cmnspore/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Compute sha256 and update formula
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE="https://github.com/cmnspore/agent-first-psql/releases/download/${TAG}"
+
+          SHA_AARCH64=$(curl -fsSL "${BASE}/afpsql-${TAG}-aarch64-apple-darwin.tar.gz" | sha256sum | awk '{print $1}')
+          SHA_X86_DARWIN=$(curl -fsSL "${BASE}/afpsql-${TAG}-x86_64-apple-darwin.tar.gz" | sha256sum | awk '{print $1}')
+          SHA_X86_LINUX=$(curl -fsSL "${BASE}/afpsql-${TAG}-x86_64-unknown-linux-gnu.tar.gz" | sha256sum | awk '{print $1}')
+
+          python3 - "$VERSION" "$TAG" "$BASE" "$SHA_AARCH64" "$SHA_X86_DARWIN" "$SHA_X86_LINUX" <<'PYEOF'
+          import sys, os
+          version, tag, base, sha_aarch64, sha_x86_darwin, sha_x86_linux = sys.argv[1:7]
+          ruby_bin = "#{bin}"
+          formula = f"""class Afpsql < Formula
+            desc "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out"
+            homepage "https://github.com/cmnspore/agent-first-psql"
+            version "{version}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "{base}/afpsql-{tag}-aarch64-apple-darwin.tar.gz"
+                sha256 "{sha_aarch64}"
+              end
+              on_intel do
+                url "{base}/afpsql-{tag}-x86_64-apple-darwin.tar.gz"
+                sha256 "{sha_x86_darwin}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "{base}/afpsql-{tag}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "{sha_x86_linux}"
+              end
+            end
+
+            def install
+              bin.install "afpsql"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("{ruby_bin}/afpsql --version")
+            end
+          end
+          """
+          os.makedirs("Formula", exist_ok=True)
+          with open("Formula/afpsql.rb", "w") as f:
+              f.write(formula)
+          print(f"Updated Formula/afpsql.rb to {version}")
+          PYEOF
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/afpsql.rb
+          git diff --cached --quiet || git commit -m "afpsql $TAG"
+          git push
+
+  update-scoop:
+    name: Update Scoop bucket
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout bucket
+        uses: actions/checkout@v4
+        with:
+          repository: cmnspore/scoop-bucket
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Compute sha256 and update manifest
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          BASE="https://github.com/cmnspore/agent-first-psql/releases/download/${TAG}"
+          ARCHIVE="afpsql-${TAG}-x86_64-pc-windows-msvc.zip"
+
+          SHA=$(curl -fsSL "${BASE}/${ARCHIVE}" | sha256sum | awk '{print $1}')
+
+          python3 - "$VERSION" "$TAG" "$BASE" "$ARCHIVE" "$SHA" <<'PYEOF'
+          import sys, json, os
+          version, tag, base, archive, sha = sys.argv[1:6]
+          manifest = {
+            "version": version,
+            "description": "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out",
+            "homepage": "https://github.com/cmnspore/agent-first-psql",
+            "license": "MIT",
+            "url": f"{base}/{archive}",
+            "hash": sha,
+            "bin": "afpsql.exe"
+          }
+          os.makedirs("bucket", exist_ok=True)
+          with open("bucket/afpsql.json", "w") as f:
+              json.dump(manifest, f, indent=2, ensure_ascii=False)
+              f.write("\n")
+          print(f"Updated bucket/afpsql.json to {version}")
+          PYEOF
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add bucket/afpsql.json
+          git diff --cached --quiet || git commit -m "afpsql $TAG"
+          git push
