@@ -68,7 +68,10 @@ fn config_to_url(cfg: &tokio_postgres::Config) -> String {
         .first()
         .map(|h| match h {
             tokio_postgres::config::Host::Tcp(s) => s.to_string(),
+            #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => "127.0.0.1".to_string(),
+            #[cfg(not(unix))]
+            _ => "127.0.0.1".to_string(),
         })
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg.get_ports().first().copied().unwrap_or(5432);
