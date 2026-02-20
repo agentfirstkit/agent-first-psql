@@ -416,6 +416,11 @@ async fn emit_log(
             session: session.map(std::string::ToString::to_string),
             error_code: error_code.map(std::string::ToString::to_string),
             command_tag: command_tag.map(std::string::ToString::to_string),
+            version: None,
+            argv: None,
+            config: None,
+            args: None,
+            env: None,
             trace: trace.clone(),
         })
         .await;

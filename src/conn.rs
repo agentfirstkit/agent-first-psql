@@ -30,6 +30,7 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
         .host
         .clone()
         .or_else(|| std::env::var("AFPSQL_HOST").ok())
+        .or_else(|| std::env::var("PGHOST").ok())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg
         .port
@@ -38,23 +39,37 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
+        .or_else(|| std::env::var("PGPORT").ok().and_then(|s| s.parse().ok()))
         .unwrap_or(5432);
     let user = cfg
         .user
         .clone()
         .or_else(|| std::env::var("AFPSQL_USER").ok())
+        .or_else(|| std::env::var("PGUSER").ok())
         .unwrap_or_else(|| "postgres".to_string());
     let dbname = cfg
         .dbname
         .clone()
         .or_else(|| std::env::var("AFPSQL_DBNAME").ok())
+        .or_else(|| std::env::var("PGDATABASE").ok())
         .unwrap_or_else(|| "postgres".to_string());
     let password = cfg
         .password_secret
         .clone()
         .or_else(|| std::env::var("AFPSQL_PASSWORD_SECRET").ok());
 
-    let auth = if let Some(pw) = password {
+    if host.starts_with('/') {
+        let mut conninfo = format!(
+            "host={} port={} user={} dbname={}",
+            host, port, user, dbname
+        );
+        if let Some(pw) = password {
+            conninfo.push_str(&format!(" password={pw}"));
+        }
+        return Ok(conninfo);
+    }
+
+    let auth = if let Some(ref pw) = password {
         format!("{user}:{pw}")
     } else {
         user

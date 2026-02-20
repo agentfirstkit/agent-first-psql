@@ -118,6 +118,16 @@ pub enum Output {
         error_code: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         command_tag: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        argv: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        args: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        env: Option<Value>,
         trace: Trace,
     },
 }

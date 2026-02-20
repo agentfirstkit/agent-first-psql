@@ -47,55 +47,101 @@ async fn main() {
 }
 
 async fn run_cli(req: cli::CliRequest) {
+    let cli::CliRequest {
+        sql,
+        params,
+        options,
+        session,
+        output: output_format,
+        log,
+        startup_argv,
+        startup_args,
+        startup_env,
+        startup_requested,
+    } = req;
+
     let config = RuntimeConfig::default();
     let (tx, mut rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
     let app = Arc::new(App::new(config, tx));
 
     let mut cfg = app.config.write().await;
-    cfg.sessions
-        .insert("default".to_string(), req.session.clone());
-    if !req.log.is_empty() {
-        cfg.log = req.log.clone();
+    cfg.sessions.insert("default".to_string(), session.clone());
+    if !log.is_empty() {
+        cfg.log = log.clone();
     }
+    let startup_config = cfg.clone();
     drop(cfg);
+
+    if !log.is_empty() || startup_requested {
+        let event = build_startup_log(
+            Some("default"),
+            &startup_config,
+            &startup_argv,
+            &startup_args,
+            &startup_env,
+        );
+        emit_output(&event, output_format);
+    }
 
     app.requests_total.fetch_add(1, Ordering::Relaxed);
     handler::execute_query(
         &app,
         None,
         Some("default".to_string()),
-        req.sql,
-        req.params,
-        req.options,
+        sql,
+        params,
+        options,
     )
     .await;
 
     drop(app);
 
     let mut had_error = false;
-    while let Some(output) = rx.recv().await {
-        if matches!(output, Output::Error { .. } | Output::SqlError { .. }) {
+    while let Some(event) = rx.recv().await {
+        if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
             had_error = true;
         }
-        emit_output(&output, req.output);
+        emit_output(&event, output_format);
     }
 
     std::process::exit(if had_error { 1 } else { 0 });
 }
 
 async fn run_pipe(init: cli::PipeInit) {
+    let cli::PipeInit {
+        output,
+        session,
+        log,
+        startup_argv,
+        startup_args,
+        startup_env,
+        startup_requested,
+    } = init;
+
     let mut config = RuntimeConfig::default();
-    if has_session_override(&init.session) {
+    if has_session_override(&session) {
         config
             .sessions
-            .insert(config.default_session.clone(), init.session.clone());
+            .insert(config.default_session.clone(), session.clone());
     }
-    if !init.log.is_empty() {
-        config.log = init.log.clone();
+    if !log.is_empty() {
+        config.log = log.clone();
+    }
+    let startup_config = config.clone();
+
+    if !log.is_empty() || startup_requested {
+        let event = build_startup_log(
+            None,
+            &startup_config,
+            &startup_argv,
+            &startup_args,
+            &startup_env,
+        );
+        emit_output(&event, output);
     }
 
     let (tx, rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
-    tokio::spawn(writer::writer_task(rx, init.output));
+    tokio::spawn(writer::writer_task(rx, output));
 
     let app = Arc::new(App::new(config, tx));
 
@@ -224,6 +270,28 @@ fn has_session_override(session: &SessionConfig) -> bool {
         || session.user.is_some()
         || session.dbname.is_some()
         || session.password_secret.is_some()
+}
+
+fn build_startup_log(
+    session: Option<&str>,
+    config: &RuntimeConfig,
+    argv: &[String],
+    args: &serde_json::Value,
+    env: &serde_json::Value,
+) -> Output {
+    Output::Log {
+        event: "startup".to_string(),
+        request_id: None,
+        session: session.map(std::string::ToString::to_string),
+        error_code: None,
+        command_tag: None,
+        version: Some(config::VERSION.to_string()),
+        argv: Some(argv.to_vec()),
+        config: Some(serde_json::to_value(config).unwrap_or(serde_json::Value::Null)),
+        args: Some(args.clone()),
+        env: Some(env.clone()),
+        trace: Trace::only_duration(0),
+    }
 }
 
 fn emit_cli_error(msg: &str, format: OutputFormat) {

@@ -94,7 +94,7 @@ Session connection shape supports:
 
 CLI translation notes:
 
-- AFD mode uses direct AFD flags (`--dsn-secret`, `--host`, ...)
+- agent-first mode uses direct agent-first flags (`--dsn-secret`, `--host`, ...)
 - `psql mode` may translate legacy flags (`-h`, `-p`, `-U`, `-d`, `-c`, `-f`)
   into these same canonical fields
 
@@ -238,7 +238,7 @@ Canonical `error_code` values:
 - exact match (`query.result`)
 - group prefix match (`query` -> `query.*`)
 
-## Environment Fallback (AFD Names)
+## Environment Fallback
 
 Optional runtime fallback variables:
 
@@ -249,6 +249,13 @@ Optional runtime fallback variables:
 - `AFPSQL_USER`
 - `AFPSQL_DBNAME`
 - `AFPSQL_PASSWORD_SECRET`
+
+Standard PostgreSQL environment fallback (lower precedence):
+
+- `PGHOST`
+- `PGPORT`
+- `PGUSER`
+- `PGDATABASE`
 
 ## Example: Small Result
 

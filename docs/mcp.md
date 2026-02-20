@@ -75,6 +75,6 @@ Session connection fields:
 
 ## Notes
 
-- This MCP interface is AFD-first and does not emulate `psql` behavior.
+- This MCP interface is Agent-First Data oriented and does not emulate `psql` behavior.
 - `psql mode` is a CLI translation concern and does not affect MCP semantics.
 - For full JSONL event streaming semantics, use `--mode pipe`.

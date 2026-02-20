@@ -1,7 +1,7 @@
 use crate::types::{QueryOptions, SessionConfig};
 use agent_first_data::{cli_parse_log_filters, cli_parse_output, OutputFormat};
 use clap::{Parser, ValueEnum};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub enum Mode {
@@ -15,6 +15,10 @@ pub struct PipeInit {
     pub output: OutputFormat,
     pub session: SessionConfig,
     pub log: Vec<String>,
+    pub startup_argv: Vec<String>,
+    pub startup_args: Value,
+    pub startup_env: Value,
+    pub startup_requested: bool,
 }
 
 pub struct CliRequest {
@@ -24,6 +28,10 @@ pub struct CliRequest {
     pub session: SessionConfig,
     pub output: OutputFormat,
     pub log: Vec<String>,
+    pub startup_argv: Vec<String>,
+    pub startup_args: Value,
+    pub startup_env: Value,
+    pub startup_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -90,6 +98,7 @@ pub fn parse_args() -> Result<Mode, String> {
     if is_psql_mode_requested(&raw) {
         return parse_psql_mode(&raw);
     }
+    let startup_requested = startup_requested_from_raw(&raw);
 
     let cli = AfdCli::try_parse_from(&raw).map_err(|e| e.to_string())?;
     let output = parse_output(&cli.output)?;
@@ -103,6 +112,37 @@ pub fn parse_args() -> Result<Mode, String> {
         dbname: cli.dbname,
         password_secret: cli.password_secret,
     };
+    let mode_name = match cli.mode {
+        RuntimeMode::Cli => "cli",
+        RuntimeMode::Pipe => "pipe",
+        #[cfg(feature = "mcp")]
+        RuntimeMode::Mcp => "mcp",
+        RuntimeMode::Psql => "psql",
+    };
+    let startup_args = json!({
+        "mode": mode_name,
+        "sql": &cli.sql,
+        "sql_file": &cli.sql_file,
+        "param": &cli.param,
+        "stream_rows": cli.stream_rows,
+        "batch_rows": cli.batch_rows,
+        "batch_bytes": cli.batch_bytes,
+        "statement_timeout_ms": cli.statement_timeout_ms,
+        "lock_timeout_ms": cli.lock_timeout_ms,
+        "inline_max_rows": cli.inline_max_rows,
+        "inline_max_bytes": cli.inline_max_bytes,
+        "read_only": cli.read_only,
+        "dsn_secret": &session.dsn_secret,
+        "conninfo_secret": &session.conninfo_secret,
+        "host": &session.host,
+        "port": session.port,
+        "user": &session.user,
+        "dbname": &session.dbname,
+        "password_secret": &session.password_secret,
+        "output": output_name(output),
+        "log": &log,
+    });
+    let startup_env = startup_env_snapshot();
 
     match cli.mode {
         RuntimeMode::Pipe => {
@@ -110,6 +150,10 @@ pub fn parse_args() -> Result<Mode, String> {
                 output,
                 session,
                 log: log.clone(),
+                startup_argv: raw,
+                startup_args,
+                startup_env,
+                startup_requested,
             }));
         }
         #[cfg(feature = "mcp")]
@@ -118,6 +162,10 @@ pub fn parse_args() -> Result<Mode, String> {
                 output,
                 session,
                 log: log.clone(),
+                startup_argv: raw,
+                startup_args,
+                startup_env,
+                startup_requested,
             }));
         }
         RuntimeMode::Cli | RuntimeMode::Psql => {}
@@ -144,10 +192,15 @@ pub fn parse_args() -> Result<Mode, String> {
         session,
         output,
         log,
+        startup_argv: raw,
+        startup_args,
+        startup_env,
+        startup_requested,
     }))
 }
 
 fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
+    let startup_requested = startup_requested_from_raw(raw);
     let mut sql: Option<String> = None;
     let mut sql_file: Option<String> = None;
     let mut host: Option<String> = None;
@@ -261,6 +314,15 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
                     dbname,
                     password_secret: None,
                 };
+                let startup_args = psql_startup_args(
+                    "psql",
+                    sql.clone(),
+                    sql_file.clone(),
+                    &params_kv,
+                    &session,
+                    output,
+                    &log_entries,
+                );
                 let sql = load_sql(sql, sql_file)?;
                 let params = parse_params(&params_kv)?;
                 return Ok(Mode::Cli(CliRequest {
@@ -270,6 +332,10 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
                     session,
                     output,
                     log: parse_log_categories(&log_entries),
+                    startup_argv: raw.to_vec(),
+                    startup_args,
+                    startup_env: startup_env_snapshot(),
+                    startup_requested,
                 }));
             }
             unsupported => {
@@ -290,8 +356,19 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         password_secret: None,
     };
 
+    let startup_sql = sql.clone();
+    let startup_sql_file = sql_file.clone();
     let sql = load_sql(sql, sql_file)?;
     let params = parse_params(&params_kv)?;
+    let startup_args = psql_startup_args(
+        "psql",
+        startup_sql.or_else(|| Some(sql.clone())),
+        startup_sql_file,
+        &params_kv,
+        &session,
+        output,
+        &log_entries,
+    );
     Ok(Mode::Cli(CliRequest {
         sql,
         params,
@@ -299,6 +376,10 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         session,
         output,
         log: parse_log_categories(&log_entries),
+        startup_argv: raw.to_vec(),
+        startup_args,
+        startup_env: startup_env_snapshot(),
+        startup_requested,
     }))
 }
 
@@ -337,6 +418,84 @@ fn parse_output(v: &str) -> Result<OutputFormat, String> {
 
 fn parse_log_categories(entries: &[String]) -> Vec<String> {
     cli_parse_log_filters(entries)
+}
+
+fn startup_requested_from_raw(raw: &[String]) -> bool {
+    let mut i = 1usize;
+    while i < raw.len() {
+        if raw[i] == "--log" {
+            if let Some(values) = raw.get(i + 1) {
+                for part in values.split(',') {
+                    let v = part.trim().to_ascii_lowercase();
+                    if matches!(v.as_str(), "startup" | "all" | "*") {
+                        return true;
+                    }
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(values) = raw[i].strip_prefix("--log=") {
+            for part in values.split(',') {
+                let v = part.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "startup" | "all" | "*") {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn output_name(output: OutputFormat) -> &'static str {
+    match output {
+        OutputFormat::Json => "json",
+        OutputFormat::Yaml => "yaml",
+        OutputFormat::Plain => "plain",
+    }
+}
+
+fn startup_env_snapshot() -> Value {
+    json!({
+        "AFPSQL_DSN_SECRET": std::env::var("AFPSQL_DSN_SECRET").ok(),
+        "AFPSQL_CONNINFO_SECRET": std::env::var("AFPSQL_CONNINFO_SECRET").ok(),
+        "AFPSQL_HOST": std::env::var("AFPSQL_HOST").ok(),
+        "AFPSQL_PORT": std::env::var("AFPSQL_PORT").ok(),
+        "AFPSQL_USER": std::env::var("AFPSQL_USER").ok(),
+        "AFPSQL_DBNAME": std::env::var("AFPSQL_DBNAME").ok(),
+        "AFPSQL_PASSWORD_SECRET": std::env::var("AFPSQL_PASSWORD_SECRET").ok(),
+        "PGHOST": std::env::var("PGHOST").ok(),
+        "PGPORT": std::env::var("PGPORT").ok(),
+        "PGUSER": std::env::var("PGUSER").ok(),
+        "PGDATABASE": std::env::var("PGDATABASE").ok(),
+    })
+}
+
+fn psql_startup_args(
+    mode: &str,
+    sql: Option<String>,
+    sql_file: Option<String>,
+    params_kv: &[String],
+    session: &SessionConfig,
+    output: OutputFormat,
+    log_entries: &[String],
+) -> Value {
+    json!({
+        "mode": mode,
+        "sql": sql,
+        "sql_file": sql_file,
+        "param": params_kv,
+        "dsn_secret": session.dsn_secret,
+        "conninfo_secret": session.conninfo_secret,
+        "host": session.host,
+        "port": session.port,
+        "user": session.user,
+        "dbname": session.dbname,
+        "password_secret": session.password_secret,
+        "output": output_name(output),
+        "log": parse_log_categories(log_entries),
+    })
 }
 
 pub fn parse_params(entries: &[String]) -> Result<Vec<Value>, String> {

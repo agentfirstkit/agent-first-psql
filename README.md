@@ -23,14 +23,14 @@ structures, connection reuse, and streaming for large result sets.
 
 ## Contract
 
-`afpsql` has one runtime protocol (AFD) and two CLI entry styles:
+`afpsql` has one Agent-First Data runtime protocol and two CLI entry styles:
 
-1. AFD CLI mode (default)
+1. agent-first CLI mode (default)
 2. `psql mode` (CLI translation layer only)
 
 `psql mode` scope:
 
-- translates legacy-style CLI arguments into canonical AFD request/config fields
+- translates legacy-style CLI arguments into canonical agent-first request/config fields
 - does not change runtime protocol or output format
 - runtime protocol output goes to `stdout` only (JSON/YAML/Plain rendering of the
   same structured events)
@@ -60,7 +60,7 @@ CLI binding syntax:
 - `--param 1=... --param 2=...` (single canonical CLI form)
 
 In `psql mode`, translation may also accept numeric `-v` entries and map them to
-AFD `params` by position.
+agent-first `params` by position.
 
 Not supported:
 
@@ -69,14 +69,29 @@ Not supported:
 
 ## Connection Inputs
 
-AFD canonical connection fields:
+Canonical agent-first connection fields:
 
 - `dsn_secret` (PostgreSQL URI)
 - `conninfo_secret` (key/value conninfo)
 - discrete fields (`host`, `port`, `user`, `dbname`, `password_secret`)
 
 `psql mode` accepts legacy CLI connection flags and translates them to the same
-AFD fields.
+agent-first fields.
+
+Environment fallback (lowest precedence) also reads standard PostgreSQL variables:
+
+- `PGHOST`
+- `PGPORT`
+- `PGUSER`
+- `PGDATABASE`
+
+Unix socket example using system `PGHOST` and only passing dbname in the command:
+
+```bash
+export PGHOST=/var/run/postgresql
+export PGUSER=roger
+afpsql --dbname appdb --sql "select current_database()"
+```
 
 See docs for details:
 
