@@ -1,0 +1,37 @@
+{
+  "id": "agent-first-psql",
+  "name": "Agent-First PSQL",
+  "domain": "cmn.dev",
+  "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
+  "intent": [
+    "Give AI agents a persistent PostgreSQL client that reuses long-lived database connections and sessions, so agents send SQL requests as JSONL and receive structured JSONL responses without managing connection setup",
+    "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
+    "Provide predictable machine-readable outputs for row sets, command status, and errors so agent workflows can branch without parsing human-formatted terminal output"
+  ],
+  "changes": [
+    "Introduce afpsql — a persistent PostgreSQL client for AI agents that reuses long-lived database connections and delivers all results as structured JSONL events, eliminating per-request connection setup overhead",
+    "Support three runtime modes via --mode flag: CLI mode for single-query one-shot execution, pipe mode for JSONL stdin/stdout session with concurrent query handling, and MCP mode exposing psql_query and psql_config tools over stdio for AI assistants",
+    "Emit distinct sql_error events carrying the PostgreSQL SQLSTATE code alongside message, detail, hint, and position fields, enabling agents to branch on error type (e.g. 23505 unique violation vs 08006 connection failure) without parsing human-readable text",
+    "Support streaming result delivery via result_start / result_rows / result_end event sequence with configurable batch-rows and batch-bytes thresholds, allowing agents to process large result sets incrementally without buffering all rows in memory",
+    "Enforce inline result size limits (inline-max-rows, inline-max-bytes) with a result_too_large error and a retry hint, preventing accidental full-table scans from overwhelming agent context",
+    "Provide psql compatibility mode (--mode psql / -c / -f / -h / -p / -U / -d / -v flags) as a CLI translation layer, allowing agents with existing psql-style tool definitions to switch to afpsql without modifying their tool calls",
+    "Use positional parameter binding (.. with --param N=value or params JSON array in pipe mode) for all queries, preventing SQL injection and enabling the database to cache prepared statement plans"
+  ],
+  "license": "MIT",
+  "references": [
+    {
+      "uri": "cmn://cmn.dev/spore/blake3_5964f09fc2b8a9c8035cd823f431d6a7bcb81d2480f9ddee74beca0b2859020c",
+      "relation": "follows",
+      "reason": "All request/response fields use AFD suffix conventions and output formats"
+    }
+  ],
+  "tree": {
+    "algorithm": "blob_tree_blake3_nfc",
+    "excludes": [
+      ".git"
+    ],
+    "ignore_rules": [
+      ".gitignore"
+    ]
+  }
+}
