@@ -6,13 +6,13 @@ Practical usage for `afpsql`.
 
 `afpsql` has two CLI entry modes with one execution core:
 
-1. AFD mode (default)
+1. agent-first mode (default)
 2. `psql mode` (`--mode psql`) as argument translation only
 
-Both modes execute through the same AFD runtime protocol and produce the same
+Both modes execute through the same Agent-First Data runtime protocol and produce the same
 structured output events.
 
-`afpsql` CLI parsing/output follows shared AFD helpers from `agent-first-data`
+`afpsql` CLI parsing/output follows shared Agent-First Data helpers from `agent-first-data`
 (`cli_parse_output`, `cli_parse_log_filters`, `cli_output`, `build_cli_error`).
 
 Protocol stream contract:
@@ -66,7 +66,7 @@ Rules:
 
 Single canonical form: `--param N=VALUE` (repeatable).
 
-## Connection Flags (AFD)
+## Connection Flags (Agent-First)
 
 URI DSN:
 
@@ -92,7 +92,7 @@ afpsql \
   --sql "select 1"
 ```
 
-Optional environment fallback (AFD names):
+Optional environment fallback (agent-first names):
 
 - `AFPSQL_DSN_SECRET`
 - `AFPSQL_CONNINFO_SECRET`
@@ -102,6 +102,13 @@ Optional environment fallback (AFD names):
 - `AFPSQL_DBNAME`
 - `AFPSQL_PASSWORD_SECRET`
 
+Standard PostgreSQL environment fallback is also supported (lower precedence):
+
+- `PGHOST`
+- `PGPORT`
+- `PGUSER`
+- `PGDATABASE`
+
 ## `psql` Mode (Translation Only)
 
 Enable with `--mode psql`.
@@ -109,7 +116,7 @@ Enable with `--mode psql`.
 Purpose:
 
 - parse legacy-style CLI connection/query arguments
-- translate to canonical AFD request/config fields
+- translate to canonical agent-first request/config fields
 
 Still not supported:
 
@@ -183,7 +190,7 @@ Structured diagnostics are optional and disabled by default.
 Enable by category:
 
 ```bash
-afpsql --dsn-secret "$DATABASE_URL" --log query.result --sql "select 1 as n"
+afpsql --dsn-secret "$DATABASE_URL" --log startup,query.result --sql "select 1 as n"
 ```
 
 Enable multiple categories:
@@ -194,9 +201,19 @@ afpsql --mode pipe --log query.result,query.error
 
 Category matching:
 
-- exact event (`query.result`)
+- exact event (`startup`, `query.result`)
 - group prefix (`query` matches `query.result`, `query.error`, `query.sql_error`)
 - wildcard (`all` or `*`)
+
+`startup` emits one diagnostic event at process start with AFDATA-style payload:
+
+- `version`
+- `argv`
+- `config` (resolved runtime config)
+- `args` (parsed CLI arguments)
+- `env` (read runtime env vars; null when unset)
+
+Secret fields ending with `_secret` / `_SECRET` are redacted by AFDATA output processing.
 
 ## Exit Codes
 

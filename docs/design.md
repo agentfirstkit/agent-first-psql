@@ -11,11 +11,11 @@ ideal for automated workflows:
 4. Text interpolation patterns are easy to misuse and unsafe by default.
 
 `afpsql` is an agent runtime for PostgreSQL: structured protocol, persistent
-connections, safe parameter binding, and AFD naming everywhere.
+connections, safe parameter binding, and Agent-First Data naming everywhere.
 
 ## Product Boundary
 
-`afpsql` has one runtime interface (AFD protocol). `psql mode` is only a CLI
+`afpsql` has one runtime interface (Agent-First Data protocol). `psql mode` is only a CLI
 argument translation layer.
 
 Non-goals:
@@ -25,7 +25,7 @@ Non-goals:
 - no `psql` meta-command compatibility (`\\d`, `\\x`, `\\timing`, ...)
 - no text-template variable substitution semantics
 
-Architecture is two CLI frontends -> one canonical AFD execution core.
+Architecture is two CLI frontends -> one canonical agent-first execution core.
 
 Execution layering:
 
@@ -36,7 +36,7 @@ Execution layering:
 ## Core Principles
 
 1. SQL-native protocol events.
-2. AFD naming conventions for fields and flags.
+2. Agent-First Data naming conventions for fields and flags.
 3. Parameter binding for dynamic values.
 4. Structured errors with machine-readable codes.
 5. Large-result streaming as first-class behavior.
@@ -91,7 +91,7 @@ Unsupported by design:
 
 ### CLI Binding Forms
 
-AFD CLI uses one canonical binding form:
+The agent-first CLI uses one canonical binding form:
 
 - `--param 1=value --param 2=value` (repeatable)
 
@@ -114,8 +114,8 @@ Single query execution and structured output.
 
 Two parsers are available:
 
-1. AFD parser (default)
-2. `psql` parser (`--mode psql`) -> translated into AFD request
+1. agent-first parser (default)
+2. `psql` parser (`--mode psql`) -> translated into agent-first request
 
 ### Pipe mode (`--mode pipe`)
 
@@ -130,7 +130,7 @@ Long-lived JSONL session on stdin/stdout:
 
 Exposes structured SQL tools to MCP clients.
 
-## Connection Model (AFD)
+## Connection Model (Agent-First)
 
 Connection may be supplied by:
 
@@ -138,7 +138,7 @@ Connection may be supplied by:
 2. `conninfo_secret`
 3. discrete fields: `host`, `port`, `user`, `dbname`, `password_secret`
 
-Optional environment fallback uses AFD names:
+Optional environment fallback uses agent-first names:
 
 - `AFPSQL_DSN_SECRET`
 - `AFPSQL_CONNINFO_SECRET`
@@ -148,10 +148,17 @@ Optional environment fallback uses AFD names:
 - `AFPSQL_DBNAME`
 - `AFPSQL_PASSWORD_SECRET`
 
+Standard PostgreSQL fallback names are also supported (lower precedence):
+
+- `PGHOST`
+- `PGPORT`
+- `PGUSER`
+- `PGDATABASE`
+
 Resolution precedence:
 
 1. request/session explicit fields
-2. translated CLI flags (AFD or `psql mode`)
+2. translated CLI flags (agent-first or `psql mode`)
 3. environment fallback
 4. built-in defaults
 
@@ -221,9 +228,9 @@ Runtime diagnostics:
   - `query.error`
   - `query.sql_error`
 
-## AFD Rules
+## Agent-First Data Rules
 
-- AFD field suffix semantics (`duration_ms`, `payload_bytes`, `_secret`, ...)
+- Agent-First Data field suffix semantics (`duration_ms`, `payload_bytes`, `_secret`, ...)
 - long-form self-describing CLI flags
 - CLI/output dispatch via `agent_first_data::cli_parse_output` + `cli_output`
 - CLI parse errors via `agent_first_data::build_cli_error` (structured `code:"error"`)

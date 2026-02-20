@@ -56,6 +56,34 @@ fn parse_log_categories_normalizes_and_dedups() {
 }
 
 #[test]
+fn clap_log_flag_accepts_startup() {
+    let cli = AfdCli::try_parse_from(["afpsql", "--mode", "pipe", "--log", "startup,query.error"])
+        .unwrap();
+    assert_eq!(
+        parse_log_categories(&cli.log),
+        vec!["startup".to_string(), "query.error".to_string()]
+    );
+}
+
+#[test]
+fn startup_requested_detects_raw_log_entries() {
+    assert!(startup_requested_from_raw(&[
+        "afpsql".to_string(),
+        "--log".to_string(),
+        "startup".to_string(),
+    ]));
+    assert!(startup_requested_from_raw(&[
+        "afpsql".to_string(),
+        "--log=all".to_string(),
+    ]));
+    assert!(!startup_requested_from_raw(&[
+        "afpsql".to_string(),
+        "--log".to_string(),
+        "query.error".to_string(),
+    ]));
+}
+
+#[test]
 fn load_sql_validation() {
     assert!(load_sql(Some("select 1".to_string()), None).is_ok());
     assert!(load_sql(Some("x".to_string()), Some("y".to_string())).is_err());
