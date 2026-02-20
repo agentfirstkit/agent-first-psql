@@ -35,16 +35,10 @@ fn psql_mode_all_translation_paths() {
     let mut cmd = Command::new(bin());
     cmd.arg("--mode")
         .arg("psql")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
         .arg("-f")
         .arg(path.to_string_lossy().to_string())
-        .arg("-h")
-        .arg("localhost")
-        .arg("-p")
-        .arg("5432")
-        .arg("-U")
-        .arg("roger")
-        .arg("-d")
-        .arg("postgres")
         .arg("-v")
         .arg("1=9")
         .arg("--output")
@@ -116,10 +110,7 @@ fn conn_via_env_fallback() {
     let mut cmd = Command::new(bin());
     cmd.arg("--sql")
         .arg("select 1 as n")
-        .env("AFPSQL_HOST", "localhost")
-        .env("AFPSQL_PORT", "5432")
-        .env("AFPSQL_USER", "roger")
-        .env("AFPSQL_DBNAME", "postgres");
+        .env("AFPSQL_DSN_SECRET", test_dsn());
     let (code, stdout, _stderr) = run(cmd);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
