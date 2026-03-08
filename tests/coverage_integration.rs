@@ -201,7 +201,8 @@ fn handler_param_types_and_empty_rows() {
     let (code, stdout, _stderr) = run(empty);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(v["columns"].as_array().map(|a| a.len()).unwrap_or(0), 0);
+    assert_eq!(v["columns"].as_array().map(|a| a.len()).unwrap_or(0), 1);
+    assert_eq!(v["columns"][0]["name"], "n");
 }
 
 #[test]

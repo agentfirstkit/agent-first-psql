@@ -200,3 +200,63 @@ fn psql_mode_positional_dsn() {
     assert_eq!(v["code"], "result");
     assert_eq!(v["rows"][0]["n"], 3);
 }
+
+#[test]
+fn psql_mode_positional_dsn_before_sql_flag() {
+    let out = Command::new(bin())
+        .arg("--mode")
+        .arg("psql")
+        .arg(test_dsn())
+        .arg("-c")
+        .arg("select 4 as n")
+        .output()
+        .expect("run afpsql");
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["code"], "result");
+    assert_eq!(v["rows"][0]["n"], 4);
+}
+
+#[test]
+fn pipe_rejects_duplicate_inflight_query_id() {
+    let payload = serde_json::json!({
+        "code": "query",
+        "id": "dup1",
+        "sql": "select pg_sleep(1)"
+    })
+    .to_string()
+        + "\n"
+        + &serde_json::json!({
+            "code": "query",
+            "id": "dup1",
+            "sql": "select 1 as n"
+        })
+        .to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write stdin");
+
+    let out = child.wait_with_output().expect("wait output");
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    assert!(text.contains("\"error_code\":\"invalid_request\""));
+    assert!(text.contains("duplicate in-flight query id"));
+}

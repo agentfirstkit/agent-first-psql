@@ -27,26 +27,26 @@ impl RuntimeConfig {
         if let Some(sessions) = patch.sessions {
             for (name, s) in sessions {
                 let entry = self.sessions.entry(name).or_default();
-                if let Some(v) = s.dsn_secret {
-                    entry.dsn_secret = Some(v);
+                if let Some(v) = s.dsn_secret.into_update() {
+                    entry.dsn_secret = v;
                 }
-                if let Some(v) = s.conninfo_secret {
-                    entry.conninfo_secret = Some(v);
+                if let Some(v) = s.conninfo_secret.into_update() {
+                    entry.conninfo_secret = v;
                 }
-                if let Some(v) = s.host {
-                    entry.host = Some(v);
+                if let Some(v) = s.host.into_update() {
+                    entry.host = v;
                 }
-                if let Some(v) = s.port {
-                    entry.port = Some(v);
+                if let Some(v) = s.port.into_update() {
+                    entry.port = v;
                 }
-                if let Some(v) = s.user {
-                    entry.user = Some(v);
+                if let Some(v) = s.user.into_update() {
+                    entry.user = v;
                 }
-                if let Some(v) = s.dbname {
-                    entry.dbname = Some(v);
+                if let Some(v) = s.dbname.into_update() {
+                    entry.dbname = v;
                 }
-                if let Some(v) = s.password_secret {
-                    entry.password_secret = Some(v);
+                if let Some(v) = s.password_secret.into_update() {
+                    entry.password_secret = v;
                 }
             }
         }
@@ -68,6 +68,19 @@ impl RuntimeConfig {
             inline_max_bytes: q.inline_max_bytes.unwrap_or(self.inline_max_bytes),
         }
     }
+}
+
+pub fn sessions_to_invalidate(patch: &ConfigPatch) -> Vec<String> {
+    let mut sessions: Vec<String> = vec![];
+    if let Some(default_session) = patch.default_session.as_ref() {
+        sessions.push(default_session.clone());
+    }
+    if let Some(update_sessions) = patch.sessions.as_ref() {
+        sessions.extend(update_sessions.keys().cloned());
+    }
+    sessions.sort();
+    sessions.dedup();
+    sessions
 }
 
 #[cfg(test)]

@@ -50,17 +50,23 @@ fn build_params_types() {
         Type::JSONB,
         Type::VARCHAR,
     ];
-    let params = build_params(&values, &tys).expect("build params");
-    let refs = build_param_refs(&params);
-    assert_eq!(refs.len(), 9);
+    let params_res = build_params(&values, &tys);
+    assert!(params_res.is_ok());
+    if let Ok(params) = params_res {
+        let refs = build_param_refs(&params);
+        assert_eq!(refs.len(), 9);
+    }
 }
 
 #[test]
 fn anynull_to_sql() {
     let n = AnyNull;
     let mut out = bytes::BytesMut::new();
-    let is_null = n.to_sql(&Type::TEXT, &mut out).expect("to_sql");
-    assert!(matches!(is_null, tokio_postgres::types::IsNull::Yes));
+    let is_null_res = n.to_sql(&Type::TEXT, &mut out);
+    assert!(is_null_res.is_ok());
+    if let Ok(is_null) = is_null_res {
+        assert!(matches!(is_null, tokio_postgres::types::IsNull::Yes));
+    }
 }
 
 #[tokio::test]
@@ -97,11 +103,13 @@ async fn postgres_executor_success_and_sql_error() {
     };
     let opts = RuntimeConfig::default().resolve_options(&QueryOptions::default());
 
-    let out = exec
+    let out_res = exec
         .execute("default", &cfg, "select 1 as n", &[], &opts)
-        .await
-        .expect("ok");
-    assert!(matches!(out, ExecOutcome::Rows(_)));
+        .await;
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert!(matches!(out, ExecOutcome::Rows { .. }));
+    }
 
     let err = exec
         .execute(

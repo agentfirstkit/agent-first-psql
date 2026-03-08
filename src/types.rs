@@ -98,7 +98,19 @@ pub enum Output {
         id: Option<String>,
         error_code: String,
         error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
         retryable: bool,
+        trace: Trace,
+    },
+    #[serde(rename = "dry_run")]
+    DryRun {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        sql: String,
+        params: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
         trace: Trace,
     },
     #[serde(rename = "config")]
@@ -229,15 +241,56 @@ pub struct ConfigPatch {
     pub log: Option<Vec<String>>,
 }
 
+#[derive(Debug, Default)]
+pub enum PatchField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for PatchField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Option::<T>::deserialize(deserializer)?;
+        match value {
+            Some(value) => Ok(Self::Value(value)),
+            None => Ok(Self::Null),
+        }
+    }
+}
+
+impl<T> PatchField<T> {
+    pub fn into_update(self) -> Option<Option<T>> {
+        match self {
+            Self::Missing => None,
+            Self::Null => Some(None),
+            Self::Value(value) => Some(Some(value)),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct SessionConfigPatch {
-    pub dsn_secret: Option<String>,
-    pub conninfo_secret: Option<String>,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-    pub dbname: Option<String>,
-    pub password_secret: Option<String>,
+    #[serde(default)]
+    pub dsn_secret: PatchField<String>,
+    #[serde(default)]
+    pub conninfo_secret: PatchField<String>,
+    #[serde(default)]
+    pub host: PatchField<String>,
+    #[serde(default)]
+    pub port: PatchField<u16>,
+    #[serde(default)]
+    pub user: PatchField<String>,
+    #[serde(default)]
+    pub dbname: PatchField<String>,
+    #[serde(default)]
+    pub password_secret: PatchField<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -5,21 +5,50 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-#[test]
-fn infer_columns_from_first_row() {
-    let rows = vec![
-        serde_json::json!({"a":1,"b":"x"}),
-        serde_json::json!({"a":2}),
+#[tokio::test]
+async fn emit_rows_uses_db_columns_even_when_rows_empty() {
+    let columns = vec![
+        ColumnInfo {
+            name: "a".to_string(),
+            type_name: "int4".to_string(),
+        },
+        ColumnInfo {
+            name: "b".to_string(),
+            type_name: "text".to_string(),
+        },
     ];
-    let cols = infer_columns(&rows);
-    assert_eq!(cols.len(), 2);
-    assert_eq!(cols[0].type_name, "json");
-}
+    let (tx, mut rx) = mpsc::channel(16);
+    let app = Arc::new(App::new(RuntimeConfig::default(), tx));
+    let opts = ResolvedOptions {
+        stream_rows: false,
+        batch_rows: 10,
+        batch_bytes: 1024,
+        statement_timeout_ms: 100,
+        lock_timeout_ms: 100,
+        read_only: false,
+        inline_max_rows: 100,
+        inline_max_bytes: 1000,
+    };
 
-#[test]
-fn infer_columns_empty() {
-    let cols = infer_columns(&[]);
-    assert!(cols.is_empty());
+    let status = emit_rows_result(
+        &app,
+        Some("q_empty".to_string()),
+        Some("default".to_string()),
+        columns.clone(),
+        vec![],
+        std::time::Instant::now(),
+        &opts,
+    )
+    .await;
+    assert!(matches!(status, RowEmitStatus::Sent { .. }));
+    let out_opt = rx.recv().await;
+    assert!(out_opt.is_some());
+    if let Some(out) = out_opt {
+        assert!(matches!(out, Output::Result { .. }));
+        if let Output::Result { columns: got, .. } = out {
+            assert_eq!(got.len(), columns.len());
+        }
+    }
 }
 
 #[tokio::test]
@@ -41,6 +70,10 @@ async fn emit_rows_result_paths() {
         &app,
         Some("q1".to_string()),
         Some("default".to_string()),
+        vec![ColumnInfo {
+            name: "n".to_string(),
+            type_name: "int4".to_string(),
+        }],
         vec![
             serde_json::json!({"n":1}),
             serde_json::json!({"n":2}),
@@ -67,6 +100,10 @@ async fn emit_rows_result_paths() {
         &app,
         Some("q2".to_string()),
         Some("default".to_string()),
+        vec![ColumnInfo {
+            name: "n".to_string(),
+            type_name: "int4".to_string(),
+        }],
         vec![serde_json::json!({"n":1}), serde_json::json!({"n":2})],
         std::time::Instant::now(),
         &inline_opts,
@@ -93,7 +130,7 @@ impl DbExecutor for MockExecutor {
             .lock()
             .await
             .take()
-            .unwrap_or_else(|| Ok(ExecOutcome::Command { affected: 0 }))
+            .unwrap_or(Ok(ExecOutcome::Command { affected: 0 }))
     }
 }
 
@@ -117,8 +154,10 @@ fn test_app_with_executor(
 
 #[tokio::test]
 async fn execute_query_unknown_session_emits_connect_failed() {
-    let mut cfg = RuntimeConfig::default();
-    cfg.default_session = "missing".to_string();
+    let cfg = RuntimeConfig {
+        default_session: "missing".to_string(),
+        ..Default::default()
+    };
     let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 1 }));
     execute_query(
         &app,
@@ -129,10 +168,13 @@ async fn execute_query_unknown_session_emits_connect_failed() {
         QueryOptions::default(),
     )
     .await;
-    let msg = rx.recv().await.unwrap();
-    match msg {
-        Output::Error { error_code, .. } => assert_eq!(error_code, "connect_failed"),
-        _ => panic!("expected error"),
+    let msg_opt = rx.recv().await;
+    assert!(msg_opt.is_some());
+    if let Some(msg) = msg_opt {
+        assert!(matches!(msg, Output::Error { .. }));
+        if let Output::Error { error_code, .. } = msg {
+            assert_eq!(error_code, "connect_failed");
+        }
     }
 }
 
@@ -143,7 +185,13 @@ async fn execute_query_maps_executor_outcomes() {
         .insert("default".to_string(), SessionConfig::default());
 
     for result in [
-        Ok(ExecOutcome::Rows(vec![serde_json::json!({"n":1})])),
+        Ok(ExecOutcome::Rows {
+            columns: vec![ColumnInfo {
+                name: "n".to_string(),
+                type_name: "int4".to_string(),
+            }],
+            rows: vec![serde_json::json!({"n":1})],
+        }),
         Ok(ExecOutcome::Command { affected: 2 }),
         Err(ExecError::Connect("down".to_string())),
         Err(ExecError::InvalidParams("bad".to_string())),
@@ -166,6 +214,7 @@ async fn execute_query_maps_executor_outcomes() {
             QueryOptions::default(),
         )
         .await;
-        let _ = rx.recv().await.unwrap();
+        let msg_opt = rx.recv().await;
+        assert!(msg_opt.is_some());
     }
 }

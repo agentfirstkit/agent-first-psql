@@ -27,23 +27,22 @@ fn build_startup_log_has_afdata_fields() {
         &serde_json::json!({"mode":"cli"}),
         &serde_json::json!({"AFPSQL_DSN_SECRET": null}),
     );
-    match out {
-        Output::Log {
-            event,
-            version,
-            argv,
-            config,
-            args,
-            env,
-            ..
-        } => {
-            assert_eq!(event, "startup");
-            assert!(version.is_some());
-            assert!(argv.is_some());
-            assert!(config.is_some());
-            assert!(args.is_some());
-            assert!(env.is_some());
-        }
-        _ => panic!("expected startup log"),
+    assert!(matches!(out, Output::Log { .. }));
+    if let Output::Log {
+        event,
+        version,
+        argv,
+        config,
+        args,
+        env,
+        ..
+    } = out
+    {
+        assert_eq!(event, "startup");
+        assert!(version.is_some());
+        assert!(argv.is_some());
+        assert!(config.is_some());
+        assert!(args.is_some());
+        assert!(env.is_some());
     }
 }

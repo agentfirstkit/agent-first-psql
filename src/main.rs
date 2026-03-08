@@ -18,6 +18,7 @@ mod writer;
 
 use agent_first_data::OutputFormat;
 use cli::Mode;
+use config::sessions_to_invalidate;
 use handler::App;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -58,7 +59,20 @@ async fn run_cli(req: cli::CliRequest) {
         startup_args,
         startup_env,
         startup_requested,
+        dry_run,
     } = req;
+
+    if dry_run {
+        let dry = Output::DryRun {
+            id: None,
+            sql: sql.clone(),
+            params: params.iter().map(|v| v.to_string()).collect(),
+            session: Some("default".to_string()),
+            trace: Trace::only_duration(0),
+        };
+        emit_output(&dry, output_format);
+        return;
+    }
 
     let config = RuntimeConfig::default();
     let (tx, mut rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
@@ -164,6 +178,7 @@ async fn run_pipe(init: cli::PipeInit) {
                         id: None,
                         error_code: "invalid_request".to_string(),
                         error: format!("parse error: {e}"),
+                        hint: None,
                         retryable: false,
                         trace: Trace::only_duration(0),
                     })
@@ -180,32 +195,81 @@ async fn run_pipe(init: cli::PipeInit) {
                 params,
                 options,
             } => {
-                let app2 = app.clone();
-                app.requests_total.fetch_add(1, Ordering::Relaxed);
                 let key = id.clone();
-                let handle = tokio::spawn(async move {
-                    handler::execute_query(&app2, Some(id), session, sql, params, options).await;
-                });
-                app.in_flight.lock().await.insert(key, handle);
-            }
-            Input::Config(patch) => {
-                let mut cfg = app.config.write().await;
-                cfg.apply_update(patch);
-                let _ = app.writer.send(Output::Config(cfg.clone())).await;
-            }
-            Input::Cancel { id } => {
-                if let Some(handle) = app.in_flight.lock().await.remove(&id) {
-                    handle.abort();
+                let mut reject_duplicate = false;
+                {
+                    let mut in_flight = app.in_flight.lock().await;
+                    if let Some(existing) = in_flight.get(&key) {
+                        if existing.is_finished() {
+                            in_flight.remove(&key);
+                        } else {
+                            reject_duplicate = true;
+                        }
+                    }
+
+                    if !reject_duplicate {
+                        let app2 = app.clone();
+                        app.requests_total.fetch_add(1, Ordering::Relaxed);
+                        let handle = tokio::spawn(async move {
+                            handler::execute_query(&app2, Some(id), session, sql, params, options)
+                                .await;
+                        });
+                        in_flight.insert(key.clone(), handle);
+                    }
+                }
+
+                if reject_duplicate {
                     let _ = app
                         .writer
                         .send(Output::Error {
-                            id: Some(id),
-                            error_code: "cancelled".to_string(),
-                            error: "query cancelled".to_string(),
+                            id: Some(key),
+                            error_code: "invalid_request".to_string(),
+                            error: "duplicate in-flight query id".to_string(),
+                            hint: None,
                             retryable: false,
                             trace: Trace::only_duration(0),
                         })
                         .await;
+                }
+            }
+            Input::Config(patch) => {
+                let sessions = sessions_to_invalidate(&patch);
+                let cfg_snapshot = {
+                    let mut cfg = app.config.write().await;
+                    cfg.apply_update(patch);
+                    cfg.clone()
+                };
+                app.executor.invalidate_sessions(&sessions).await;
+                let _ = app.writer.send(Output::Config(cfg_snapshot)).await;
+            }
+            Input::Cancel { id } => {
+                if let Some(handle) = app.in_flight.lock().await.remove(&id) {
+                    if handle.is_finished() {
+                        let _ = app
+                            .writer
+                            .send(Output::Error {
+                                id: Some(id),
+                                error_code: "invalid_request".to_string(),
+                                error: "query already finished".to_string(),
+                                hint: None,
+                                retryable: false,
+                                trace: Trace::only_duration(0),
+                            })
+                            .await;
+                    } else {
+                        handle.abort();
+                        let _ = app
+                            .writer
+                            .send(Output::Error {
+                                id: Some(id),
+                                error_code: "cancelled".to_string(),
+                                error: "query cancelled".to_string(),
+                                hint: None,
+                                retryable: false,
+                                trace: Trace::only_duration(0),
+                            })
+                            .await;
+                    }
                 } else {
                     let _ = app
                         .writer
@@ -213,6 +277,7 @@ async fn run_pipe(init: cli::PipeInit) {
                             id: Some(id),
                             error_code: "invalid_request".to_string(),
                             error: "no in-flight query with this id".to_string(),
+                            hint: None,
                             retryable: false,
                             trace: Trace::only_duration(0),
                         })
@@ -295,7 +360,7 @@ fn build_startup_log(
 }
 
 fn emit_cli_error(msg: &str, format: OutputFormat) {
-    let value = agent_first_data::build_cli_error(msg);
+    let value = agent_first_data::build_cli_error(msg, None);
     let rendered = agent_first_data::cli_output(&value, format);
     println!("{rendered}");
 }

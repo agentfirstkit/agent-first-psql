@@ -2,27 +2,39 @@ use super::*;
 
 #[test]
 fn parse_params_order_and_types() {
-    let p = parse_params(&["2=active".to_string(), "1=42".to_string()]).unwrap();
-    assert_eq!(p[0], Value::Number(42.into()));
-    assert_eq!(p[1], Value::String("active".to_string()));
+    let p_res = parse_params(&["2=active".to_string(), "1=42".to_string()]);
+    assert!(p_res.is_ok());
+    if let Ok(p) = p_res {
+        assert_eq!(p[0], Value::Number(42.into()));
+        assert_eq!(p[1], Value::String("active".to_string()));
+    }
 }
 
 #[test]
 fn parse_params_missing_index_errors() {
-    let err = parse_params(&["2=active".to_string()]).unwrap_err();
-    assert!(err.contains("missing parameter index 1"));
+    let err_res = parse_params(&["2=active".to_string()]);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("missing parameter index 1"));
+    }
 }
 
 #[test]
 fn parse_params_index_starts_from_one() {
-    let err = parse_params(&["0=x".to_string()]).unwrap_err();
-    assert!(err.contains("start at 1"));
+    let err_res = parse_params(&["0=x".to_string()]);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("start at 1"));
+    }
 }
 
 #[test]
 fn parse_params_invalid_shape() {
-    let err = parse_params(&["abc".to_string()]).unwrap_err();
-    assert!(err.contains("expected N=value"));
+    let err_res = parse_params(&["abc".to_string()]);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("expected N=value"));
+    }
 }
 
 #[test]
@@ -57,12 +69,15 @@ fn parse_log_categories_normalizes_and_dedups() {
 
 #[test]
 fn clap_log_flag_accepts_startup() {
-    let cli = AfdCli::try_parse_from(["afpsql", "--mode", "pipe", "--log", "startup,query.error"])
-        .unwrap();
-    assert_eq!(
-        parse_log_categories(&cli.log),
-        vec!["startup".to_string(), "query.error".to_string()]
-    );
+    let cli_res =
+        AfdCli::try_parse_from(["afpsql", "--mode", "pipe", "--log", "startup,query.error"]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert_eq!(
+            parse_log_categories(&cli.log),
+            vec!["startup".to_string(), "query.error".to_string()]
+        );
+    }
 }
 
 #[test]
@@ -94,7 +109,7 @@ fn load_sql_validation() {
 fn parse_psql_mode_all_flags_and_sql_file() {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("afpsql_sql_{}.sql", std::process::id()));
-    std::fs::write(&path, "select $1::int").unwrap();
+    assert!(std::fs::write(&path, "select $1::int").is_ok());
     let raw = vec![
         "afpsql".to_string(),
         "--mode".to_string(),
@@ -116,9 +131,11 @@ fn parse_psql_mode_all_flags_and_sql_file() {
         "--output".to_string(),
         "plain".to_string(),
     ];
-    let mode = parse_psql_mode(&raw).unwrap();
-    match mode {
-        Mode::Cli(req) => {
+    let mode_res = parse_psql_mode(&raw);
+    assert!(mode_res.is_ok());
+    if let Ok(mode) = mode_res {
+        assert!(matches!(mode, Mode::Cli(_)));
+        if let Mode::Cli(req) = mode {
             assert_eq!(req.sql.trim(), "select $1::int");
             assert_eq!(req.params.len(), 1);
             assert!(matches!(req.output, OutputFormat::Plain));
@@ -127,7 +144,6 @@ fn parse_psql_mode_all_flags_and_sql_file() {
             assert_eq!(req.session.dbname.as_deref(), Some("postgres"));
             assert!(req.session.conninfo_secret.is_some());
         }
-        _ => panic!("expected cli mode"),
     }
     let _ = std::fs::remove_file(path);
 }
@@ -143,15 +159,16 @@ fn parse_psql_mode_dsn_and_errors() {
         "--dsn-secret".to_string(),
         "postgresql://localhost/postgres".to_string(),
     ];
-    let mode = parse_psql_mode(&raw).unwrap();
-    match mode {
-        Mode::Cli(req) => {
+    let mode_res = parse_psql_mode(&raw);
+    assert!(mode_res.is_ok());
+    if let Ok(mode) = mode_res {
+        assert!(matches!(mode, Mode::Cli(_)));
+        if let Mode::Cli(req) = mode {
             assert_eq!(
                 req.session.dsn_secret.as_deref(),
                 Some("postgresql://localhost/postgres")
             );
         }
-        _ => panic!("expected cli mode"),
     }
 
     let bad = vec![
@@ -160,8 +177,38 @@ fn parse_psql_mode_dsn_and_errors() {
         "psql".to_string(),
         "--bad".to_string(),
     ];
-    let err = parse_psql_mode(&bad).err().unwrap_or_default();
-    assert!(err.contains("unsupported psql-mode argument"));
+    let err_res = parse_psql_mode(&bad);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("unsupported psql-mode argument"));
+    }
+}
+
+#[test]
+fn parse_psql_mode_positional_dsn_does_not_short_circuit() {
+    let raw = vec![
+        "afpsql".to_string(),
+        "--mode".to_string(),
+        "psql".to_string(),
+        "postgresql://localhost/postgres".to_string(),
+        "-c".to_string(),
+        "select $1::int as n".to_string(),
+        "-v".to_string(),
+        "1=7".to_string(),
+    ];
+    let mode_res = parse_psql_mode(&raw);
+    assert!(mode_res.is_ok());
+    if let Ok(mode) = mode_res {
+        assert!(matches!(mode, Mode::Cli(_)));
+        if let Mode::Cli(req) = mode {
+            assert_eq!(
+                req.session.dsn_secret.as_deref(),
+                Some("postgresql://localhost/postgres")
+            );
+            assert_eq!(req.sql, "select $1::int as n");
+            assert_eq!(req.params, vec![serde_json::json!(7)]);
+        }
+    }
 }
 
 #[test]
@@ -175,8 +222,11 @@ fn parse_psql_mode_port_and_v_errors() {
         "-c".to_string(),
         "select 1".to_string(),
     ];
-    let err = parse_psql_mode(&bad_port).err().unwrap_or_default();
-    assert!(err.contains("invalid -p port"));
+    let err_res = parse_psql_mode(&bad_port);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("invalid -p port"));
+    }
 
     let bad_v = vec![
         "afpsql".to_string(),
@@ -187,6 +237,9 @@ fn parse_psql_mode_port_and_v_errors() {
         "-v".to_string(),
         "bad".to_string(),
     ];
-    let err = parse_psql_mode(&bad_v).err().unwrap_or_default();
-    assert!(err.contains("expected N=value") || err.contains("invalid"));
+    let err_res = parse_psql_mode(&bad_v);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("expected N=value") || err.contains("invalid"));
+    }
 }

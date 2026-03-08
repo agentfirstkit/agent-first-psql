@@ -193,19 +193,30 @@ async fn handle_tool_call(
             if !arguments.is_object() {
                 return tool_error("arguments must be an object");
             }
-            let mut cfg = app.config.write().await;
             let patch: ConfigPatch = match serde_json::from_value(arguments.clone()) {
                 Ok(v) => v,
                 Err(e) => return tool_error(&format!("invalid config patch: {e}")),
             };
-            if arguments
+            let apply_patch = arguments
                 .as_object()
                 .map(|m| !m.is_empty())
-                .unwrap_or(false)
-            {
-                cfg.apply_update(patch);
+                .unwrap_or(false);
+            let sessions = if apply_patch {
+                crate::config::sessions_to_invalidate(&patch)
+            } else {
+                vec![]
+            };
+            let cfg_snapshot = {
+                let mut cfg = app.config.write().await;
+                if apply_patch {
+                    cfg.apply_update(patch);
+                }
+                cfg.clone()
+            };
+            if apply_patch {
+                app.executor.invalidate_sessions(&sessions).await;
             }
-            tool_ok(json!({"config": cfg.clone()}))
+            tool_ok(json!({"config": cfg_snapshot}))
         }
         other => tool_error(&format!("unknown tool: {other}")),
     }
