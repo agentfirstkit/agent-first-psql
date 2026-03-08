@@ -1,5 +1,5 @@
 use crate::conn::resolve_conn_string;
-use crate::types::{ResolvedOptions, SessionConfig};
+use crate::types::{ColumnInfo, ResolvedOptions, SessionConfig};
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde_json::{json, Value};
@@ -9,8 +9,13 @@ use tokio_postgres::types::{Json, ToSql, Type};
 
 #[derive(Debug)]
 pub enum ExecOutcome {
-    Rows(Vec<Value>),
-    Command { affected: usize },
+    Rows {
+        columns: Vec<ColumnInfo>,
+        rows: Vec<Value>,
+    },
+    Command {
+        affected: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -37,6 +42,8 @@ pub trait DbExecutor: Send + Sync {
         params: &[Value],
         opts: &ResolvedOptions,
     ) -> Result<ExecOutcome, ExecError>;
+
+    async fn invalidate_sessions(&self, _session_names: &[String]) {}
 }
 
 pub struct PostgresExecutor {
@@ -99,11 +106,19 @@ impl DbExecutor for PostgresExecutor {
         let mut tx = client.transaction().await.map_err(map_pg_error)?;
         apply_query_settings(&mut tx, opts).await?;
         let stmt = tx.prepare(sql).await.map_err(map_pg_error)?;
+        let columns = stmt
+            .columns()
+            .iter()
+            .map(|col| ColumnInfo {
+                name: col.name().to_string(),
+                type_name: col.type_().name().to_string(),
+            })
+            .collect::<Vec<_>>();
         validate_param_count(stmt.params().len(), params.len())?;
         let query_params = build_params(params, stmt.params())?;
         let bind_refs = build_param_refs(&query_params);
 
-        if !stmt.columns().is_empty() {
+        if !columns.is_empty() {
             // Primary row path: CTE + to_jsonb to preserve PostgreSQL's own type
             // serialization. This supports SELECT and RETURNING-style statements.
             let wrapped = format!(
@@ -165,13 +180,26 @@ impl DbExecutor for PostgresExecutor {
                 })
                 .collect();
 
-            return Ok(ExecOutcome::Rows(json_rows));
+            return Ok(ExecOutcome::Rows {
+                columns,
+                rows: json_rows,
+            });
         }
 
         let affected = tx.execute(&stmt, &bind_refs).await.map_err(map_pg_error)? as usize;
         tx.commit().await.map_err(map_pg_error)?;
 
         Ok(ExecOutcome::Command { affected })
+    }
+
+    async fn invalidate_sessions(&self, session_names: &[String]) {
+        if session_names.is_empty() {
+            return;
+        }
+        let mut pools = self.pools.write().await;
+        for name in session_names {
+            pools.remove(name);
+        }
     }
 }
 

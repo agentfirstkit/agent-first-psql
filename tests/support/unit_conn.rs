@@ -6,8 +6,11 @@ fn resolve_conn_uses_dsn_secret_first() {
         dsn_secret: Some("postgresql://a/b".to_string()),
         ..Default::default()
     };
-    let out = resolve_conn_string(&cfg).unwrap();
-    assert_eq!(out, "postgresql://a/b");
+    let out_res = resolve_conn_string(&cfg);
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(out, "postgresql://a/b");
+    }
 }
 
 #[test]
@@ -16,8 +19,11 @@ fn resolve_conn_from_conninfo() {
         conninfo_secret: Some("host=localhost port=5432 user=roger dbname=postgres".to_string()),
         ..Default::default()
     };
-    let out = resolve_conn_string(&cfg).unwrap();
-    assert_eq!(out, "postgresql://roger@localhost:5432/postgres");
+    let out_res = resolve_conn_string(&cfg);
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(out, "host=localhost port=5432 user=roger dbname=postgres");
+    }
 }
 
 #[test]
@@ -30,8 +36,11 @@ fn resolve_conn_from_discrete_fields() {
         password_secret: Some("p".to_string()),
         ..Default::default()
     };
-    let out = resolve_conn_string(&cfg).unwrap();
-    assert_eq!(out, "postgresql://u:p@db:6543/d");
+    let out_res = resolve_conn_string(&cfg);
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(out, "postgresql://u:p@db:6543/d");
+    }
 }
 
 #[test]
@@ -43,11 +52,14 @@ fn resolve_conn_from_unix_socket_discrete_fields() {
         dbname: Some("appdb".to_string()),
         ..Default::default()
     };
-    let out = resolve_conn_string(&cfg).unwrap();
-    assert_eq!(
-        out,
-        "host=/var/run/postgresql port=5432 user=roger dbname=appdb"
-    );
+    let out_res = resolve_conn_string(&cfg);
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(
+            out,
+            "host=/var/run/postgresql port=5432 user=roger dbname=appdb"
+        );
+    }
 }
 
 #[test]
@@ -63,8 +75,11 @@ fn resolve_conn_defaults_and_conninfo_password() {
         conninfo_secret: Some("host=localhost user=roger password=pw".to_string()),
         ..Default::default()
     };
-    let out = resolve_conn_string(&cfg).unwrap();
-    assert_eq!(out, "postgresql://roger:pw@localhost:5432/postgres");
+    let out_res = resolve_conn_string(&cfg);
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(out, "host=localhost user=roger password=pw");
+    }
 
     let cfg2 = SessionConfig {
         conninfo_secret: Some("host=localhost noeq user=roger password=pw".to_string()),
@@ -76,6 +91,9 @@ fn resolve_conn_defaults_and_conninfo_password() {
         conninfo_secret: Some("host=/tmp user=roger dbname=postgres".to_string()),
         ..Default::default()
     };
-    let out2 = resolve_conn_string(&cfg3).unwrap();
-    assert_eq!(out2, "postgresql://roger@127.0.0.1:5432/postgres");
+    let out_res2 = resolve_conn_string(&cfg3);
+    assert!(out_res2.is_ok());
+    if let Ok(out2) = out_res2 {
+        assert_eq!(out2, "host=/tmp user=roger dbname=postgres");
+    }
 }

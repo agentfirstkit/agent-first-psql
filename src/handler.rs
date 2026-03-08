@@ -49,6 +49,9 @@ pub async fn execute_query(
                 id: id.clone(),
                 error_code: "connect_failed".to_string(),
                 error: format!("unknown session: {resolved_session}"),
+                hint: Some(
+                    "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
+                ),
                 retryable: true,
                 trace: trace.clone(),
             })
@@ -78,11 +81,12 @@ pub async fn execute_query(
         .await;
 
     match result {
-        Ok(ExecOutcome::Rows(rows)) => {
+        Ok(ExecOutcome::Rows { columns, rows }) => {
             let status = emit_rows_result(
                 app,
                 id.clone(),
                 Some(resolved_session.clone()),
+                columns,
                 rows,
                 start,
                 &resolved_opts,
@@ -153,6 +157,9 @@ pub async fn execute_query(
                     id: id.clone(),
                     error_code: "connect_failed".to_string(),
                     error: message,
+                    hint: Some(
+                        "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
+                    ),
                     retryable: true,
                     trace: trace.clone(),
                 })
@@ -176,6 +183,7 @@ pub async fn execute_query(
                     id: id.clone(),
                     error_code: "invalid_params".to_string(),
                     error: message,
+                    hint: None,
                     retryable: false,
                     trace: trace.clone(),
                 })
@@ -231,6 +239,7 @@ pub async fn execute_query(
                     id: id.clone(),
                     error_code: "invalid_request".to_string(),
                     error: message,
+                    hint: None,
                     retryable: false,
                     trace: trace.clone(),
                 })
@@ -259,19 +268,19 @@ async fn emit_rows_result(
     app: &Arc<App>,
     id: Option<String>,
     session: Option<String>,
+    columns: Vec<ColumnInfo>,
     rows: Vec<Value>,
     start: Instant,
     opts: &ResolvedOptions,
 ) -> RowEmitStatus {
     if opts.stream_rows {
         let req_id = id.clone().unwrap_or_else(|| "cli".to_string());
-        let columns = infer_columns(&rows);
         let _ = app
             .writer
             .send(Output::ResultStart {
                 id: req_id.clone(),
                 session: session.clone(),
-                columns,
+                columns: columns.clone(),
             })
             .await;
 
@@ -331,7 +340,6 @@ async fn emit_rows_result(
         return RowEmitStatus::Sent { trace };
     }
 
-    let columns = infer_columns(&rows);
     let mut payload_bytes = 0usize;
     for row in &rows {
         payload_bytes += serde_json::to_vec(row).map(|b| b.len()).unwrap_or(0);
@@ -349,6 +357,10 @@ async fn emit_rows_result(
                 id,
                 error_code: "result_too_large".to_string(),
                 error: "result exceeds inline limits; retry with stream_rows=true".to_string(),
+                hint: Some(
+                    "use --stream-rows or increase --inline-max-rows/--inline-max-bytes"
+                        .to_string(),
+                ),
                 retryable: false,
                 trace: trace.clone(),
             })
@@ -376,19 +388,6 @@ async fn emit_rows_result(
         .await;
 
     RowEmitStatus::Sent { trace }
-}
-
-fn infer_columns(rows: &[Value]) -> Vec<ColumnInfo> {
-    let Some(Value::Object(first)) = rows.first() else {
-        return vec![];
-    };
-    first
-        .keys()
-        .map(|k| ColumnInfo {
-            name: k.clone(),
-            type_name: "json".to_string(),
-        })
-        .collect()
 }
 
 async fn emit_log(

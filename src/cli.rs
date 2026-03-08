@@ -32,6 +32,7 @@ pub struct CliRequest {
     pub startup_args: Value,
     pub startup_env: Value,
     pub startup_requested: bool,
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -69,6 +70,9 @@ struct AfdCli {
     inline_max_bytes: Option<usize>,
     #[arg(long = "read-only")]
     read_only: bool,
+    /// Preview the query without executing it
+    #[arg(long)]
+    dry_run: bool,
 
     #[arg(long = "dsn-secret")]
     dsn_secret: Option<String>,
@@ -100,7 +104,17 @@ pub fn parse_args() -> Result<Mode, String> {
     }
     let startup_requested = startup_requested_from_raw(&raw);
 
-    let cli = AfdCli::try_parse_from(&raw).map_err(|e| e.to_string())?;
+    let cli = match AfdCli::try_parse_from(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                println!("{e}");
+                std::process::exit(0);
+            }
+            return Err(e.to_string());
+        }
+    };
     let output = parse_output(&cli.output)?;
     let log = parse_log_categories(&cli.log);
     let session = SessionConfig {
@@ -196,6 +210,7 @@ pub fn parse_args() -> Result<Mode, String> {
         startup_args,
         startup_env,
         startup_requested,
+        dry_run: cli.dry_run,
     }))
 }
 
@@ -304,39 +319,8 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
                 i += 1;
             }
             other if other.starts_with("postgresql://") || other.starts_with("postgres://") => {
-                // treat positional DSN in psql mode
-                let session = SessionConfig {
-                    dsn_secret: Some(other.to_string()),
-                    conninfo_secret,
-                    host,
-                    port,
-                    user,
-                    dbname,
-                    password_secret: None,
-                };
-                let startup_args = psql_startup_args(
-                    "psql",
-                    sql.clone(),
-                    sql_file.clone(),
-                    &params_kv,
-                    &session,
-                    output,
-                    &log_entries,
-                );
-                let sql = load_sql(sql, sql_file)?;
-                let params = parse_params(&params_kv)?;
-                return Ok(Mode::Cli(CliRequest {
-                    sql,
-                    params,
-                    options: QueryOptions::default(),
-                    session,
-                    output,
-                    log: parse_log_categories(&log_entries),
-                    startup_argv: raw.to_vec(),
-                    startup_args,
-                    startup_env: startup_env_snapshot(),
-                    startup_requested,
-                }));
+                dsn_secret = Some(other.to_string());
+                i += 1;
             }
             unsupported => {
                 return Err(format!(
@@ -380,6 +364,7 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         startup_args,
         startup_env: startup_env_snapshot(),
         startup_requested,
+        dry_run: false,
     }))
 }
 

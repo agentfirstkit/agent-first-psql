@@ -1,5 +1,6 @@
 {
   "id": "agent-first-psql",
+  "version": "0.2.1",
   "name": "Agent-First PSQL",
   "domain": "cmn.dev",
   "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
@@ -8,21 +9,18 @@
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
     "Provide predictable machine-readable outputs for row sets, command status, and errors so agent workflows can branch without parsing human-formatted terminal output"
   ],
-  "changes": [
-    "Add startup log event emitted when --log startup or --verbose is used, reporting version, argv, all resolved CLI arguments, environment variable snapshot (AFPSQL_* and standard PG* vars), and full runtime config — giving agents observability into what connection parameters were actually resolved at startup",
-    "Add standard PostgreSQL environment variable fallback (PGHOST, PGPORT, PGUSER, PGDATABASE) with lower precedence than AFPSQL_* vars, allowing afpsql to pick up connection settings from environments where these variables are already set (CI, Docker, local dev shells)",
-    "Add Unix socket path support in connection string resolution — when host begins with '/', afpsql uses conninfo format instead of a URL, enabling connections through local Unix domain sockets (e.g. /var/run/postgresql) without manual DSN construction"
+  "mutations": [
+    "Add --dry-run flag and Output::DryRun variant to preview SQL queries without executing, emitting the resolved SQL, params, and session for agent inspection",
+    "Add error hint field to Output::Error, providing actionable suggestions for connection failures and result size limits",
+    "Upgrade agent-first-data dependency from 0.5 to 0.6 to use the new hint parameter on build_cli_error"
   ],
   "license": "MIT",
-  "references": [
+  "bonds": [
     {
-      "uri": "cmn://cmn.dev/spore/blake3_eeb9f29b968d51855c8b8d60d8f97b64beff48e92405e005b7890b40503415e3",
-      "relation": "follows",
+      "uri": "cmn://cmn.dev/b3.AwNhTbTQiv5XwAJeKaMHRv2LxcweHudyLWYPh4qcP11J",
+      "relation": "depends_on",
+      "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
-    },
-    {
-      "uri": "cmn://cmn.dev/spore/blake3_2a01314cb7f17a60ced10d02eb41bdde5d892577552bdb3c0199e361f96b5423",
-      "relation": "spawned_from"
     }
   ],
   "tree": {

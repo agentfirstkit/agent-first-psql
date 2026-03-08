@@ -20,10 +20,10 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
         .clone()
         .or_else(|| std::env::var("AFPSQL_CONNINFO_SECRET").ok())
     {
-        let parsed: tokio_postgres::Config = conninfo
+        let _parsed: tokio_postgres::Config = conninfo
             .parse()
             .map_err(|e| format!("invalid conninfo: {e}"))?;
-        return Ok(config_to_url(&parsed));
+        return Ok(conninfo);
     }
 
     let host = cfg
@@ -75,34 +75,6 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
         user
     };
     Ok(format!("postgresql://{auth}@{host}:{port}/{dbname}"))
-}
-
-fn config_to_url(cfg: &tokio_postgres::Config) -> String {
-    let host = cfg
-        .get_hosts()
-        .first()
-        .map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => s.to_string(),
-            #[cfg(unix)]
-            tokio_postgres::config::Host::Unix(_) => "127.0.0.1".to_string(),
-            #[cfg(not(unix))]
-            _ => "127.0.0.1".to_string(),
-        })
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = cfg.get_ports().first().copied().unwrap_or(5432);
-    let user = cfg.get_user().unwrap_or("postgres");
-    let dbname = cfg.get_dbname().unwrap_or("postgres");
-    let password = cfg
-        .get_password()
-        .and_then(|pw| std::str::from_utf8(pw).ok())
-        .map(std::string::ToString::to_string);
-
-    let auth = if let Some(pw) = password {
-        format!("{user}:{pw}")
-    } else {
-        user.to_string()
-    };
-    format!("postgresql://{auth}@{host}:{port}/{dbname}")
 }
 
 #[cfg(test)]

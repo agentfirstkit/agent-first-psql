@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -100,6 +100,8 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
         .arg("pipe")
         .arg("--dsn-secret")
         .arg(test_dsn())
+        .env_remove("AFPSQL_DSN_SECRET")
+        .env_remove("AFPSQL_CONNINFO_SECRET")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -327,6 +329,225 @@ fn pipe_config_and_cancel_existing_query() {
     assert!(text.contains("\"code\":\"config\""));
     assert!(text.contains("\"error_code\":\"cancelled\"") || text.contains("\"code\":\"result\""));
     assert!(text.contains("\"code\":\"close\""));
+}
+
+#[test]
+fn pipe_config_update_switches_session_connection() {
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"q1","sql":"select 1 as n"})
+    )
+    .expect("write q1");
+    stdin.flush().expect("flush q1");
+
+    let mut line = String::new();
+    let mut all = String::new();
+    let mut saw_q1_result = false;
+    for _ in 0..64 {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read q1 line");
+        if n == 0 {
+            break;
+        }
+        all.push_str(&line);
+        if line.contains("\"id\":\"q1\"") && line.contains("\"code\":\"result\"") {
+            saw_q1_result = true;
+            break;
+        }
+    }
+    assert!(
+        saw_q1_result,
+        "did not observe q1 result before config update"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "code":"config",
+            "sessions":{"default":{"dsn_secret":"postgresql://127.0.0.1:1/postgres"}}
+        })
+    )
+    .expect("write config");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"q2","sql":"select 1 as n"})
+    )
+    .expect("write q2");
+    writeln!(stdin, "{}", serde_json::json!({"code":"close"})).expect("write close");
+    drop(stdin);
+
+    reader.read_to_string(&mut all).expect("read remaining");
+
+    let status = child.wait().expect("wait status");
+    assert!(status.success());
+    assert!(all.contains("\"code\":\"config\""));
+    assert!(all.contains("\"id\":\"q2\""));
+    assert!(
+        all.contains("\"error_code\":\"connect_failed\""),
+        "full output: {all}"
+    );
+}
+
+#[test]
+fn pipe_config_patch_can_clear_dsn_secret() {
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"q1","sql":"select 1 as n"})
+    )
+    .expect("write q1");
+    stdin.flush().expect("flush q1");
+
+    let mut line = String::new();
+    let mut all = String::new();
+    let mut saw_q1_result = false;
+    for _ in 0..64 {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read q1 line");
+        if n == 0 {
+            break;
+        }
+        all.push_str(&line);
+        if line.contains("\"id\":\"q1\"") && line.contains("\"code\":\"result\"") {
+            saw_q1_result = true;
+            break;
+        }
+    }
+    assert!(
+        saw_q1_result,
+        "did not observe q1 result before config update"
+    );
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "code":"config",
+            "sessions":{
+                "default":{
+                    "dsn_secret": null,
+                    "host":"127.0.0.1",
+                    "port": 1,
+                    "user":"postgres",
+                    "dbname":"postgres"
+                }
+            }
+        })
+    )
+    .expect("write config");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"q2","sql":"select 1 as n"})
+    )
+    .expect("write q2");
+    writeln!(stdin, "{}", serde_json::json!({"code":"close"})).expect("write close");
+    drop(stdin);
+
+    reader.read_to_string(&mut all).expect("read remaining");
+
+    let status = child.wait().expect("wait status");
+    assert!(status.success());
+    assert!(all.contains("\"code\":\"config\""));
+    assert!(all.contains("\"id\":\"q2\""));
+    assert!(
+        all.contains("\"error_code\":\"connect_failed\""),
+        "full output: {all}"
+    );
+}
+
+#[test]
+fn pipe_cancel_after_query_finished_returns_invalid_request() {
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"qdone","sql":"select 1 as n"})
+    )
+    .expect("write qdone");
+    stdin.flush().expect("flush qdone");
+
+    let mut line = String::new();
+    let mut all = String::new();
+    let mut saw_result = false;
+    for _ in 0..64 {
+        line.clear();
+        let n = reader.read_line(&mut line).expect("read qdone line");
+        if n == 0 {
+            break;
+        }
+        all.push_str(&line);
+        if line.contains("\"id\":\"qdone\"") && line.contains("\"code\":\"result\"") {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_result, "did not observe qdone result before cancel");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"cancel","id":"qdone"})
+    )
+    .expect("write cancel");
+    writeln!(stdin, "{}", serde_json::json!({"code":"close"})).expect("write close");
+    drop(stdin);
+
+    reader.read_to_string(&mut all).expect("read remaining");
+
+    let status = child.wait().expect("wait status");
+    assert!(status.success());
+    assert!(all.contains("\"id\":\"qdone\""));
+    assert!(all.contains("\"error_code\":\"invalid_request\""));
+    assert!(all.contains("query already finished"));
+    assert!(all.contains("\"code\":\"close\""));
 }
 
 #[test]

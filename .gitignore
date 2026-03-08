@@ -1,5 +1,6 @@
+/target
+
 # macOS metadata files
 .DS_Store
-/target
 # hypha spawn working directory
 .cmn
