@@ -20,6 +20,8 @@ use agent_first_data::OutputFormat;
 use cli::Mode;
 use config::sessions_to_invalidate;
 use handler::App;
+#[cfg(feature = "mcp")]
+use rmcp::ServiceExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +36,7 @@ async fn main() {
     let mode = match cli::parse_args() {
         Ok(m) => m,
         Err(e) => {
-            emit_cli_error(&e, OutputFormat::Json);
+            emit_cli_error(&e, None, OutputFormat::Json);
             std::process::exit(2);
         }
     };
@@ -43,7 +45,7 @@ async fn main() {
         Mode::Cli(req) => run_cli(req).await,
         Mode::Pipe(init) => run_pipe(init).await,
         #[cfg(feature = "mcp")]
-        Mode::Mcp(init) => mcp::run_mcp(init.session, init.log).await,
+        Mode::Mcp(init) => run_mcp(init).await,
     }
 }
 
@@ -327,6 +329,38 @@ async fn run_pipe(init: cli::PipeInit) {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
+#[cfg(feature = "mcp")]
+async fn run_mcp(init: cli::PipeInit) {
+    let mut config = RuntimeConfig::default();
+    if has_session_override(&init.session) {
+        config
+            .sessions
+            .insert(config.default_session.clone(), init.session);
+    }
+    if !init.log.is_empty() {
+        config.log = init.log;
+    }
+
+    let (tx, _rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
+    let app = Arc::new(App::new(config, tx));
+
+    let service = match mcp::AfpsqlMcp::new(app)
+        .serve(rmcp::transport::stdio())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            emit_cli_error(&format!("MCP serve failed: {e}"), None, OutputFormat::Json);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = service.waiting().await {
+        emit_cli_error(&format!("MCP server error: {e}"), None, OutputFormat::Json);
+        std::process::exit(1);
+    }
+}
+
 fn has_session_override(session: &SessionConfig) -> bool {
     session.dsn_secret.is_some()
         || session.conninfo_secret.is_some()
@@ -359,8 +393,8 @@ fn build_startup_log(
     }
 }
 
-fn emit_cli_error(msg: &str, format: OutputFormat) {
-    let value = agent_first_data::build_cli_error(msg, None);
+fn emit_cli_error(msg: &str, hint: Option<&str>, format: OutputFormat) {
+    let value = agent_first_data::build_cli_error(msg, hint);
     let rendered = agent_first_data::cli_output(&value, format);
     println!("{rendered}");
 }

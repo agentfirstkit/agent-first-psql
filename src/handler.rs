@@ -356,9 +356,9 @@ async fn emit_rows_result(
             .send(Output::Error {
                 id,
                 error_code: "result_too_large".to_string(),
-                error: "result exceeds inline limits; retry with stream_rows=true".to_string(),
+                error: "result exceeds inline limits".to_string(),
                 hint: Some(
-                    "use --stream-rows or increase --inline-max-rows/--inline-max-bytes"
+                    "retry with stream_rows=true, or increase --inline-max-rows/--inline-max-bytes"
                         .to_string(),
                 ),
                 retryable: false,
