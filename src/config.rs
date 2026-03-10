@@ -1,7 +1,6 @@
 use crate::types::*;
 use agent_first_data::cli_parse_log_filters;
 
-#[cfg(feature = "mcp")]
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl RuntimeConfig {

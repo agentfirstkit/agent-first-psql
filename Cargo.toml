@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out"
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 
 [features]
 default = ["mcp"]
-mcp = []
+mcp = ["dep:rmcp", "dep:schemars"]
 
 [[bin]]
 name = "afpsql"
@@ -25,3 +25,5 @@ deadpool-postgres = "0.14"
 bytes = "1"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["full"] }
+rmcp = { version = "1.1", features = ["macros", "server", "transport-io"], optional = true }
+schemars = { version = "1", optional = true }

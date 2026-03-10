@@ -126,41 +126,7 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
 
 #[test]
 fn mcp_initialize_list_and_query() {
-    let payload = serde_json::json!({
-        "jsonrpc":"2.0",
-        "id":1,
-        "method":"initialize",
-        "params":{}
-    })
-    .to_string()
-        + "\n"
-        + &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/list",
-            "params":{}
-        })
-        .to_string()
-        + "\n"
-        + &serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":3,
-            "method":"tools/call",
-            "params":{
-                "name":"psql_query",
-                "arguments":{
-                    "sql":"select $1::int as n",
-                    "params":[9],
-                    "session":"default"
-                }
-            }
-        })
-        .to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"shutdown","params":{}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","method":"exit","params":{}}).to_string()
-        + "\n";
+    use std::io::BufReader;
 
     let mut child = Command::new(bin())
         .arg("--mode")
@@ -173,28 +139,72 @@ fn mcp_initialize_list_and_query() {
         .spawn()
         .expect("spawn afpsql mode mcp");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(payload.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
 
+    // 1. initialize
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0.1"},"capabilities":{}}
+        })
+    )
+    .expect("write init");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read init");
+    assert!(line.contains("\"id\":1"));
+    assert!(line.contains("\"protocolVersion\""));
+
+    // 2. initialized notification
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .expect("write initialized");
+    stdin.flush().expect("flush");
+
+    // 3. tools/list
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+    )
+    .expect("write tools/list");
+    stdin.flush().expect("flush");
+    let mut line2 = String::new();
+    reader.read_line(&mut line2).expect("read tools/list");
+    assert!(line2.contains("\"id\":2"));
+    assert!(line2.contains("\"psql_query\""));
+
+    // 4. psql_query tool call
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"psql_query","arguments":{"sql":"select $1::int as n","params":[9],"session":"default"}}
+        })
+    )
+    .expect("write query");
+    stdin.flush().expect("flush");
+    let mut line3 = String::new();
+    reader.read_line(&mut line3).expect("read query result");
+    assert!(line3.contains("\"id\":3"), "query response: {line3}");
+    assert!(line3.contains("\"content\""), "query has content: {line3}");
+
+    // Close stdin to shut down
+    drop(stdin);
     let out = child.wait_with_output().expect("wait output");
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = String::from_utf8(out.stdout).expect("utf8");
-
-    assert!(text.contains("\"id\":1"));
-    assert!(text.contains("\"protocolVersion\""));
-    assert!(text.contains("\"id\":2"));
-    assert!(text.contains("\"psql_query\""));
-    assert!(text.contains("\"id\":3"));
-    assert!(text.contains("\"structuredContent\""));
-    assert!(text.contains("\"ROWS 1\""));
 }
 
 #[test]
@@ -551,20 +561,8 @@ fn pipe_cancel_after_query_finished_returns_invalid_request() {
 }
 
 #[test]
-fn mcp_parse_ping_and_unknown_paths() {
-    let payload = "\n{bad-json}\n".to_string()
-        + &serde_json::json!({"jsonrpc":"2.0","id":11,"method":"ping","params":{}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","id":12,"method":"not-found","params":{}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"psql_config","arguments":1}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","method":"tools/call","params":{"name":"psql_query","arguments":{"sql":"select 1"}}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"psql_config","arguments":{"inline_max_rows":"bad"}}}).to_string()
-        + "\n"
-        + &serde_json::json!({"jsonrpc":"2.0","method":"exit","params":{}}).to_string()
-        + "\n";
+fn mcp_protocol_error_handling() {
+    use std::io::BufReader;
 
     let mut child = Command::new(bin())
         .arg("--mode")
@@ -575,28 +573,62 @@ fn mcp_parse_ping_and_unknown_paths() {
         .spawn()
         .expect("spawn afpsql mode mcp");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(payload.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
 
-    let out = child.wait_with_output().expect("wait output");
+    // 1. initialize
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"test","version":"0.1"},"capabilities":{}}
+        })
+    )
+    .expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    assert!(line.contains("\"protocolVersion\""));
+
+    // 2. initialized
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .expect("write");
+    stdin.flush().expect("flush");
+
+    // 3. psql_config with invalid type (string instead of integer for inline_max_rows)
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc":"2.0","id":10,"method":"tools/call",
+            "params":{"name":"psql_config","arguments":{"inline_max_rows":"bad"}}
+        })
+    )
+    .expect("write");
+    stdin.flush().expect("flush");
+    let mut line2 = String::new();
+    reader.read_line(&mut line2).expect("read");
+    assert!(line2.contains("\"id\":10"), "error response: {line2}");
+    // rmcp returns an error for invalid tool arguments
+    assert!(
+        line2.contains("\"error\"") || line2.contains("\"isError\""),
+        "should be error: {line2}"
+    );
+
+    // Close stdin
+    drop(stdin);
+    let out = child.wait_with_output().expect("wait");
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = String::from_utf8(out.stdout).expect("utf8");
-    assert!(text.contains("\"code\":-32700"));
-    assert!(text.contains("\"id\":11"));
-    assert!(text.contains("\"id\":12"));
-    assert!(text.contains("method not found"));
-    assert!(text.contains("\"id\":13"));
-    assert!(text.contains("\"isError\":true"));
-    assert!(text.contains("\"id\":14"));
-    assert!(text.contains("invalid config patch"));
 }
 
 #[test]

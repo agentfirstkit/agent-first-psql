@@ -1,35 +1,62 @@
 use super::*;
+use rmcp::ServerHandler;
 
-#[test]
-fn tools_list_contains_expected_tools() {
-    let list = tools_list();
-    let text = list.to_string();
-    assert!(text.contains("psql_query"));
-    assert!(text.contains("psql_config"));
+fn test_app() -> Arc<crate::handler::App> {
+    let config = RuntimeConfig::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    Arc::new(crate::handler::App::new(config, tx))
 }
 
 #[test]
-fn tool_ok_and_error_shapes() {
-    let ok = tool_ok(serde_json::json!({"k":"v"}));
-    let err = tool_error("bad");
-    assert_eq!(ok["isError"], false);
-    assert_eq!(err["isError"], true);
+fn get_info_exposes_tools_and_instructions() {
+    let app = test_app();
+    let mcp = AfpsqlMcp::new(app);
+    let info = mcp.get_info();
+    assert!(info.instructions.is_some());
 }
 
-#[test]
-fn jsonrpc_wrappers() {
-    let r = jsonrpc_result(serde_json::json!(1), serde_json::json!({"ok":true}));
-    let e = jsonrpc_error(Some(serde_json::json!(2)), -1, "x".to_string());
-    assert_eq!(r["jsonrpc"], "2.0");
-    assert_eq!(e["error"]["code"], -1);
-    assert_eq!(e["id"], 2);
+#[tokio::test]
+async fn psql_config_returns_current_config() {
+    let app = test_app();
+    let mcp = AfpsqlMcp::new(app);
+
+    let res = mcp
+        .psql_config(rmcp::handler::server::wrapper::Parameters(
+            PsqlConfigParams {
+                default_session: None,
+                sessions: None,
+                inline_max_rows: None,
+                inline_max_bytes: None,
+                statement_timeout_ms: None,
+                lock_timeout_ms: None,
+                log: None,
+            },
+        ))
+        .await;
+    assert!(res.is_ok());
 }
 
-#[test]
-fn has_session_override_detects_values() {
-    assert!(!has_session_override(&SessionConfig::default()));
-    assert!(has_session_override(&SessionConfig {
-        host: Some("localhost".to_string()),
-        ..Default::default()
-    }));
+#[tokio::test]
+async fn psql_config_applies_update() {
+    let app = test_app();
+    let mcp = AfpsqlMcp::new(app.clone());
+
+    let res = mcp
+        .psql_config(rmcp::handler::server::wrapper::Parameters(
+            PsqlConfigParams {
+                default_session: None,
+                sessions: None,
+                inline_max_rows: Some(42),
+                inline_max_bytes: None,
+                statement_timeout_ms: Some(5000),
+                lock_timeout_ms: None,
+                log: None,
+            },
+        ))
+        .await;
+    assert!(res.is_ok());
+
+    let cfg = app.config.read().await;
+    assert_eq!(cfg.inline_max_rows, 42);
+    assert_eq!(cfg.statement_timeout_ms, 5000);
 }
