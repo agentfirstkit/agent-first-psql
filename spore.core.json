@@ -1,7 +1,8 @@
 {
+  "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "domain": "cmn.dev",
   "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
   "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
@@ -11,19 +12,20 @@
     "Provide predictable machine-readable outputs for row sets, command status, and errors so agent workflows can branch without parsing human-formatted terminal output"
   ],
   "mutations": [
-    "Rewrite MCP server using rmcp SDK with typed tool routing — execute_sql and psql_config are now proper MCP tools with JsonSchema parameter validation, replacing the hand-rolled JSON-RPC framing that required agents to know the wire format",
-    "Add hint field to CLI error outputs, giving agents actionable next-step suggestions when argument parsing or startup fails",
-    "Improve result_too_large error message to suggest stream_rows=true as the primary remedy, making the retry path clearer for agents hitting inline row/byte limits"
+    "Apply redaction policy to SQL result output — Result and ResultRows events use RedactionTraceOnly to preserve query payload while redacting trace metadata, ensuring sensitive column values are never masked by the output layer",
+    "Protect rows field in non-JSON output formats by serializing it as an opaque JSON string, preventing YAML and plain formatters from re-interpreting SQL row data and corrupting its structure",
+    "Apply per-event redaction policy in MCP mode before assembling the events array, consistent with CLI and pipe modes",
+    "Update agent-first-data dependency to 0.7.0, which adds YAML and plain-text output format support"
   ],
   "license": "MIT",
   "bonds": [
     {
       "relation": "spawned_from",
-      "uri": "cmn://cmn.dev/b3.bjdRyoeA17dnkgFt7xZ2g8isnKkwcx1ZcikgGJXNR4Y"
+      "uri": "cmn://cmn.dev/b3.8ESkL1akt6peTpnmx3kmmmQVFMgjfmu9hYauVX169i2d"
     },
     {
       "relation": "depends_on",
-      "uri": "cmn://cmn.dev/b3.4Q6SQVbb9HLB8ffJpzuqECtq8TZZrBXzHtqoHgJXoNJ5",
+      "uri": "cmn://cmn.dev/b3.CXRG2dKsx1Dgmw5zVCydwcLKF1zCKcEqhS1UDewyqjCu",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

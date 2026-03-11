@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out"
 license = "MIT"
@@ -16,7 +16,7 @@ name = "afpsql"
 path = "src/main.rs"
 
 [dependencies]
-agent-first-data = "0.6"
+agent-first-data = "0.7.0"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
