@@ -13,10 +13,11 @@ mod db;
 mod handler;
 #[cfg(feature = "mcp")]
 mod mcp;
+mod output_fmt;
 mod types;
 mod writer;
 
-use agent_first_data::OutputFormat;
+use agent_first_data::{cli_output, OutputFormat};
 use cli::Mode;
 use config::sessions_to_invalidate;
 use handler::App;
@@ -395,13 +396,12 @@ fn build_startup_log(
 
 fn emit_cli_error(msg: &str, hint: Option<&str>, format: OutputFormat) {
     let value = agent_first_data::build_cli_error(msg, hint);
-    let rendered = agent_first_data::cli_output(&value, format);
+    let rendered = cli_output(&value, format);
     println!("{rendered}");
 }
 
 fn emit_output(out: &Output, format: OutputFormat) {
-    let value = serde_json::to_value(out).unwrap_or(serde_json::Value::Null);
-    let rendered = agent_first_data::cli_output(&value, format);
+    let rendered = output_fmt::render_output(out, format);
     println!("{rendered}");
 }
 

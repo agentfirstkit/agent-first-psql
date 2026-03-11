@@ -1,3 +1,4 @@
+use agent_first_data::RedactionPolicy;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -138,11 +139,18 @@ impl AfpsqlMcp {
         drop(call_app);
         let mut outputs = vec![];
         while let Some(msg) = rx.recv().await {
-            outputs.push(serde_json::to_value(&msg).unwrap_or(Value::Null));
+            let rendered =
+                crate::output_fmt::render_output(&msg, agent_first_data::OutputFormat::Json);
+            let redacted_value = match serde_json::from_str::<Value>(&rendered) {
+                Ok(v) => v,
+                Err(_) => Value::Null,
+            };
+            outputs.push(redacted_value);
         }
 
         let result = json!({"events": outputs});
-        let json = agent_first_data::output_json(&result);
+        // Events are already policy-processed per output type above.
+        let json = agent_first_data::output_json_with(&result, RedactionPolicy::RedactionNone);
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
