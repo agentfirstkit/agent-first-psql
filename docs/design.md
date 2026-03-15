@@ -126,10 +126,6 @@ Long-lived JSONL session on stdin/stdout:
 - concurrent in-flight queries
 - id-based correlation
 
-### MCP mode (`--mode mcp`)
-
-Exposes structured SQL tools to MCP clients.
-
 ## Connection Model (Agent-First)
 
 Connection may be supplied by:
@@ -248,7 +244,6 @@ Runtime diagnostics:
 2. `result` + `result_*` streaming
 3. connection resolution model above
 4. parameter binding (`params`)
-5. MCP tools (`psql_query`, `psql_config`)
 
 Future:
 

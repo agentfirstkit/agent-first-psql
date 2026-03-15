@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 pub enum Mode {
     Cli(CliRequest),
     Pipe(PipeInit),
-    #[cfg(feature = "mcp")]
-    Mcp(PipeInit),
 }
 
 pub struct PipeInit {
@@ -39,8 +37,6 @@ pub struct CliRequest {
 enum RuntimeMode {
     Cli,
     Pipe,
-    #[cfg(feature = "mcp")]
-    Mcp,
     #[value(name = "psql")]
     Psql,
 }
@@ -129,8 +125,6 @@ pub fn parse_args() -> Result<Mode, String> {
     let mode_name = match cli.mode {
         RuntimeMode::Cli => "cli",
         RuntimeMode::Pipe => "pipe",
-        #[cfg(feature = "mcp")]
-        RuntimeMode::Mcp => "mcp",
         RuntimeMode::Psql => "psql",
     };
     let startup_args = json!({
@@ -161,18 +155,6 @@ pub fn parse_args() -> Result<Mode, String> {
     match cli.mode {
         RuntimeMode::Pipe => {
             return Ok(Mode::Pipe(PipeInit {
-                output,
-                session,
-                log: log.clone(),
-                startup_argv: raw,
-                startup_args,
-                startup_env,
-                startup_requested,
-            }));
-        }
-        #[cfg(feature = "mcp")]
-        RuntimeMode::Mcp => {
-            return Ok(Mode::Mcp(PipeInit {
                 output,
                 session,
                 log: log.clone(),
