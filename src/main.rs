@@ -1,9 +1,12 @@
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::disallowed_methods,
-    clippy::disallowed_macros
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::print_stdout,
+        clippy::print_stderr,
+    )
 )]
 
 mod cli;
@@ -14,6 +17,8 @@ mod handler;
 mod output_fmt;
 mod types;
 mod writer;
+
+use std::io::Write;
 
 use agent_first_data::{cli_output, OutputFormat};
 use cli::Mode;
@@ -359,12 +364,12 @@ fn build_startup_log(
 fn emit_cli_error(msg: &str, hint: Option<&str>, format: OutputFormat) {
     let value = agent_first_data::build_cli_error(msg, hint);
     let rendered = cli_output(&value, format);
-    println!("{rendered}");
+    let _ = writeln!(std::io::stdout(), "{rendered}");
 }
 
 fn emit_output(out: &Output, format: OutputFormat) {
     let rendered = output_fmt::render_output(out, format);
-    println!("{rendered}");
+    let _ = writeln!(std::io::stdout(), "{rendered}");
 }
 
 #[cfg(test)]

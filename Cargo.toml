@@ -1,23 +1,39 @@
 [package]
 name = "agent-first-psql"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out"
 license = "MIT"
 repository = "https://github.com/cmnspore/agent-first-psql"
 readme = "README.md"
 
+[features]
+docgen = ["dep:clap-markdown"]
+
 [[bin]]
 name = "afpsql"
 path = "src/main.rs"
 
+[[bin]]
+name = "afpsql-docgen"
+path = "src/bin/afpsql_docgen.rs"
+required-features = ["docgen"]
+
 [dependencies]
-agent-first-data = "0.7.0"
+agent-first-data = "0.7"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+clap-markdown = { version = "0.1.5", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 deadpool-postgres = "0.14"
 bytes = "1"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["full"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

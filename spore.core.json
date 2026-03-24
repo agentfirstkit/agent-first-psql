@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "domain": "cmn.dev",
   "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
   "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
@@ -11,18 +11,21 @@
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
     "Provide predictable machine-readable outputs for row sets, command status, and errors so agent workflows can branch without parsing human-formatted terminal output"
   ],
-  "mutations": [
-    "Remove MCP server mode — afpsql no longer ships with --mode mcp or the rmcp/schemars dependencies, reducing binary size and dependency surface for agents that use afpsql through its native CLI or pipe modes"
-  ],
   "license": "MIT",
+  "mutations": [
+    "Add auto-generated CLI documentation from clap derive definitions, replacing the hand-maintained cli.md with a generated reference that stays in sync with source code",
+    "Organize CLI flags into logical help headings for clearer --help output",
+    "Enforce strict clippy lints across all production code with explicit test-only allowances",
+    "Bump agent-first-data dependency to 0.7"
+  ],
   "bonds": [
     {
       "relation": "spawned_from",
-      "uri": "cmn://cmn.dev/b3.HqBJdpkjQSvkhxHQnRZPXVsQiBjrr56o7gAGbn1ZhVd3"
+      "uri": "cmn://cmn.dev/b3.EMBnMZzFbmVrRVkSEB33UHALV8AKyQPYEtZ29AnX2vjh"
     },
     {
       "relation": "depends_on",
-      "uri": "cmn://cmn.dev/b3.6kdwoYeoB3GbKVFB4NnKUfHtuuNttHLpaf9nYgtMHhf6",
+      "uri": "cmn://cmn.dev/b3.77SvrWL81dyaWyUUgRREx4WTLXfKyog9AyhxSG2fvVLP",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

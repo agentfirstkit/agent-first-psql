@@ -94,7 +94,7 @@ afpsql --dbname appdb --sql "select current_database()"
 
 See docs for details:
 
-- [CLI Manual](docs/cli.md)
+- [CLI](docs/cli.md)
 - [Protocol Reference](docs/reference.md)
 - [Design](docs/design.md)
 

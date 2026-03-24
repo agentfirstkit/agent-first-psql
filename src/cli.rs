@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use crate::types::{QueryOptions, SessionConfig};
 use agent_first_data::{cli_parse_log_filters, cli_parse_output, OutputFormat};
 use clap::{Parser, ValueEnum};
@@ -41,55 +43,122 @@ enum RuntimeMode {
     Psql,
 }
 
+#[doc = r#"Agent-First PostgreSQL client.
+
+### Interface Policy
+
+- default mode is canonical agent-first CLI
+- `--mode psql` is argument translation only; runtime output stays JSONL
+- stdout carries protocol events; stderr is not a protocol channel
+
+### Query Sources and Parameters
+
+- use `--sql` for inline SQL or `--sql-file` for a file
+- use repeatable `--param N=value` for positional binds
+- placeholder count is validated from prepared-statement metadata, not by SQL text scanning
+
+### Connection Sources
+
+- `--dsn-secret` for a PostgreSQL URI
+- `--conninfo-secret` for libpq-style conninfo
+- or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
+- agent-first environment fallbacks: `AFPSQL_*`
+- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`
+
+### Result Shaping
+
+- default mode buffers a bounded inline result
+- use `--stream-rows` for large result sets, with `--batch-rows` and `--batch-bytes` to tune chunk size
+- `--output json|yaml|plain` changes rendering only, not the runtime schema
+
+### Examples
+
+```text
+afpsql --sql "select now() as now_rfc3339"
+afpsql --sql-file ./query.sql
+afpsql --sql "select * from users where id = $1" --param 1=123
+afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select 1"
+afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
+afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
+afpsql --mode pipe
+```
+
+### Exit Codes
+
+- `0`: query completed successfully
+- `1`: SQL error or runtime error
+- `2`: invalid CLI arguments
+"#]
 #[derive(Parser)]
-#[command(name = "afpsql", version, about = "Agent-First PostgreSQL client")]
-struct AfdCli {
-    #[arg(long)]
+#[command(name = "afpsql", version, verbatim_doc_comment)]
+pub struct AfdCli {
+    /// Inline SQL string to execute.
+    #[arg(long, help_heading = "Query")]
     sql: Option<String>,
-    #[arg(long = "sql-file")]
+    /// Read SQL from a file.
+    #[arg(long = "sql-file", help_heading = "Query")]
     sql_file: Option<String>,
-    #[arg(long = "param")]
+    /// Positional bind parameter in `N=value` form. Repeat for additional parameters.
+    #[arg(long = "param", help_heading = "Query")]
     param: Vec<String>,
-    #[arg(long = "stream-rows")]
+    /// Stream large result sets as `result_rows` batches instead of a single inline result.
+    #[arg(long = "stream-rows", help_heading = "Query")]
     stream_rows: bool,
-    #[arg(long = "batch-rows")]
+    /// Maximum rows per streamed batch.
+    #[arg(long = "batch-rows", help_heading = "Query")]
     batch_rows: Option<usize>,
-    #[arg(long = "batch-bytes")]
+    /// Soft byte target per streamed batch.
+    #[arg(long = "batch-bytes", help_heading = "Query")]
     batch_bytes: Option<usize>,
-    #[arg(long = "statement-timeout-ms")]
+    /// Per-query statement timeout in milliseconds.
+    #[arg(long = "statement-timeout-ms", help_heading = "Query")]
     statement_timeout_ms: Option<u64>,
-    #[arg(long = "lock-timeout-ms")]
+    /// Per-query lock timeout in milliseconds.
+    #[arg(long = "lock-timeout-ms", help_heading = "Query")]
     lock_timeout_ms: Option<u64>,
-    #[arg(long = "inline-max-rows")]
+    /// Maximum inline rows before returning `result_too_large`.
+    #[arg(long = "inline-max-rows", help_heading = "Query")]
     inline_max_rows: Option<usize>,
-    #[arg(long = "inline-max-bytes")]
+    /// Maximum inline payload bytes before returning `result_too_large`.
+    #[arg(long = "inline-max-bytes", help_heading = "Query")]
     inline_max_bytes: Option<usize>,
-    #[arg(long = "read-only")]
+    /// Force the query to run in a read-only transaction.
+    #[arg(long = "read-only", help_heading = "Query")]
     read_only: bool,
     /// Preview the query without executing it
-    #[arg(long)]
+    #[arg(long, help_heading = "Query")]
     dry_run: bool,
 
-    #[arg(long = "dsn-secret")]
+    /// PostgreSQL DSN URI. Redacted in structured output.
+    #[arg(long = "dsn-secret", help_heading = "Connection")]
     dsn_secret: Option<String>,
-    #[arg(long = "conninfo-secret")]
+    /// libpq-style conninfo string. Redacted in structured output.
+    #[arg(long = "conninfo-secret", help_heading = "Connection")]
     conninfo_secret: Option<String>,
-    #[arg(long)]
+    /// PostgreSQL host.
+    #[arg(long, help_heading = "Connection")]
     host: Option<String>,
-    #[arg(long)]
+    /// PostgreSQL port.
+    #[arg(long, help_heading = "Connection")]
     port: Option<u16>,
-    #[arg(long)]
+    /// PostgreSQL user name.
+    #[arg(long, help_heading = "Connection")]
     user: Option<String>,
-    #[arg(long)]
+    /// PostgreSQL database name.
+    #[arg(long, help_heading = "Connection")]
     dbname: Option<String>,
-    #[arg(long = "password-secret")]
+    /// PostgreSQL password. Redacted in structured output.
+    #[arg(long = "password-secret", help_heading = "Connection")]
     password_secret: Option<String>,
 
-    #[arg(long, default_value = "json")]
+    /// Output format: json (default), yaml, or plain.
+    #[arg(long, default_value = "json", help_heading = "Runtime")]
     output: String,
-    #[arg(long = "log", value_delimiter = ',')]
+    /// Diagnostic log categories.
+    #[arg(long = "log", value_delimiter = ',', help_heading = "Runtime")]
     log: Vec<String>,
-    #[arg(long, value_enum, default_value_t = RuntimeMode::Cli)]
+    /// Runtime mode: canonical cli, pipe, or `psql` translation mode.
+    #[arg(long, value_enum, default_value_t = RuntimeMode::Cli, help_heading = "Runtime")]
     mode: RuntimeMode,
 }
 
@@ -105,7 +174,7 @@ pub fn parse_args() -> Result<Mode, String> {
         Err(e) => {
             use clap::error::ErrorKind;
             if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
-                println!("{e}");
+                let _ = writeln!(std::io::stdout(), "{e}");
                 std::process::exit(0);
             }
             return Err(e.to_string());

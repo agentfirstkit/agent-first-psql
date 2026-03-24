@@ -1,6 +1,7 @@
-disallowed-methods = [
-  { path = "str::split_whitespace", reason = "Do not parse SQL text to decide runtime behavior; use prepared-statement metadata from PostgreSQL." },
-]
 disallowed-macros = [
-  { path = "std::eprintln", reason = "Protocol/diagnostic runtime events must stay on stdout as structured outputs (code:error/code:log)." },
+  { path = "std::eprintln", reason = "AFDATA protocol/log events must use stdout only; stderr is not a protocol channel." },
+]
+
+disallowed-methods = [
+  { path = "std::io::stderr", reason = "AFDATA protocol/log events must use stdout only; stderr is not a protocol channel." },
 ]
