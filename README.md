@@ -19,7 +19,6 @@ structures, connection reuse, and streaming for large result sets.
 
 - CLI mode: one SQL, one structured result, exit
 - Pipe mode: JSONL stdin/stdout session with connection reuse and concurrent query handling
-- MCP mode: tool interface for AI assistants
 
 ## Contract
 
@@ -95,10 +94,9 @@ afpsql --dbname appdb --sql "select current_database()"
 
 See docs for details:
 
-- [CLI Manual](docs/cli.md)
+- [CLI](docs/cli.md)
 - [Protocol Reference](docs/reference.md)
 - [Design](docs/design.md)
-- [MCP Reference](docs/mcp.md)
 
 ## License
 

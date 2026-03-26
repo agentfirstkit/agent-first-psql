@@ -8,9 +8,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: .
 
     services:
       postgres:
@@ -43,8 +40,10 @@ jobs:
             target
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Static + Unit
-        run: ./scripts/test.sh unit
+      - name: Unit
+        run: cargo test --bin afpsql
 
       - name: Integration
-        run: ./scripts/test.sh integration
+        run: |
+          cargo build
+          cargo test --tests

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
@@ -203,102 +205,4 @@ fn handler_param_types_and_empty_rows() {
     let v: Value = serde_json::from_str(&stdout).expect("json output");
     assert_eq!(v["columns"].as_array().map(|a| a.len()).unwrap_or(0), 1);
     assert_eq!(v["columns"][0]["name"], "n");
-}
-
-#[test]
-fn mcp_initialize_and_tools_list() {
-    use std::io::{BufRead, BufReader};
-
-    // MCP protocol: initialize → initialized notification → tools/list → close stdin
-    let mut child = Command::new(bin())
-        .arg("--mode")
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mcp");
-
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut reader = BufReader::new(stdout);
-
-    // 1. Send initialize
-    let init_msg = serde_json::json!({
-        "jsonrpc":"2.0",
-        "id":1,
-        "method":"initialize",
-        "params": {
-            "protocolVersion":"2024-11-05",
-            "clientInfo":{"name":"test","version":"0.1"},
-            "capabilities":{}
-        }
-    });
-    writeln!(stdin, "{}", init_msg).expect("write init");
-    stdin.flush().expect("flush");
-
-    // Read initialize response
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read init response");
-    assert!(
-        line.contains("\"protocolVersion\""),
-        "init response: {line}"
-    );
-    assert!(line.contains("afpsql"), "server name: {line}");
-
-    // 2. Send initialized notification
-    let initialized = serde_json::json!({
-        "jsonrpc":"2.0",
-        "method":"notifications/initialized"
-    });
-    writeln!(stdin, "{}", initialized).expect("write initialized");
-    stdin.flush().expect("flush");
-
-    // 3. Send tools/list
-    let tools_list = serde_json::json!({
-        "jsonrpc":"2.0",
-        "id":2,
-        "method":"tools/list",
-        "params": {}
-    });
-    writeln!(stdin, "{}", tools_list).expect("write tools/list");
-    stdin.flush().expect("flush");
-
-    // Read tools/list response
-    let mut line2 = String::new();
-    reader
-        .read_line(&mut line2)
-        .expect("read tools/list response");
-    assert!(
-        line2.contains("psql_query"),
-        "tools list has psql_query: {line2}"
-    );
-    assert!(
-        line2.contains("psql_config"),
-        "tools list has psql_config: {line2}"
-    );
-
-    // 4. Send psql_config tool call (read config)
-    let config_call = serde_json::json!({
-        "jsonrpc":"2.0",
-        "id":3,
-        "method":"tools/call",
-        "params": {"name":"psql_config","arguments":{}}
-    });
-    writeln!(stdin, "{}", config_call).expect("write config call");
-    stdin.flush().expect("flush");
-
-    // Read config response
-    let mut line3 = String::new();
-    reader.read_line(&mut line3).expect("read config response");
-    assert!(line3.contains("\"id\":3"), "config response id: {line3}");
-    assert!(
-        line3.contains("\"content\""),
-        "config response content: {line3}"
-    );
-
-    // Close stdin to shut down the server
-    drop(stdin);
-    let out = child.wait_with_output().expect("wait");
-    assert!(out.status.success());
 }

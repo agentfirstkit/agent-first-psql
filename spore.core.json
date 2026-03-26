@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.3.1",
+  "version": "0.4.2",
   "domain": "cmn.dev",
   "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
   "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
@@ -11,21 +11,14 @@
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
     "Provide predictable machine-readable outputs for row sets, command status, and errors so agent workflows can branch without parsing human-formatted terminal output"
   ],
-  "mutations": [
-    "Apply redaction policy to SQL result output — Result and ResultRows events use RedactionTraceOnly to preserve query payload while redacting trace metadata, ensuring sensitive column values are never masked by the output layer",
-    "Protect rows field in non-JSON output formats by serializing it as an opaque JSON string, preventing YAML and plain formatters from re-interpreting SQL row data and corrupting its structure",
-    "Apply per-event redaction policy in MCP mode before assembling the events array, consistent with CLI and pipe modes",
-    "Update agent-first-data dependency to 0.7.0, which adds YAML and plain-text output format support"
-  ],
   "license": "MIT",
+  "mutations": [
+    "Replace --help with recursive plain-text output via agent-first-data cli_render_help, and add --help-markdown for Markdown documentation generation — agents get the full CLI interface in one call"
+  ],
   "bonds": [
     {
-      "relation": "spawned_from",
-      "uri": "cmn://cmn.dev/b3.8ESkL1akt6peTpnmx3kmmmQVFMgjfmu9hYauVX169i2d"
-    },
-    {
       "relation": "depends_on",
-      "uri": "cmn://cmn.dev/b3.CXRG2dKsx1Dgmw5zVCydwcLKF1zCKcEqhS1UDewyqjCu",
+      "uri": "cmn://cmn.dev/b3.AgMr3xwC5DbTa1QWvDrqoLiVU2hCK5X2gto6uBHenGkH",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }
@@ -33,7 +26,8 @@
   "tree": {
     "algorithm": "blob_tree_blake3_nfc",
     "exclude_names": [
-      ".git"
+      ".git",
+      ".cmn"
     ],
     "follow_rules": [
       ".gitignore"

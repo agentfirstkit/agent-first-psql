@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;

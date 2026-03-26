@@ -1,224 +1,94 @@
-# Agent-First PSQL — CLI Manual
+<!-- Generated. Do not edit by hand. -->
 
-Practical usage for `afpsql`.
+# afpsql CLI Reference
 
-## Interface Policy
+> Regenerate with `./scripts/generate-cli-doc.sh`.
 
-`afpsql` has two CLI entry modes with one execution core:
+# Command-Line Help for `afpsql`
 
-1. agent-first mode (default)
-2. `psql mode` (`--mode psql`) as argument translation only
+This document contains the help content for the `afpsql` command-line program.
 
-Both modes execute through the same Agent-First Data runtime protocol and produce the same
-structured output events.
+**Command Overview:**
 
-`afpsql` CLI parsing/output follows shared Agent-First Data helpers from `agent-first-data`
-(`cli_parse_output`, `cli_parse_log_filters`, `cli_output`, `build_cli_error`).
+* [`afpsql`↴](#afpsql)
 
-Protocol stream contract:
+## `afpsql`
 
-- `stdout` carries all structured protocol events (`result` / `error` / `log` / ...)
-- `stderr` is not a protocol channel and should not be parsed by agents
+Agent-First PostgreSQL client.
 
-## Run One Query
+### Interface Policy
 
-```bash
+- default mode is canonical agent-first CLI
+- `--mode psql` is argument translation only; runtime output stays JSONL
+- stdout carries protocol events; stderr is not a protocol channel
+
+### Query Sources and Parameters
+
+- use `--sql` for inline SQL or `--sql-file` for a file
+- use repeatable `--param N=value` for positional binds
+- placeholder count is validated from prepared-statement metadata, not by SQL text scanning
+
+### Connection Sources
+
+- `--dsn-secret` for a PostgreSQL URI
+- `--conninfo-secret` for libpq-style conninfo
+- or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
+- agent-first environment fallbacks: `AFPSQL_*`
+- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`
+
+### Result Shaping
+
+- default mode buffers a bounded inline result
+- use `--stream-rows` for large result sets, with `--batch-rows` and `--batch-bytes` to tune chunk size
+- `--output json|yaml|plain` changes rendering only, not the runtime schema
+
+### Examples
+
+```text
 afpsql --sql "select now() as now_rfc3339"
-```
-
-Default output is structured JSON:
-
-```json
-{"code":"result","command_tag":"ROWS 1","columns":[{"name":"now_rfc3339","type":"timestamptz"}],"rows":[{"now_rfc3339":"2026-02-19T12:34:56Z"}],"row_count":1,"trace":{"duration_ms":3}}
-```
-
-## Query Sources
-
-SQL string:
-
-```bash
-afpsql --sql "select * from users limit 10"
-```
-
-SQL file:
-
-```bash
 afpsql --sql-file ./query.sql
-```
-
-## Safe Parameters
-
-Use placeholders with positional param flags:
-
-```bash
-afpsql \
-  --sql "select * from users where id = $1 and status = $2" \
-  --param 1=123 \
-  --param 2=active
-```
-
-Rules:
-
-- placeholder count must match parameter count (validated against prepared-statement metadata, not SQL text scanning)
-- malformed params return `invalid_params`
-- values are type-checked against server-prepared parameter OIDs
-- text-template substitution is not supported
-
-Single canonical form: `--param N=VALUE` (repeatable).
-
-## Connection Flags (Agent-First)
-
-URI DSN:
-
-```bash
-afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb?sslmode=prefer" --sql "select 1"
-```
-
-Conninfo:
-
-```bash
-afpsql --conninfo-secret "host=127.0.0.1 port=5432 dbname=appdb user=app sslmode=prefer" --sql "select 1"
-```
-
-Discrete fields:
-
-```bash
-afpsql \
-  --host 127.0.0.1 \
-  --port 5432 \
-  --user app \
-  --dbname appdb \
-  --password-secret 'secret' \
-  --sql "select 1"
-```
-
-Optional environment fallback (agent-first names):
-
-- `AFPSQL_DSN_SECRET`
-- `AFPSQL_CONNINFO_SECRET`
-- `AFPSQL_HOST`
-- `AFPSQL_PORT`
-- `AFPSQL_USER`
-- `AFPSQL_DBNAME`
-- `AFPSQL_PASSWORD_SECRET`
-
-Standard PostgreSQL environment fallback is also supported (lower precedence):
-
-- `PGHOST`
-- `PGPORT`
-- `PGUSER`
-- `PGDATABASE`
-
-## `psql` Mode (Translation Only)
-
-Enable with `--mode psql`.
-
-Purpose:
-
-- parse legacy-style CLI connection/query arguments
-- translate to canonical agent-first request/config fields
-
-Still not supported:
-
-- table/text output compatibility
-- meta-commands
-- text interpolation
-
-Supported translated inputs:
-
-- query: `-c`, `-f`
-- connection: `-h`, `-p`, `-U`, `-d`, DSN/conninfo equivalents
-- numeric `-v` bindings -> `params` positions
-
-Example:
-
-```bash
-afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb \
-  -c "select * from users where id = $1 and status = $2" \
-  -v 1=123 -v 2=active
-```
-
-Compatibility boundary:
-
-- compatible: accepted CLI flags and positional bind translation
-- incompatible by design: output format, `psql` meta-commands, interpolation semantics
-
-## Large Result Sets
-
-For large `select *`, enable streaming:
-
-```bash
+afpsql --sql "select * from users where id = $1" --param 1=123
+afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select 1"
+afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
+afpsql --mode pipe
 ```
 
-Output sequence:
+### Exit Codes
 
-1. `result_start`
-2. repeated `result_rows`
-3. `result_end`
+- `0`: query completed successfully
+- `1`: SQL error or runtime error
+- `2`: invalid CLI arguments
 
-If streaming is disabled and result exceeds inline limits, `afpsql` returns:
+**Usage:** `afpsql [OPTIONS]`
 
-```json
-{"code":"error","error_code":"result_too_large","retryable":false,...}
-```
+###### **Options:**
 
-## Pipe Mode
+* `--sql <SQL>` — Inline SQL string to execute
+* `--sql-file <SQL_FILE>` — Read SQL from a file
+* `--param <PARAM>` — Positional bind parameter in `N=value` form. Repeat for additional parameters
+* `--stream-rows` — Stream large result sets as `result_rows` batches instead of a single inline result
+* `--batch-rows <BATCH_ROWS>` — Maximum rows per streamed batch
+* `--batch-bytes <BATCH_BYTES>` — Soft byte target per streamed batch
+* `--statement-timeout-ms <STATEMENT_TIMEOUT_MS>` — Per-query statement timeout in milliseconds
+* `--lock-timeout-ms <LOCK_TIMEOUT_MS>` — Per-query lock timeout in milliseconds
+* `--inline-max-rows <INLINE_MAX_ROWS>` — Maximum inline rows before returning `result_too_large`
+* `--inline-max-bytes <INLINE_MAX_BYTES>` — Maximum inline payload bytes before returning `result_too_large`
+* `--read-only` — Force the query to run in a read-only transaction
+* `--dry-run` — Preview the query without executing it
+* `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
+* `--conninfo-secret <CONNINFO_SECRET>` — libpq-style conninfo string. Redacted in structured output
+* `--host <HOST>` — PostgreSQL host
+* `--port <PORT>` — PostgreSQL port
+* `--user <USER>` — PostgreSQL user name
+* `--dbname <DBNAME>` — PostgreSQL database name
+* `--password-secret <PASSWORD_SECRET>` — PostgreSQL password. Redacted in structured output
+* `--output <OUTPUT>` — Output format: json (default), yaml, or plain
 
-Long-lived JSONL session:
+  Default value: `json`
+* `--log <LOG>` — Diagnostic log categories
+* `--mode <MODE>` — Runtime mode: canonical cli, pipe, or `psql` translation mode
 
-```bash
-afpsql --mode pipe <<'EOF'
-{"code":"query","id":"q1","sql":"select 1 as n"}
-{"code":"query","id":"q2","sql":"select * from big_table where id > $1","params":[100],"options":{"stream_rows":true,"batch_rows":1000}}
-{"code":"close"}
-EOF
-```
+  Default value: `cli`
 
-## Output Formats
-
-```bash
-afpsql --sql "select 1 as n" --output json
-afpsql --sql "select 1 as n" --output yaml
-afpsql --sql "select 1 as n" --output plain
-```
-
-## Diagnostic Log Events
-
-Structured diagnostics are optional and disabled by default.
-
-Enable by category:
-
-```bash
-afpsql --dsn-secret "$DATABASE_URL" --log startup,query.result --sql "select 1 as n"
-```
-
-Enable multiple categories:
-
-```bash
-afpsql --mode pipe --log query.result,query.error
-```
-
-Category matching:
-
-- exact event (`startup`, `query.result`)
-- group prefix (`query` matches `query.result`, `query.error`, `query.sql_error`)
-- wildcard (`all` or `*`)
-
-`startup` emits one diagnostic event at process start with AFDATA-style payload:
-
-- `version`
-- `argv`
-- `config` (resolved runtime config)
-- `args` (parsed CLI arguments)
-- `env` (read runtime env vars; null when unset)
-
-Secret fields ending with `_secret` / `_SECRET` are redacted by AFDATA output processing.
-
-## Exit Codes
-
-| Code | Meaning |
-|---|---|
-| `0` | Query completed (`result` or `result_*`) |
-| `1` | `sql_error` or runtime `error` |
-| `2` | Invalid CLI arguments |
+  Possible values: `cli`, `pipe`, `psql`
