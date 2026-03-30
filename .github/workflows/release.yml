@@ -64,11 +64,12 @@ jobs:
             tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload to release
         shell: bash
-        run: gh release upload "$TAG" "$ARCHIVE" --clobber
+        run: gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
