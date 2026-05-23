@@ -92,6 +92,9 @@ Session connection shape supports:
 - `dbname`
 - `password_secret`
 
+TLS settings supplied in `dsn_secret` or `conninfo_secret` (for example
+`sslmode=require`) are honored by the PostgreSQL driver.
+
 CLI translation notes:
 
 - agent-first mode uses direct agent-first flags (`--dsn-secret`, `--host`, ...)
@@ -105,6 +108,11 @@ Cancel an in-flight query by id.
 ```json
 {"code":"cancel","id":"q-123"}
 ```
+
+When the database connection is already established, `afpsql` sends a
+PostgreSQL server-side cancel request before aborting local output handling.
+Cancellation is still race-prone: a query may finish normally before the cancel
+request is processed.
 
 ### `ping`
 
@@ -207,8 +215,6 @@ Canonical `error_code` values:
 - `invalid_request`
 - `invalid_params`
 - `connect_failed`
-- `connect_timeout`
-- `auth_failed`
 - `result_too_large`
 - `cancelled`
 
@@ -216,7 +222,6 @@ Canonical `error_code` values:
 
 | `code` | Meaning |
 |---|---|
-| `notice` | PostgreSQL NOTICE/WARNING |
 | `config` | full runtime config echo |
 | `pong` | ping response with counters |
 | `close` | shutdown acknowledgement |
@@ -231,12 +236,25 @@ Canonical `error_code` values:
 - `command_tag` (optional)
 - `trace`
 
+Startup `log` events include parsed `args`, redacted `config`, and selected
+redacted environment fallback fields. They intentionally omit raw `argv`.
+Bind values are summarized as `param_count`, not logged as plaintext.
+
 `log` category matching (from `config.log` / `--log`):
 
 - empty list disables `log` events
 - `all` or `*` enables all categories
 - exact match (`query.result`)
 - group prefix match (`query` -> `query.*`)
+
+## Runtime Safety Limits
+
+Pipe mode applies hard protocol limits before executing a request:
+
+- max JSONL line: 1 MiB
+- max SQL text: 1 MiB
+- max params per query: 65,535
+- max concurrent in-flight queries: 64
 
 ## Environment Fallback
 

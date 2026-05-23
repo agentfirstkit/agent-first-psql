@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 fn test_dsn() -> String {
     std::env::var("AFPSQL_TEST_DSN_SECRET")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string())
+        .expect("set AFPSQL_TEST_DSN_SECRET or DATABASE_URL for PostgreSQL integration tests")
 }
 
 fn bin() -> PathBuf {
@@ -522,4 +522,88 @@ fn pipe_cancel_race_and_long_query() {
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"code\":\"close\""));
     assert!(text.contains("\"error_code\":\"cancelled\"") || text.contains("\"code\":\"result\""));
+}
+
+#[test]
+fn pipe_cancel_requests_server_side_cancel_for_active_query() {
+    let marker = format!("afpsql_cancel_marker_{}", std::process::id());
+    let long_sql = format!("select pg_sleep(30) /* {marker} */");
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"qcancel","sql":long_sql})
+    )
+    .expect("write long query");
+    stdin.flush().expect("flush long query");
+
+    let activity_sql = format!(
+        "select count(*)::int as n from pg_stat_activity where pid <> pg_backend_pid() and state = 'active' and query like '%{marker}%'"
+    );
+    let mut saw_active = false;
+    for _ in 0..50 {
+        let out = Command::new(bin())
+            .arg("--dsn-secret")
+            .arg(test_dsn())
+            .arg("--sql")
+            .arg(&activity_sql)
+            .output()
+            .expect("query pg_stat_activity");
+        if out.status.success() {
+            let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+            if v["rows"][0]["n"].as_i64().unwrap_or(0) > 0 {
+                saw_active = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(saw_active, "long query did not become active");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"cancel","id":"qcancel"})
+    )
+    .expect("write cancel");
+    writeln!(stdin, "{}", serde_json::json!({"code":"close"})).expect("write close");
+    drop(stdin);
+
+    let mut all = String::new();
+    reader.read_to_string(&mut all).expect("read output");
+    let status = child.wait().expect("wait status");
+    assert!(status.success());
+    assert!(
+        all.contains("\"error_code\":\"cancelled\""),
+        "output: {all}"
+    );
+    assert!(
+        all.contains("server-side cancel requested"),
+        "server-side cancel hint missing: {all}"
+    );
+
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg(&activity_sql)
+        .output()
+        .expect("query pg_stat_activity after cancel");
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["rows"][0]["n"].as_i64().unwrap_or(-1), 0);
 }

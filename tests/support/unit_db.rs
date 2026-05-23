@@ -77,34 +77,45 @@ async fn postgres_executor_connect_error() {
         ..Default::default()
     };
     let out = exec
-        .execute(
-            "default",
-            &cfg,
-            "select 1",
-            &[],
-            &RuntimeConfig::default().resolve_options(&QueryOptions::default()),
-        )
+        .execute(ExecRequest {
+            session_name: "default",
+            session_cfg: &cfg,
+            sql: "select 1",
+            params: &[],
+            opts: &RuntimeConfig::default().resolve_options(&QueryOptions::default()),
+            cancel_slot: None,
+        })
         .await;
     assert!(matches!(out, Err(ExecError::Connect(_))));
 }
 
-fn test_dsn() -> String {
+fn test_dsn() -> Option<String> {
     std::env::var("AFPSQL_TEST_DSN_SECRET")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string())
+        .ok()
 }
 
 #[tokio::test]
 async fn postgres_executor_success_and_sql_error() {
+    let Some(dsn) = test_dsn() else {
+        return;
+    };
     let exec = PostgresExecutor::new();
     let cfg = SessionConfig {
-        dsn_secret: Some(test_dsn()),
+        dsn_secret: Some(dsn),
         ..Default::default()
     };
     let opts = RuntimeConfig::default().resolve_options(&QueryOptions::default());
 
     let out_res = exec
-        .execute("default", &cfg, "select 1 as n", &[], &opts)
+        .execute(ExecRequest {
+            session_name: "default",
+            session_cfg: &cfg,
+            sql: "select 1 as n",
+            params: &[],
+            opts: &opts,
+            cancel_slot: None,
+        })
         .await;
     assert!(out_res.is_ok());
     if let Ok(out) = out_res {
@@ -112,24 +123,26 @@ async fn postgres_executor_success_and_sql_error() {
     }
 
     let err = exec
-        .execute(
-            "default",
-            &cfg,
-            "select $1::int",
-            &[Value::String("x".to_string())],
-            &opts,
-        )
+        .execute(ExecRequest {
+            session_name: "default",
+            session_cfg: &cfg,
+            sql: "select $1::int",
+            params: &[Value::String("x".to_string())],
+            opts: &opts,
+            cancel_slot: None,
+        })
         .await;
     assert!(matches!(err, Err(ExecError::InvalidParams(_))));
 
     let err = exec
-        .execute(
-            "default",
-            &cfg,
-            "select * from non_existing_table_afpsql_cov",
-            &[],
-            &opts,
-        )
+        .execute(ExecRequest {
+            session_name: "default",
+            session_cfg: &cfg,
+            sql: "select * from non_existing_table_afpsql_cov",
+            params: &[],
+            opts: &opts,
+            cancel_slot: None,
+        })
         .await;
     assert!(matches!(err, Err(ExecError::Sql { .. })));
 }

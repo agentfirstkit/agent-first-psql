@@ -1,4 +1,5 @@
 use crate::types::{RuntimeConfig, SessionConfig};
+use tokio_postgres::Config;
 
 pub fn resolve_session_name(cfg: &RuntimeConfig, requested: Option<&str>) -> String {
     requested
@@ -6,13 +7,13 @@ pub fn resolve_session_name(cfg: &RuntimeConfig, requested: Option<&str>) -> Str
         .unwrap_or_else(|| cfg.default_session.clone())
 }
 
-pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
+pub fn resolve_pg_config(cfg: &SessionConfig) -> Result<Config, String> {
     if let Some(dsn) = cfg
         .dsn_secret
         .clone()
         .or_else(|| std::env::var("AFPSQL_DSN_SECRET").ok())
     {
-        return Ok(dsn);
+        return dsn.parse().map_err(|e| format!("invalid dsn: {e}"));
     }
 
     if let Some(conninfo) = cfg
@@ -20,10 +21,9 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
         .clone()
         .or_else(|| std::env::var("AFPSQL_CONNINFO_SECRET").ok())
     {
-        let _parsed: tokio_postgres::Config = conninfo
+        return conninfo
             .parse()
-            .map_err(|e| format!("invalid conninfo: {e}"))?;
-        return Ok(conninfo);
+            .map_err(|e| format!("invalid conninfo: {e}"));
     }
 
     let host = cfg
@@ -58,23 +58,12 @@ pub fn resolve_conn_string(cfg: &SessionConfig) -> Result<String, String> {
         .clone()
         .or_else(|| std::env::var("AFPSQL_PASSWORD_SECRET").ok());
 
-    if host.starts_with('/') {
-        let mut conninfo = format!(
-            "host={} port={} user={} dbname={}",
-            host, port, user, dbname
-        );
-        if let Some(pw) = password {
-            conninfo.push_str(&format!(" password={pw}"));
-        }
-        return Ok(conninfo);
+    let mut pg_cfg = Config::new();
+    pg_cfg.host(host).port(port).user(user).dbname(dbname);
+    if let Some(pw) = password {
+        pg_cfg.password(pw);
     }
-
-    let auth = if let Some(ref pw) = password {
-        format!("{user}:{pw}")
-    } else {
-        user
-    };
-    Ok(format!("postgresql://{auth}@{host}:{port}/{dbname}"))
+    Ok(pg_cfg)
 }
 
 #[cfg(test)]

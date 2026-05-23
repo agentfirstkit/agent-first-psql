@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 fn test_dsn() -> String {
     std::env::var("AFPSQL_TEST_DSN_SECRET")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgresql://localhost/postgres".to_string())
+        .expect("set AFPSQL_TEST_DSN_SECRET or DATABASE_URL for PostgreSQL integration tests")
 }
 
 fn bin() -> PathBuf {

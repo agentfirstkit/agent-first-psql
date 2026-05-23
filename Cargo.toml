@@ -1,10 +1,10 @@
 [package]
 name = "agent-first-psql"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
-description = "Persistent PostgreSQL client for AI agents — SQL-native JSONL in, JSONL out"
+description = "A PostgreSQL tool for AI agents — SQL in, typed rows out, on a connection that stays open."
 license = "MIT"
-repository = "https://github.com/cmnspore/agent-first-psql"
+repository = "https://github.com/agentfirstkit/agent-first-psql"
 readme = "README.md"
 exclude = [".github/"]
 
@@ -13,13 +13,16 @@ name = "afpsql"
 path = "src/main.rs"
 
 [dependencies]
-agent-first-data = { version = "0.7", features = ["cli-help", "cli-help-markdown"] }
+agent-first-data = { version = "0.8", features = ["cli-help", "cli-help-markdown"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 deadpool-postgres = "0.14"
 bytes = "1"
+futures-util = "0.3"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["full"] }
 

@@ -2,7 +2,7 @@
 
 # afpsql CLI Reference
 
-> Regenerate with `./scripts/generate-cli-doc.sh`.
+> Regenerate with `afpsql --help-markdown`.
 
 # Command-Line Help for `afpsql`
 
@@ -11,6 +11,10 @@ This document contains the help content for the `afpsql` command-line program.
 **Command Overview:**
 
 * [`afpsql`↴](#afpsql)
+* [`afpsql psql`↴](#afpsql-psql)
+* [`afpsql psql status`↴](#afpsql-psql-status)
+* [`afpsql psql install`↴](#afpsql-psql-install)
+* [`afpsql psql uninstall`↴](#afpsql-psql-uninstall)
 
 ## `afpsql`
 
@@ -52,6 +56,8 @@ afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
+afpsql psql status
+afpsql psql install
 ```
 
 ### Exit Codes
@@ -60,7 +66,11 @@ afpsql --mode pipe
 - `1`: SQL error or runtime error
 - `2`: invalid CLI arguments
 
-**Usage:** `afpsql [OPTIONS]`
+**Usage:** `afpsql [OPTIONS] [COMMAND]`
+
+###### **Subcommands:**
+
+* `psql` — Manage the local psql wrapper for afpsql --mode psql
 
 ###### **Options:**
 
@@ -77,12 +87,14 @@ afpsql --mode pipe
 * `--read-only` — Force the query to run in a read-only transaction
 * `--dry-run` — Preview the query without executing it
 * `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
+* `--dsn-secret-env <DSN_SECRET_ENV>` — Read PostgreSQL DSN URI from an environment variable
 * `--conninfo-secret <CONNINFO_SECRET>` — libpq-style conninfo string. Redacted in structured output
 * `--host <HOST>` — PostgreSQL host
 * `--port <PORT>` — PostgreSQL port
 * `--user <USER>` — PostgreSQL user name
 * `--dbname <DBNAME>` — PostgreSQL database name
 * `--password-secret <PASSWORD_SECRET>` — PostgreSQL password. Redacted in structured output
+* `--password-secret-env <PASSWORD_SECRET_ENV>` — Read PostgreSQL password from an environment variable
 * `--output <OUTPUT>` — Output format: json (default), yaml, or plain
 
   Default value: `json`
@@ -92,3 +104,54 @@ afpsql --mode pipe
   Default value: `cli`
 
   Possible values: `cli`, `pipe`, `psql`
+
+
+
+
+## `afpsql psql`
+
+Manage the local psql wrapper for afpsql --mode psql
+
+**Usage:** `afpsql psql <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show whether the afpsql-managed psql wrapper is installed and active
+* `install` — Install an afpsql-managed psql wrapper
+* `uninstall` — Remove an afpsql-managed psql wrapper
+
+
+
+## `afpsql psql status`
+
+Show whether the afpsql-managed psql wrapper is installed and active
+
+**Usage:** `afpsql psql status [OPTIONS]`
+
+###### **Options:**
+
+* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+
+
+
+## `afpsql psql install`
+
+Install an afpsql-managed psql wrapper
+
+**Usage:** `afpsql psql install [OPTIONS]`
+
+###### **Options:**
+
+* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+
+
+
+## `afpsql psql uninstall`
+
+Remove an afpsql-managed psql wrapper
+
+**Usage:** `afpsql psql uninstall [OPTIONS]`
+
+###### **Options:**
+
+* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory

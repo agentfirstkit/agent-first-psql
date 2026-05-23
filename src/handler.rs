@@ -1,16 +1,42 @@
 use crate::conn::resolve_session_name;
-use crate::db::{DbExecutor, ExecError, ExecOutcome, PostgresExecutor};
+use crate::db::{
+    DbExecutor, ExecError, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
+};
+use crate::protocol::{command_tag, error_code, log_event};
 use crate::types::*;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+pub struct InFlightQuery {
+    pub handle: tokio::task::JoinHandle<()>,
+    pub cancel_slot: crate::db::CancelSlot,
+}
+
+impl InFlightQuery {
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+
+    pub async fn cancel_server_query(&self) -> Result<bool, String> {
+        crate::db::cancel_query(&self.cancel_slot).await
+    }
+
+    pub fn into_handle(self) -> tokio::task::JoinHandle<()> {
+        self.handle
+    }
+}
+
 pub struct App {
     pub config: RwLock<RuntimeConfig>,
     pub executor: Arc<dyn DbExecutor>,
     pub writer: mpsc::Sender<Output>,
-    pub in_flight: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    pub in_flight: Mutex<std::collections::HashMap<String, InFlightQuery>>,
     pub requests_total: std::sync::atomic::AtomicU64,
     pub start_time: Instant,
 }
@@ -35,6 +61,7 @@ pub async fn execute_query(
     sql: String,
     params: Vec<Value>,
     options: QueryOptions,
+    cancel_slot: Option<crate::db::CancelSlot>,
 ) {
     let start = Instant::now();
     let cfg = app.config.read().await.clone();
@@ -47,7 +74,7 @@ pub async fn execute_query(
             .writer
             .send(Output::Error {
                 id: id.clone(),
-                error_code: "connect_failed".to_string(),
+                error_code: error_code::CONNECT_FAILED.to_string(),
                 error: format!("unknown session: {resolved_session}"),
                 hint: Some(
                     "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
@@ -58,10 +85,10 @@ pub async fn execute_query(
             .await;
         emit_log(
             app,
-            "query.error",
+            log_event::QUERY_ERROR,
             id.as_deref(),
             Some(&resolved_session),
-            Some("connect_failed"),
+            Some(error_code::CONNECT_FAILED),
             None,
             &trace,
         )
@@ -69,15 +96,42 @@ pub async fn execute_query(
         return;
     };
 
+    if resolved_opts.stream_rows {
+        let mut sink = OutputRowSink::new(
+            app.clone(),
+            id.clone().unwrap_or_else(|| "cli".to_string()),
+            Some(resolved_session.clone()),
+            resolved_opts.batch_rows,
+            resolved_opts.batch_bytes,
+        );
+        let result = app
+            .executor
+            .execute_streaming(
+                ExecRequest {
+                    session_name: &resolved_session,
+                    session_cfg: &session_cfg,
+                    sql: &sql,
+                    params: &params,
+                    opts: &resolved_opts,
+                    cancel_slot: cancel_slot.clone(),
+                },
+                &mut sink,
+            )
+            .await;
+        handle_streaming_result(app, id, resolved_session, result, sink, start).await;
+        return;
+    }
+
     let result = app
         .executor
-        .execute(
-            &resolved_session,
-            &session_cfg,
-            &sql,
-            &params,
-            &resolved_opts,
-        )
+        .execute(ExecRequest {
+            session_name: &resolved_session,
+            session_cfg: &session_cfg,
+            sql: &sql,
+            params: &params,
+            opts: &resolved_opts,
+            cancel_slot,
+        })
         .await;
 
     match result {
@@ -96,11 +150,11 @@ pub async fn execute_query(
                 RowEmitStatus::Sent { trace } => {
                     emit_log(
                         app,
-                        "query.result",
+                        log_event::QUERY_RESULT,
                         id.as_deref(),
                         Some(&resolved_session),
                         None,
-                        Some("SELECT"),
+                        Some(command_tag::SELECT),
                         &trace,
                     )
                     .await;
@@ -108,10 +162,10 @@ pub async fn execute_query(
                 RowEmitStatus::TooLarge { trace } => {
                     emit_log(
                         app,
-                        "query.error",
+                        log_event::QUERY_ERROR,
                         id.as_deref(),
                         Some(&resolved_session),
-                        Some("result_too_large"),
+                        Some(error_code::RESULT_TOO_LARGE),
                         None,
                         &trace,
                     )
@@ -120,42 +174,112 @@ pub async fn execute_query(
             }
         }
         Ok(ExecOutcome::Command { affected }) => {
-            let command_tag = format!("EXECUTE {affected}");
+            emit_command_result(app, id, &resolved_session, affected, start).await;
+        }
+        Err(err) => emit_exec_error(app, id, &resolved_session, err, start).await,
+    }
+}
+
+async fn handle_streaming_result(
+    app: &Arc<App>,
+    id: Option<String>,
+    resolved_session: String,
+    result: Result<StreamOutcome, ExecError>,
+    mut sink: OutputRowSink,
+    start: Instant,
+) {
+    match result {
+        Ok(StreamOutcome::Rows {
+            row_count,
+            payload_bytes,
+        }) => {
+            let _ = sink.flush_batch().await;
             let trace = Trace {
                 duration_ms: start.elapsed().as_millis() as u64,
-                row_count: Some(0),
-                payload_bytes: Some(0),
+                row_count: Some(row_count),
+                payload_bytes: Some(payload_bytes),
             };
             let _ = app
                 .writer
-                .send(Output::Result {
-                    id: id.clone(),
+                .send(Output::ResultEnd {
+                    id: sink.id.clone(),
                     session: Some(resolved_session.clone()),
-                    command_tag: command_tag.clone(),
-                    columns: vec![],
-                    rows: vec![],
-                    row_count: 0,
+                    command_tag: command_tag::rows(row_count),
                     trace: trace.clone(),
                 })
                 .await;
             emit_log(
                 app,
-                "query.result",
+                log_event::QUERY_RESULT,
                 id.as_deref(),
                 Some(&resolved_session),
                 None,
-                Some("EXECUTE"),
+                Some(command_tag::SELECT),
                 &trace,
             )
             .await;
         }
-        Err(ExecError::Connect(message)) => {
+        Ok(StreamOutcome::Command { affected }) => {
+            emit_command_result(app, id, &resolved_session, affected, start).await;
+        }
+        Err(err) => {
+            emit_exec_error(app, id, &resolved_session, err, start).await;
+        }
+    }
+}
+
+async fn emit_command_result(
+    app: &Arc<App>,
+    id: Option<String>,
+    resolved_session: &str,
+    affected: usize,
+    start: Instant,
+) {
+    let command_tag = command_tag::execute(affected);
+    let trace = Trace {
+        duration_ms: start.elapsed().as_millis() as u64,
+        row_count: Some(0),
+        payload_bytes: Some(0),
+    };
+    let _ = app
+        .writer
+        .send(Output::Result {
+            id: id.clone(),
+            session: Some(resolved_session.to_string()),
+            command_tag: command_tag.clone(),
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            trace: trace.clone(),
+        })
+        .await;
+    emit_log(
+        app,
+        log_event::QUERY_RESULT,
+        id.as_deref(),
+        Some(resolved_session),
+        None,
+        Some(command_tag::EXECUTE),
+        &trace,
+    )
+    .await;
+}
+
+async fn emit_exec_error(
+    app: &Arc<App>,
+    id: Option<String>,
+    resolved_session: &str,
+    err: ExecError,
+    start: Instant,
+) {
+    match err {
+        ExecError::Connect(message) => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
                 .send(Output::Error {
                     id: id.clone(),
-                    error_code: "connect_failed".to_string(),
+                    error_code: error_code::CONNECT_FAILED.to_string(),
                     error: message,
                     hint: Some(
                         "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
@@ -166,22 +290,22 @@ pub async fn execute_query(
                 .await;
             emit_log(
                 app,
-                "query.error",
+                log_event::QUERY_ERROR,
                 id.as_deref(),
-                Some(&resolved_session),
-                Some("connect_failed"),
+                Some(resolved_session),
+                Some(error_code::CONNECT_FAILED),
                 None,
                 &trace,
             )
             .await;
         }
-        Err(ExecError::InvalidParams(message)) => {
+        ExecError::InvalidParams(message) => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
                 .send(Output::Error {
                     id: id.clone(),
-                    error_code: "invalid_params".to_string(),
+                    error_code: error_code::INVALID_PARAMS.to_string(),
                     error: message,
                     hint: None,
                     retryable: false,
@@ -190,28 +314,28 @@ pub async fn execute_query(
                 .await;
             emit_log(
                 app,
-                "query.error",
+                log_event::QUERY_ERROR,
                 id.as_deref(),
-                Some(&resolved_session),
-                Some("invalid_params"),
+                Some(resolved_session),
+                Some(error_code::INVALID_PARAMS),
                 None,
                 &trace,
             )
             .await;
         }
-        Err(ExecError::Sql {
+        ExecError::Sql {
             sqlstate,
             message,
             detail,
             hint,
             position,
-        }) => {
+        } => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
                 .send(Output::SqlError {
                     id: id.clone(),
-                    session: Some(resolved_session.clone()),
+                    session: Some(resolved_session.to_string()),
                     sqlstate: sqlstate.clone(),
                     message,
                     detail,
@@ -222,22 +346,22 @@ pub async fn execute_query(
                 .await;
             emit_log(
                 app,
-                "query.sql_error",
+                log_event::QUERY_SQL_ERROR,
                 id.as_deref(),
-                Some(&resolved_session),
+                Some(resolved_session),
                 Some(&sqlstate),
                 None,
                 &trace,
             )
             .await;
         }
-        Err(ExecError::Internal(message)) => {
+        ExecError::Internal(message) => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
                 .send(Output::Error {
                     id: id.clone(),
-                    error_code: "invalid_request".to_string(),
+                    error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
                     hint: None,
                     retryable: false,
@@ -246,15 +370,87 @@ pub async fn execute_query(
                 .await;
             emit_log(
                 app,
-                "query.error",
+                log_event::QUERY_ERROR,
                 id.as_deref(),
-                Some(&resolved_session),
-                Some("invalid_request"),
+                Some(resolved_session),
+                Some(error_code::INVALID_REQUEST),
                 None,
                 &trace,
             )
             .await;
         }
+    }
+}
+
+struct OutputRowSink {
+    app: Arc<App>,
+    id: String,
+    session: Option<String>,
+    batch: Vec<Value>,
+    batch_bytes: usize,
+    batch_rows_limit: usize,
+    batch_bytes_limit: usize,
+}
+
+impl OutputRowSink {
+    fn new(
+        app: Arc<App>,
+        id: String,
+        session: Option<String>,
+        batch_rows_limit: usize,
+        batch_bytes_limit: usize,
+    ) -> Self {
+        Self {
+            app,
+            id,
+            session,
+            batch: vec![],
+            batch_bytes: 0,
+            batch_rows_limit,
+            batch_bytes_limit,
+        }
+    }
+
+    async fn flush_batch(&mut self) -> Result<(), ExecError> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let n = self.batch.len();
+        let rows = std::mem::take(&mut self.batch);
+        self.batch_bytes = 0;
+        self.app
+            .writer
+            .send(Output::ResultRows {
+                id: self.id.clone(),
+                rows,
+                rows_batch_count: n,
+            })
+            .await
+            .map_err(|_| ExecError::Internal("output channel closed".to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl RowSink for OutputRowSink {
+    async fn start(&mut self, columns: Vec<ColumnInfo>) -> Result<(), ExecError> {
+        self.app
+            .writer
+            .send(Output::ResultStart {
+                id: self.id.clone(),
+                session: self.session.clone(),
+                columns,
+            })
+            .await
+            .map_err(|_| ExecError::Internal("output channel closed".to_string()))
+    }
+
+    async fn row(&mut self, row: Value, row_bytes: usize) -> Result<(), ExecError> {
+        self.batch_bytes += row_bytes;
+        self.batch.push(row);
+        if self.batch.len() >= self.batch_rows_limit || self.batch_bytes >= self.batch_bytes_limit {
+            self.flush_batch().await?;
+        }
+        Ok(())
     }
 }
 
@@ -332,7 +528,7 @@ async fn emit_rows_result(
             .send(Output::ResultEnd {
                 id: req_id,
                 session,
-                command_tag: format!("ROWS {row_count}"),
+                command_tag: command_tag::rows(row_count),
                 trace: trace.clone(),
             })
             .await;
@@ -355,7 +551,7 @@ async fn emit_rows_result(
             .writer
             .send(Output::Error {
                 id,
-                error_code: "result_too_large".to_string(),
+                error_code: error_code::RESULT_TOO_LARGE.to_string(),
                 error: "result exceeds inline limits".to_string(),
                 hint: Some(
                     "retry with stream_rows=true, or increase --inline-max-rows/--inline-max-bytes"
@@ -379,7 +575,7 @@ async fn emit_rows_result(
         .send(Output::Result {
             id,
             session,
-            command_tag: format!("ROWS {row_count}"),
+            command_tag: command_tag::rows(row_count),
             columns,
             rows,
             row_count,
@@ -416,7 +612,6 @@ async fn emit_log(
             error_code: error_code.map(std::string::ToString::to_string),
             command_tag: command_tag.map(std::string::ToString::to_string),
             version: None,
-            argv: None,
             config: None,
             args: None,
             env: None,

@@ -2,10 +2,10 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.4.2",
-  "domain": "cmn.dev",
-  "key": "ed25519.7BmCWmBb2YeUWR7pmHvwAvi9wRm96VpZsJvZFSTfc2Uu",
-  "synopsis": "Persistent PostgreSQL client for AI agents — JSONL in, JSONL out, connection lifecycle managed transparently",
+  "version": "0.5.0",
+  "domain": "agentfirstkit.com",
+  "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
+  "synopsis": "A PostgreSQL tool for AI agents — SQL in, typed rows out, on a connection that stays open.",
   "intent": [
     "Give AI agents a persistent PostgreSQL client that reuses long-lived database connections and sessions, so agents send SQL requests as JSONL and receive structured JSONL responses without managing connection setup",
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
@@ -13,12 +13,19 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Replace --help with recursive plain-text output via agent-first-data cli_render_help, and add --help-markdown for Markdown documentation generation — agents get the full CLI interface in one call"
+    "Migrate to the agentfirstkit identity",
+    "Rewrite README around agent ergonomics, with the full guide in docs/overview.md",
+    "Add TLS support for PostgreSQL connections",
+    "Stream rows without buffering so large result sets no longer balloon memory",
+    "Support server-side cancellation of running queries",
+    "Install a psql wrapper alongside afpsql",
+    "Harden config building (no string interpolation) and drop argv from startup logs",
+    "Bump agent-first-data dependency to 0.8"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://cmn.dev/b3.AgMr3xwC5DbTa1QWvDrqoLiVU2hCK5X2gto6uBHenGkH",
+      "uri": "cmn://agentfirstkit.com/b3.DRSaYD5qjBZoBHEukpEoRzDoBk3aangKVgYo8hBrftqZ",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

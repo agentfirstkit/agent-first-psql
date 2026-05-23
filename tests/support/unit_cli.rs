@@ -81,6 +81,21 @@ fn clap_log_flag_accepts_startup() {
 }
 
 #[test]
+fn clap_accepts_psql_admin_subcommands() {
+    let cli_res =
+        AfdCli::try_parse_from(["afpsql", "psql", "status", "--bin-dir", "/tmp/afpsql-bin"]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert!(matches!(
+            cli.command,
+            Some(AfdCommand::Psql(PsqlCommand {
+                action: PsqlCliAction::Status(_)
+            }))
+        ));
+    }
+}
+
+#[test]
 fn startup_requested_detects_raw_log_entries() {
     assert!(startup_requested_from_raw(&[
         "afpsql".to_string(),
@@ -99,10 +114,61 @@ fn startup_requested_detects_raw_log_entries() {
 }
 
 #[test]
+fn resolve_secret_value_from_env_and_errors() {
+    let path = std::env::var("PATH");
+    assert!(path.is_ok());
+    if let Ok(path) = path {
+        let resolved = resolve_secret_value("--dsn-secret", None, Some("PATH"));
+        assert_eq!(resolved, Ok(Some(path)));
+    }
+
+    let conflict = resolve_secret_value("--dsn-secret", Some("direct".to_string()), Some("PATH"));
+    assert!(conflict.is_err());
+
+    let missing_name = format!("AFPSQL_TEST_MISSING_{}", std::process::id());
+    let missing = resolve_secret_value("--dsn-secret", None, Some(&missing_name));
+    assert!(missing.is_err());
+}
+
+#[test]
 fn load_sql_validation() {
     assert!(load_sql(Some("select 1".to_string()), None).is_ok());
     assert!(load_sql(Some("x".to_string()), Some("y".to_string())).is_err());
     assert!(load_sql(None, None).is_err());
+}
+
+#[test]
+fn parse_psql_mode_accepts_secret_env_flags() {
+    let path = std::env::var("PATH");
+    assert!(path.is_ok());
+    let raw = vec![
+        "afpsql".to_string(),
+        "--mode".to_string(),
+        "psql".to_string(),
+        "-c".to_string(),
+        "select 1".to_string(),
+        "--dsn-secret-env".to_string(),
+        "PATH".to_string(),
+        "--password-secret-env".to_string(),
+        "PATH".to_string(),
+    ];
+    let mode_res = parse_psql_mode(&raw);
+    assert!(mode_res.is_ok());
+    if let (Ok(mode), Ok(path)) = (mode_res, path) {
+        assert!(matches!(mode, Mode::Cli(_)));
+        if let Mode::Cli(req) = mode {
+            assert_eq!(req.session.dsn_secret.as_deref(), Some(path.as_str()));
+            assert_eq!(req.session.password_secret.as_deref(), Some(path.as_str()));
+            assert_eq!(
+                req.startup_args["dsn_secret_env"],
+                serde_json::json!("PATH")
+            );
+            assert_eq!(
+                req.startup_args["password_secret_env"],
+                serde_json::json!("PATH")
+            );
+        }
+    }
 }
 
 #[test]
@@ -138,6 +204,8 @@ fn parse_psql_mode_all_flags_and_sql_file() {
         if let Mode::Cli(req) = mode {
             assert_eq!(req.sql.trim(), "select $1::int");
             assert_eq!(req.params.len(), 1);
+            assert_eq!(req.startup_args["param_count"], serde_json::json!(1));
+            assert!(req.startup_args.get("param").is_none());
             assert!(matches!(req.output, OutputFormat::Plain));
             assert_eq!(req.session.host.as_deref(), Some("localhost"));
             assert_eq!(req.session.user.as_deref(), Some("roger"));

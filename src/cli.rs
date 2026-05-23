@@ -2,23 +2,36 @@ use std::io::Write;
 
 use crate::types::{QueryOptions, SessionConfig};
 use agent_first_data::{cli_parse_log_filters, cli_parse_output, OutputFormat};
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub enum Mode {
     Cli(CliRequest),
     Pipe(PipeInit),
+    PsqlAdmin(PsqlAdminRequest),
 }
 
 pub struct PipeInit {
     pub output: OutputFormat,
     pub session: SessionConfig,
     pub log: Vec<String>,
-    pub startup_argv: Vec<String>,
     pub startup_args: Value,
     pub startup_env: Value,
     pub startup_requested: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PsqlAdminRequest {
+    pub action: PsqlAdminAction,
+    pub output: OutputFormat,
+}
+
+#[derive(Debug, Clone)]
+pub enum PsqlAdminAction {
+    Status { bin_dir: Option<String> },
+    Install { bin_dir: Option<String> },
+    Uninstall { bin_dir: Option<String> },
 }
 
 pub struct CliRequest {
@@ -28,7 +41,6 @@ pub struct CliRequest {
     pub session: SessionConfig,
     pub output: OutputFormat,
     pub log: Vec<String>,
-    pub startup_argv: Vec<String>,
     pub startup_args: Value,
     pub startup_env: Value,
     pub startup_requested: bool,
@@ -41,6 +53,35 @@ enum RuntimeMode {
     Pipe,
     #[value(name = "psql")]
     Psql,
+}
+
+#[derive(Subcommand)]
+enum AfdCommand {
+    /// Manage the local psql wrapper for afpsql --mode psql.
+    Psql(PsqlCommand),
+}
+
+#[derive(Args)]
+struct PsqlCommand {
+    #[command(subcommand)]
+    action: PsqlCliAction,
+}
+
+#[derive(Subcommand)]
+enum PsqlCliAction {
+    /// Show whether the afpsql-managed psql wrapper is installed and active.
+    Status(PsqlPathArgs),
+    /// Install an afpsql-managed psql wrapper.
+    Install(PsqlPathArgs),
+    /// Remove an afpsql-managed psql wrapper.
+    Uninstall(PsqlPathArgs),
+}
+
+#[derive(Args)]
+struct PsqlPathArgs {
+    /// Directory that contains the psql wrapper. Defaults to the afpsql executable directory.
+    #[arg(long = "bin-dir")]
+    bin_dir: Option<String>,
 }
 
 #[doc = r#"Agent-First PostgreSQL client.
@@ -81,6 +122,8 @@ afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
+afpsql psql status
+afpsql psql install
 ```
 
 ### Exit Codes
@@ -132,6 +175,9 @@ pub struct AfdCli {
     /// PostgreSQL DSN URI. Redacted in structured output.
     #[arg(long = "dsn-secret", help_heading = "Connection")]
     dsn_secret: Option<String>,
+    /// Read PostgreSQL DSN URI from an environment variable.
+    #[arg(long = "dsn-secret-env", help_heading = "Connection")]
+    dsn_secret_env: Option<String>,
     /// libpq-style conninfo string. Redacted in structured output.
     #[arg(long = "conninfo-secret", help_heading = "Connection")]
     conninfo_secret: Option<String>,
@@ -150,6 +196,9 @@ pub struct AfdCli {
     /// PostgreSQL password. Redacted in structured output.
     #[arg(long = "password-secret", help_heading = "Connection")]
     password_secret: Option<String>,
+    /// Read PostgreSQL password from an environment variable.
+    #[arg(long = "password-secret-env", help_heading = "Connection")]
+    password_secret_env: Option<String>,
 
     /// Output format: json (default), yaml, or plain.
     #[arg(long, default_value = "json", help_heading = "Runtime")]
@@ -160,6 +209,9 @@ pub struct AfdCli {
     /// Runtime mode: canonical cli, pipe, or `psql` translation mode.
     #[arg(long, value_enum, default_value_t = RuntimeMode::Cli, help_heading = "Runtime")]
     mode: RuntimeMode,
+
+    #[command(subcommand)]
+    command: Option<AfdCommand>,
 }
 
 pub fn parse_args() -> Result<Mode, String> {
@@ -170,7 +222,7 @@ pub fn parse_args() -> Result<Mode, String> {
     let startup_requested = startup_requested_from_raw(&raw);
 
     // --help: recursive plain-text help (all subcommands expanded)
-    if raw.iter().any(|a| a == "--help" || a == "-h") {
+    if top_level_help_requested(&raw) {
         let _ = writeln!(
             std::io::stdout(),
             "{}",
@@ -192,7 +244,7 @@ pub fn parse_args() -> Result<Mode, String> {
         Ok(c) => c,
         Err(e) => {
             use clap::error::ErrorKind;
-            if matches!(e.kind(), ErrorKind::DisplayVersion) {
+            if matches!(e.kind(), ErrorKind::DisplayVersion | ErrorKind::DisplayHelp) {
                 let _ = writeln!(std::io::stdout(), "{e}");
                 std::process::exit(0);
             }
@@ -201,14 +253,24 @@ pub fn parse_args() -> Result<Mode, String> {
     };
     let output = parse_output(&cli.output)?;
     let log = parse_log_categories(&cli.log);
+    let dsn_secret = resolve_secret_value(
+        "--dsn-secret",
+        cli.dsn_secret,
+        cli.dsn_secret_env.as_deref(),
+    )?;
+    let password_secret = resolve_secret_value(
+        "--password-secret",
+        cli.password_secret,
+        cli.password_secret_env.as_deref(),
+    )?;
     let session = SessionConfig {
-        dsn_secret: cli.dsn_secret,
+        dsn_secret,
         conninfo_secret: cli.conninfo_secret,
         host: cli.host,
         port: cli.port,
         user: cli.user,
         dbname: cli.dbname,
-        password_secret: cli.password_secret,
+        password_secret,
     };
     let mode_name = match cli.mode {
         RuntimeMode::Cli => "cli",
@@ -219,7 +281,7 @@ pub fn parse_args() -> Result<Mode, String> {
         "mode": mode_name,
         "sql": &cli.sql,
         "sql_file": &cli.sql_file,
-        "param": &cli.param,
+        "param_count": cli.param.len(),
         "stream_rows": cli.stream_rows,
         "batch_rows": cli.batch_rows,
         "batch_bytes": cli.batch_bytes,
@@ -229,16 +291,27 @@ pub fn parse_args() -> Result<Mode, String> {
         "inline_max_bytes": cli.inline_max_bytes,
         "read_only": cli.read_only,
         "dsn_secret": &session.dsn_secret,
+        "dsn_secret_env": &cli.dsn_secret_env,
         "conninfo_secret": &session.conninfo_secret,
         "host": &session.host,
         "port": session.port,
         "user": &session.user,
         "dbname": &session.dbname,
         "password_secret": &session.password_secret,
+        "password_secret_env": &cli.password_secret_env,
         "output": output_name(output),
         "log": &log,
     });
     let startup_env = startup_env_snapshot();
+
+    if let Some(command) = cli.command {
+        return Ok(match command {
+            AfdCommand::Psql(psql) => Mode::PsqlAdmin(PsqlAdminRequest {
+                action: psql_admin_action(psql.action),
+                output,
+            }),
+        });
+    }
 
     match cli.mode {
         RuntimeMode::Pipe => {
@@ -246,7 +319,6 @@ pub fn parse_args() -> Result<Mode, String> {
                 output,
                 session,
                 log: log.clone(),
-                startup_argv: raw,
                 startup_args,
                 startup_env,
                 startup_requested,
@@ -276,7 +348,6 @@ pub fn parse_args() -> Result<Mode, String> {
         session,
         output,
         log,
-        startup_argv: raw,
         startup_args,
         startup_env,
         startup_requested,
@@ -293,7 +364,10 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
     let mut user: Option<String> = None;
     let mut dbname: Option<String> = None;
     let mut dsn_secret: Option<String> = None;
+    let mut dsn_secret_env: Option<String> = None;
     let mut conninfo_secret: Option<String> = None;
+    let mut password_secret: Option<String> = None;
+    let mut password_secret_env: Option<String> = None;
     let mut params_kv: Vec<String> = vec![];
     let mut output = OutputFormat::Json;
     let mut log_entries: Vec<String> = vec![];
@@ -358,11 +432,34 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
                 dsn_secret = Some(raw.get(i).ok_or("--dsn-secret requires value")?.clone());
                 i += 1;
             }
+            "--dsn-secret-env" => {
+                i += 1;
+                dsn_secret_env = Some(raw.get(i).ok_or("--dsn-secret-env requires value")?.clone());
+                i += 1;
+            }
             "--conninfo-secret" => {
                 i += 1;
                 conninfo_secret = Some(
                     raw.get(i)
                         .ok_or("--conninfo-secret requires value")?
+                        .clone(),
+                );
+                i += 1;
+            }
+            "--password-secret" => {
+                i += 1;
+                password_secret = Some(
+                    raw.get(i)
+                        .ok_or("--password-secret requires value")?
+                        .clone(),
+                );
+                i += 1;
+            }
+            "--password-secret-env" => {
+                i += 1;
+                password_secret_env = Some(
+                    raw.get(i)
+                        .ok_or("--password-secret-env requires value")?
                         .clone(),
                 );
                 i += 1;
@@ -394,12 +491,18 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
             }
             unsupported => {
                 return Err(format!(
-                    "unsupported psql-mode argument: {unsupported}; only --mode psql, -c/-f/-h/-p/-U/-d/-v/--dsn-secret/--conninfo-secret/--output/--log are supported"
+                    "unsupported psql-mode argument: {unsupported}; only --mode psql, -c/-f/-h/-p/-U/-d/-v/--dsn-secret/--dsn-secret-env/--conninfo-secret/--password-secret/--password-secret-env/--output/--log are supported"
                 ));
             }
         }
     }
 
+    let dsn_secret = resolve_secret_value("--dsn-secret", dsn_secret, dsn_secret_env.as_deref())?;
+    let password_secret = resolve_secret_value(
+        "--password-secret",
+        password_secret,
+        password_secret_env.as_deref(),
+    )?;
     let session = SessionConfig {
         dsn_secret,
         conninfo_secret,
@@ -407,22 +510,24 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         port,
         user,
         dbname,
-        password_secret: None,
+        password_secret,
     };
 
     let startup_sql = sql.clone();
     let startup_sql_file = sql_file.clone();
     let sql = load_sql(sql, sql_file)?;
     let params = parse_params(&params_kv)?;
-    let startup_args = psql_startup_args(
-        "psql",
-        startup_sql.or_else(|| Some(sql.clone())),
-        startup_sql_file,
-        &params_kv,
-        &session,
+    let startup_args = psql_startup_args(PsqlStartupArgs {
+        mode: "psql",
+        sql: startup_sql.or_else(|| Some(sql.clone())),
+        sql_file: startup_sql_file,
+        params_kv: &params_kv,
+        session: &session,
         output,
-        &log_entries,
-    );
+        log_entries: &log_entries,
+        dsn_secret_env: dsn_secret_env.as_deref(),
+        password_secret_env: password_secret_env.as_deref(),
+    });
     Ok(Mode::Cli(CliRequest {
         sql,
         params,
@@ -430,12 +535,29 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         session,
         output,
         log: parse_log_categories(&log_entries),
-        startup_argv: raw.to_vec(),
         startup_args,
         startup_env: startup_env_snapshot(),
         startup_requested,
         dry_run: false,
     }))
+}
+
+fn top_level_help_requested(raw: &[String]) -> bool {
+    raw.len() == 2 && matches!(raw.get(1).map(String::as_str), Some("--help" | "-h"))
+}
+
+fn psql_admin_action(action: PsqlCliAction) -> PsqlAdminAction {
+    match action {
+        PsqlCliAction::Status(args) => PsqlAdminAction::Status {
+            bin_dir: args.bin_dir,
+        },
+        PsqlCliAction::Install(args) => PsqlAdminAction::Install {
+            bin_dir: args.bin_dir,
+        },
+        PsqlCliAction::Uninstall(args) => PsqlAdminAction::Uninstall {
+            bin_dir: args.bin_dir,
+        },
+    }
 }
 
 fn is_psql_mode_requested(raw: &[String]) -> bool {
@@ -527,30 +649,60 @@ fn startup_env_snapshot() -> Value {
     })
 }
 
-fn psql_startup_args(
-    mode: &str,
+struct PsqlStartupArgs<'a> {
+    mode: &'a str,
     sql: Option<String>,
     sql_file: Option<String>,
-    params_kv: &[String],
-    session: &SessionConfig,
+    params_kv: &'a [String],
+    session: &'a SessionConfig,
     output: OutputFormat,
-    log_entries: &[String],
-) -> Value {
+    log_entries: &'a [String],
+    dsn_secret_env: Option<&'a str>,
+    password_secret_env: Option<&'a str>,
+}
+
+fn psql_startup_args(args: PsqlStartupArgs<'_>) -> Value {
     json!({
-        "mode": mode,
-        "sql": sql,
-        "sql_file": sql_file,
-        "param": params_kv,
-        "dsn_secret": session.dsn_secret,
-        "conninfo_secret": session.conninfo_secret,
-        "host": session.host,
-        "port": session.port,
-        "user": session.user,
-        "dbname": session.dbname,
-        "password_secret": session.password_secret,
-        "output": output_name(output),
-        "log": parse_log_categories(log_entries),
+        "mode": args.mode,
+        "sql": args.sql,
+        "sql_file": args.sql_file,
+        "param_count": args.params_kv.len(),
+        "dsn_secret": args.session.dsn_secret,
+        "dsn_secret_env": args.dsn_secret_env,
+        "conninfo_secret": args.session.conninfo_secret,
+        "host": args.session.host,
+        "port": args.session.port,
+        "user": args.session.user,
+        "dbname": args.session.dbname,
+        "password_secret": args.session.password_secret,
+        "password_secret_env": args.password_secret_env,
+        "output": output_name(args.output),
+        "log": parse_log_categories(args.log_entries),
     })
+}
+
+fn resolve_secret_value(
+    flag_name: &str,
+    direct: Option<String>,
+    env_name: Option<&str>,
+) -> Result<Option<String>, String> {
+    match (direct, env_name) {
+        (Some(_), Some(_)) => Err(format!(
+            "{flag_name} and {flag_name}-env are mutually exclusive"
+        )),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(name)) => {
+            if name.is_empty() {
+                return Err(format!(
+                    "{flag_name}-env requires a non-empty variable name"
+                ));
+            }
+            std::env::var(name).map(Some).map_err(|_| {
+                format!("{flag_name}-env references unset environment variable: {name}")
+            })
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 pub fn parse_params(entries: &[String]) -> Result<Vec<Value>, String> {

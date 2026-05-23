@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{DbExecutor, ExecError, ExecOutcome};
+use crate::db::{DbExecutor, ExecError, ExecOutcome, ExecRequest};
 use async_trait::async_trait;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -118,14 +118,7 @@ struct MockExecutor {
 
 #[async_trait]
 impl DbExecutor for MockExecutor {
-    async fn execute(
-        &self,
-        _session_name: &str,
-        _session_cfg: &SessionConfig,
-        _sql: &str,
-        _params: &[Value],
-        _opts: &ResolvedOptions,
-    ) -> Result<ExecOutcome, ExecError> {
+    async fn execute(&self, _req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
         self.result
             .lock()
             .await
@@ -166,6 +159,7 @@ async fn execute_query_unknown_session_emits_connect_failed() {
         "select 1".to_string(),
         vec![],
         QueryOptions::default(),
+        None,
     )
     .await;
     let msg_opt = rx.recv().await;
@@ -212,6 +206,7 @@ async fn execute_query_maps_executor_outcomes() {
             "select 1".to_string(),
             vec![],
             QueryOptions::default(),
+            None,
         )
         .await;
         let msg_opt = rx.recv().await;

@@ -63,7 +63,6 @@ Output events:
 - `result_end`
 - `sql_error`
 - `error`
-- `notice`
 - `config`
 - `pong`
 - `close`
@@ -190,8 +189,9 @@ Return one `result` if payload is below both limits:
 When `stream_rows=true`:
 
 1. emit `result_start` with column metadata
-2. emit repeated `result_rows` batches
-3. emit `result_end` with totals in `trace`
+2. read PostgreSQL rows incrementally instead of buffering the full result
+3. emit repeated `result_rows` batches
+4. emit `result_end` with totals in `trace`
 
 Batch controls:
 
