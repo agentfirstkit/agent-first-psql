@@ -20,11 +20,16 @@ This document contains the help content for the `afpsql` command-line program.
 
 Agent-First PostgreSQL client.
 
+`afpsql` gives agents a reliable PostgreSQL contract: structured stdout
+events, explicit write permissions, stable pipe sessions, and machine-readable
+failures.
+
 ### Interface Policy
 
 - default mode is canonical agent-first CLI
 - `--mode psql` is argument translation only; runtime output stays JSONL
 - stdout carries protocol events; stderr is not a protocol channel
+- native CLI and pipe mode default to read-only transactions; writes require permission
 
 ### Query Sources and Parameters
 
@@ -37,8 +42,9 @@ Agent-First PostgreSQL client.
 - `--dsn-secret` for a PostgreSQL URI
 - `--conninfo-secret` for libpq-style conninfo
 - or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
+- add `--ssh user@server` when PostgreSQL is reachable only from the server
 - agent-first environment fallbacks: `AFPSQL_*`
-- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`
+- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`
 
 ### Result Shaping
 
@@ -52,7 +58,8 @@ Agent-First PostgreSQL client.
 afpsql --sql "select now() as now_rfc3339"
 afpsql --sql-file ./query.sql
 afpsql --sql "select * from users where id = $1" --param 1=123
-afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select 1"
+afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
+afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
@@ -84,7 +91,7 @@ afpsql psql install
 * `--lock-timeout-ms <LOCK_TIMEOUT_MS>` — Per-query lock timeout in milliseconds
 * `--inline-max-rows <INLINE_MAX_ROWS>` — Maximum inline rows before returning `result_too_large`
 * `--inline-max-bytes <INLINE_MAX_BYTES>` — Maximum inline payload bytes before returning `result_too_large`
-* `--read-only` — Force the query to run in a read-only transaction
+* `--permission <PERMISSION>` — Query permission: read, write, ssh-read, or ssh-write. Defaults to read, or ssh-read with --ssh
 * `--dry-run` — Preview the query without executing it
 * `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
 * `--dsn-secret-env <DSN_SECRET_ENV>` — Read PostgreSQL DSN URI from an environment variable
@@ -95,6 +102,12 @@ afpsql psql install
 * `--dbname <DBNAME>` — PostgreSQL database name
 * `--password-secret <PASSWORD_SECRET>` — PostgreSQL password. Redacted in structured output
 * `--password-secret-env <PASSWORD_SECRET_ENV>` — Read PostgreSQL password from an environment variable
+* `--ssh <SSH>` — Open an SSH transport to USER@HOST before connecting to PostgreSQL
+* `--ssh-option <SSH_OPTIONS>` — Additional OpenSSH -o option. Repeat for multiple options
+* `--ssh-local-host <SSH_LOCAL_HOST>` — Local bind host for the SSH tunnel
+* `--ssh-local-port <SSH_LOCAL_PORT>` — Local bind port for the SSH tunnel. Defaults to an ephemeral port
+* `--ssh-remote-socket <SSH_REMOTE_SOCKET>` — Explicit remote PostgreSQL Unix socket path for SSH forwarding
+* `--ssh-sudo-user <SSH_SUDO_USER>` — Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket
 * `--output <OUTPUT>` — Output format: json (default), yaml, or plain
 
   Default value: `json`

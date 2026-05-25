@@ -1,3 +1,16 @@
+# Canonical clippy config for every Rust spore in this kit.
+#
+# Source of truth — `sync-spore-meta.py` mirrors this file into:
+#   spores/agent-first-data/rust/clippy.toml   (multi-language: rust subdir)
+#   spores/agent-first-http/clippy.toml
+#   spores/agent-first-mail/clippy.toml
+#   spores/agent-first-pay/clippy.toml
+#   spores/agent-first-psql/clippy.toml
+#   spores/agent-first-ui/clippy.toml          (workspace root)
+#
+# Edit this file, then `python3 scripts/sync-spore-meta.py <spore> --no-github`
+# (release pipeline runs the propagation automatically).
+
 disallowed-macros = [
   { path = "std::eprintln", reason = "AFDATA protocol/log events must use stdout only; stderr is not a protocol channel." },
 ]

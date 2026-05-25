@@ -1,8 +1,8 @@
 [package]
 name = "agent-first-psql"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "A PostgreSQL tool for AI agents — SQL in, typed rows out, on a connection that stays open."
+description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and safe by default."
 license = "MIT"
 repository = "https://github.com/agentfirstkit/agent-first-psql"
 readme = "README.md"
@@ -13,12 +13,11 @@ name = "afpsql"
 path = "src/main.rs"
 
 [dependencies]
-agent-first-data = { version = "0.8", features = ["cli-help", "cli-help-markdown"] }
+agent-first-data = { version = "0.9", features = ["cli-help", "cli-help-markdown"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-deadpool-postgres = "0.14"
 bytes = "1"
 futures-util = "0.3"
 native-tls = "0.2"

@@ -1,9 +1,13 @@
 use crate::types::Output;
-use agent_first_data::{cli_output, OutputFormat, RedactionPolicy};
+use agent_first_data::{
+    OutputFormat, OutputOptions, OutputStyle, RedactionOptions, RedactionPolicy,
+};
 use serde_json::Value;
 
+const LEGACY_SECRET_NAMES: &[&str] = &["PGPASSWORD"];
+
 pub fn render_output(out: &Output, format: OutputFormat) -> String {
-    let mut value = match serde_json::to_value(out) {
+    let value = match serde_json::to_value(out) {
         Ok(v) => v,
         Err(_) => {
             let fallback = serde_json::json!({
@@ -13,42 +17,56 @@ pub fn render_output(out: &Output, format: OutputFormat) -> String {
                 "retryable": false,
                 "trace": {"duration_ms": 0}
             });
-            return cli_output(&fallback, format);
+            return render_value(&fallback, format, &default_output_options());
         }
     };
 
-    if matches!(format, OutputFormat::Json) {
-        match json_redaction_policy_for_output(out) {
-            Some(policy) => agent_first_data::output_json_with(&value, policy),
-            None => cli_output(&value, OutputFormat::Json),
-        }
-    } else {
-        protect_result_rows(&mut value, out);
-        cli_output(&value, format)
-    }
+    let options = output_options_for_output(out);
+    render_value(&value, format, &options)
 }
 
-fn json_redaction_policy_for_output(out: &Output) -> Option<RedactionPolicy> {
-    match out {
+fn output_options_for_output(out: &Output) -> OutputOptions {
+    let policy = match out {
         // Preserve SQL payload keys/values; redact trace-only metadata if needed.
         Output::Result { .. } | Output::ResultRows { .. } => {
             Some(RedactionPolicy::RedactionTraceOnly)
         }
         _ => None,
+    };
+    let style = match out {
+        Output::Result { .. } | Output::ResultRows { .. } => OutputStyle::Raw,
+        _ => OutputStyle::Readable,
+    };
+    OutputOptions {
+        redaction: RedactionOptions {
+            policy,
+            secret_names: legacy_secret_names(),
+        },
+        style,
     }
 }
 
-fn protect_result_rows(value: &mut Value, out: &Output) {
-    if !matches!(out, Output::Result { .. } | Output::ResultRows { .. }) {
-        return;
+fn default_output_options() -> OutputOptions {
+    OutputOptions {
+        redaction: RedactionOptions {
+            policy: None,
+            secret_names: legacy_secret_names(),
+        },
+        style: OutputStyle::Readable,
     }
-    if let Some(obj) = value.as_object_mut() {
-        if let Some(rows) = obj.get("rows").cloned() {
-            if !rows.is_null() && !rows.is_string() {
-                if let Ok(rows_json) = serde_json::to_string(&rows) {
-                    obj.insert("rows".to_string(), Value::String(rows_json));
-                }
-            }
-        }
+}
+
+fn legacy_secret_names() -> Vec<String> {
+    LEGACY_SECRET_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn render_value(value: &Value, format: OutputFormat, options: &OutputOptions) -> String {
+    match format {
+        OutputFormat::Json => agent_first_data::output_json_with_options(value, options),
+        OutputFormat::Yaml => agent_first_data::output_yaml_with_options(value, options),
+        OutputFormat::Plain => agent_first_data::output_plain_with_options(value, options),
     }
 }

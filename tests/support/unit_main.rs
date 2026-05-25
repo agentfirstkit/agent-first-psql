@@ -15,12 +15,20 @@ fn has_session_override_true_for_host() {
 
 #[test]
 fn build_startup_log_has_afdata_fields() {
-    let cfg = RuntimeConfig::default();
     let out = build_startup_log(
         Some("default"),
-        &cfg,
-        &serde_json::json!({"mode":"cli"}),
-        &serde_json::json!({"AFPSQL_DSN_SECRET": null}),
+        &serde_json::json!({
+            "mode": "cli",
+            "sql": {
+                "present": true,
+                "source": "inline",
+                "bytes": 8,
+                "chars": 8,
+                "operation": "select"
+            },
+            "param_count": 0
+        }),
+        &serde_json::json!([{"key": "AFPSQL_DSN_SECRET", "present": false}]),
     );
     assert!(matches!(out, Output::Log { .. }));
     if let Output::Log {
@@ -34,31 +42,42 @@ fn build_startup_log_has_afdata_fields() {
     {
         assert_eq!(event, "startup");
         assert!(version.is_some());
-        assert!(config.is_some());
+        assert!(config.is_none());
         assert!(args.is_some());
         assert!(env.is_some());
     }
 }
 
 #[test]
-fn startup_log_redacts_args_and_has_no_argv() {
-    let cfg = RuntimeConfig::default();
+fn startup_log_omits_raw_sql_config_and_env_values() {
     let out = build_startup_log(
         Some("default"),
-        &cfg,
         &serde_json::json!({
             "mode": "cli",
-            "dsn_secret": "postgresql://user:supersecret@host/db",
+            "sql": {
+                "present": true,
+                "source": "inline",
+                "bytes": 47,
+                "chars": 47,
+                "operation": "select"
+            },
             "param_count": 1
         }),
-        &serde_json::json!({"AFPSQL_DSN_SECRET": "postgresql://env:secret@host/db"}),
+        &serde_json::json!([
+            {"key": "AFPSQL_DSN_SECRET", "present": true},
+            {"key": "PGPASSWORD", "present": true}
+        ]),
     );
     let rendered = output_fmt::render_output(&out, OutputFormat::Json);
     assert!(!rendered.contains("\"argv\""));
-    assert!(!rendered.contains("supersecret"));
-    assert!(!rendered.contains("postgresql://env:secret@host/db"));
-    assert!(rendered.contains("\"dsn_secret\":\"***\""));
-    assert!(rendered.contains("\"AFPSQL_DSN_SECRET\":\"***\""));
+    assert!(!rendered.contains("\"config\""));
+    assert!(!rendered.contains("postgresql://"));
+    assert!(!rendered.contains("pg-secret"));
+    assert!(!rendered.contains("select 'sensitive'"));
+    assert!(rendered.contains("\"operation\":\"select\""));
+    assert!(rendered.contains("\"bytes\":47"));
+    assert!(rendered.contains("\"key\":\"PGPASSWORD\""));
+    assert!(rendered.contains("\"present\":true"));
     assert!(rendered.contains("\"param_count\":1"));
 }
 

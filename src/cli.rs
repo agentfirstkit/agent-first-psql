@@ -1,15 +1,38 @@
-use std::io::Write;
+use std::io::{Read, Write};
 
-use crate::types::{QueryOptions, SessionConfig};
+use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
+use crate::types::{Permission, QueryOptions, SessionConfig};
 use agent_first_data::{cli_parse_log_filters, cli_parse_output, OutputFormat};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
+
+const STARTUP_ENV_KEYS: &[&str] = &[
+    "AFPSQL_DSN_SECRET",
+    "AFPSQL_CONNINFO_SECRET",
+    "AFPSQL_HOST",
+    "AFPSQL_PORT",
+    "AFPSQL_USER",
+    "AFPSQL_DBNAME",
+    "AFPSQL_PASSWORD_SECRET",
+    "AFPSQL_SSH",
+    "AFPSQL_SSH_LOCAL_HOST",
+    "AFPSQL_SSH_LOCAL_PORT",
+    "AFPSQL_SSH_REMOTE_SOCKET",
+    "AFPSQL_SSH_SUDO_USER",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGDATABASE",
+    "PGPASSWORD",
+    "PGSSLMODE",
+];
 
 pub enum Mode {
     Cli(CliRequest),
     Pipe(PipeInit),
     PsqlAdmin(PsqlAdminRequest),
+    PsqlUnsupported(PsqlUnsupportedRequest),
 }
 
 pub struct PipeInit {
@@ -40,11 +63,17 @@ pub struct CliRequest {
     pub options: QueryOptions,
     pub session: SessionConfig,
     pub output: OutputFormat,
+    pub output_file: Option<String>,
+    pub log_file: Option<String>,
     pub log: Vec<String>,
     pub startup_args: Value,
     pub startup_env: Value,
     pub startup_requested: bool,
     pub dry_run: bool,
+}
+
+pub struct PsqlUnsupportedRequest {
+    pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -86,11 +115,16 @@ struct PsqlPathArgs {
 
 #[doc = r#"Agent-First PostgreSQL client.
 
+`afpsql` gives agents a reliable PostgreSQL contract: structured stdout
+events, explicit write permissions, stable pipe sessions, and machine-readable
+failures.
+
 ### Interface Policy
 
 - default mode is canonical agent-first CLI
 - `--mode psql` is argument translation only; runtime output stays JSONL
 - stdout carries protocol events; stderr is not a protocol channel
+- native CLI and pipe mode default to read-only transactions; writes require permission
 
 ### Query Sources and Parameters
 
@@ -103,8 +137,9 @@ struct PsqlPathArgs {
 - `--dsn-secret` for a PostgreSQL URI
 - `--conninfo-secret` for libpq-style conninfo
 - or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
+- add `--ssh user@server` when PostgreSQL is reachable only from the server
 - agent-first environment fallbacks: `AFPSQL_*`
-- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`
+- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`
 
 ### Result Shaping
 
@@ -118,7 +153,8 @@ struct PsqlPathArgs {
 afpsql --sql "select now() as now_rfc3339"
 afpsql --sql-file ./query.sql
 afpsql --sql "select * from users where id = $1" --param 1=123
-afpsql --dsn-secret "postgresql://app:secret@127.0.0.1:5432/appdb" --sql "select 1"
+afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
+afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
@@ -136,10 +172,10 @@ afpsql psql install
 #[command(name = "afpsql", version, verbatim_doc_comment)]
 pub struct AfdCli {
     /// Inline SQL string to execute.
-    #[arg(long, help_heading = "Query")]
+    #[arg(long, allow_hyphen_values = true, help_heading = "Query")]
     sql: Option<String>,
     /// Read SQL from a file.
-    #[arg(long = "sql-file", help_heading = "Query")]
+    #[arg(long = "sql-file", allow_hyphen_values = true, help_heading = "Query")]
     sql_file: Option<String>,
     /// Positional bind parameter in `N=value` form. Repeat for additional parameters.
     #[arg(long = "param", help_heading = "Query")]
@@ -165,9 +201,9 @@ pub struct AfdCli {
     /// Maximum inline payload bytes before returning `result_too_large`.
     #[arg(long = "inline-max-bytes", help_heading = "Query")]
     inline_max_bytes: Option<usize>,
-    /// Force the query to run in a read-only transaction.
-    #[arg(long = "read-only", help_heading = "Query")]
-    read_only: bool,
+    /// Query permission: read, write, ssh-read, or ssh-write. Defaults to read, or ssh-read with --ssh.
+    #[arg(long = "permission", value_parser = parse_permission_arg, help_heading = "Query")]
+    permission: Option<Permission>,
     /// Preview the query without executing it
     #[arg(long, help_heading = "Query")]
     dry_run: bool,
@@ -199,6 +235,24 @@ pub struct AfdCli {
     /// Read PostgreSQL password from an environment variable.
     #[arg(long = "password-secret-env", help_heading = "Connection")]
     password_secret_env: Option<String>,
+    /// Open an SSH transport to USER@HOST before connecting to PostgreSQL.
+    #[arg(long = "ssh", help_heading = "SSH Transport")]
+    ssh: Option<String>,
+    /// Additional OpenSSH -o option. Repeat for multiple options.
+    #[arg(long = "ssh-option", help_heading = "SSH Transport")]
+    ssh_options: Vec<String>,
+    /// Local bind host for the SSH tunnel.
+    #[arg(long = "ssh-local-host", help_heading = "SSH Transport")]
+    ssh_local_host: Option<String>,
+    /// Local bind port for the SSH tunnel. Defaults to an ephemeral port.
+    #[arg(long = "ssh-local-port", help_heading = "SSH Transport")]
+    ssh_local_port: Option<u16>,
+    /// Explicit remote PostgreSQL Unix socket path for SSH forwarding.
+    #[arg(long = "ssh-remote-socket", help_heading = "SSH Transport")]
+    ssh_remote_socket: Option<String>,
+    /// Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket.
+    #[arg(long = "ssh-sudo-user", help_heading = "SSH Transport")]
+    ssh_sudo_user: Option<String>,
 
     /// Output format: json (default), yaml, or plain.
     #[arg(long, default_value = "json", help_heading = "Runtime")]
@@ -231,7 +285,7 @@ pub fn parse_args() -> Result<Mode, String> {
         std::process::exit(0);
     }
     // --help-markdown: Markdown for doc generation
-    if raw.iter().any(|a| a == "--help-markdown") {
+    if top_level_help_markdown_requested(&raw) {
         let _ = writeln!(
             std::io::stdout(),
             "{}",
@@ -271,37 +325,28 @@ pub fn parse_args() -> Result<Mode, String> {
         user: cli.user,
         dbname: cli.dbname,
         password_secret,
+        ssh: cli.ssh.or_else(|| std::env::var("AFPSQL_SSH").ok()),
+        ssh_options: cli.ssh_options,
+        ssh_local_host: cli
+            .ssh_local_host
+            .or_else(|| std::env::var("AFPSQL_SSH_LOCAL_HOST").ok()),
+        ssh_local_port: cli.ssh_local_port.or_else(|| {
+            std::env::var("AFPSQL_SSH_LOCAL_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        }),
+        ssh_remote_socket: cli
+            .ssh_remote_socket
+            .or_else(|| std::env::var("AFPSQL_SSH_REMOTE_SOCKET").ok()),
+        ssh_sudo_user: cli
+            .ssh_sudo_user
+            .or_else(|| std::env::var("AFPSQL_SSH_SUDO_USER").ok()),
     };
     let mode_name = match cli.mode {
         RuntimeMode::Cli => "cli",
         RuntimeMode::Pipe => "pipe",
         RuntimeMode::Psql => "psql",
     };
-    let startup_args = json!({
-        "mode": mode_name,
-        "sql": &cli.sql,
-        "sql_file": &cli.sql_file,
-        "param_count": cli.param.len(),
-        "stream_rows": cli.stream_rows,
-        "batch_rows": cli.batch_rows,
-        "batch_bytes": cli.batch_bytes,
-        "statement_timeout_ms": cli.statement_timeout_ms,
-        "lock_timeout_ms": cli.lock_timeout_ms,
-        "inline_max_rows": cli.inline_max_rows,
-        "inline_max_bytes": cli.inline_max_bytes,
-        "read_only": cli.read_only,
-        "dsn_secret": &session.dsn_secret,
-        "dsn_secret_env": &cli.dsn_secret_env,
-        "conninfo_secret": &session.conninfo_secret,
-        "host": &session.host,
-        "port": session.port,
-        "user": &session.user,
-        "dbname": &session.dbname,
-        "password_secret": &session.password_secret,
-        "password_secret_env": &cli.password_secret_env,
-        "output": output_name(output),
-        "log": &log,
-    });
     let startup_env = startup_env_snapshot();
 
     if let Some(command) = cli.command {
@@ -319,7 +364,7 @@ pub fn parse_args() -> Result<Mode, String> {
                 output,
                 session,
                 log: log.clone(),
-                startup_args,
+                startup_args: startup_args(mode_name, None, None, 0),
                 startup_env,
                 startup_requested,
             }));
@@ -327,8 +372,15 @@ pub fn parse_args() -> Result<Mode, String> {
         RuntimeMode::Cli | RuntimeMode::Psql => {}
     }
 
+    let startup_sql_file = cli.sql_file.clone();
     let sql = load_sql(cli.sql, cli.sql_file)?;
     let params = parse_params(&cli.param)?;
+    let startup_args = startup_args(
+        mode_name,
+        Some(&sql),
+        startup_sql_file.as_deref(),
+        params.len(),
+    );
 
     let options = QueryOptions {
         stream_rows: cli.stream_rows,
@@ -336,7 +388,7 @@ pub fn parse_args() -> Result<Mode, String> {
         batch_bytes: cli.batch_bytes,
         statement_timeout_ms: cli.statement_timeout_ms,
         lock_timeout_ms: cli.lock_timeout_ms,
-        read_only: if cli.read_only { Some(true) } else { None },
+        permission: cli.permission,
         inline_max_rows: cli.inline_max_rows,
         inline_max_bytes: cli.inline_max_bytes,
     };
@@ -347,6 +399,8 @@ pub fn parse_args() -> Result<Mode, String> {
         options,
         session,
         output,
+        output_file: None,
+        log_file: None,
         log,
         startup_args,
         startup_env,
@@ -357,184 +411,93 @@ pub fn parse_args() -> Result<Mode, String> {
 
 fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
     let startup_requested = startup_requested_from_raw(raw);
-    let mut sql: Option<String> = None;
-    let mut sql_file: Option<String> = None;
-    let mut host: Option<String> = None;
-    let mut port: Option<u16> = None;
-    let mut user: Option<String> = None;
-    let mut dbname: Option<String> = None;
-    let mut dsn_secret: Option<String> = None;
-    let mut dsn_secret_env: Option<String> = None;
-    let mut conninfo_secret: Option<String> = None;
-    let mut password_secret: Option<String> = None;
-    let mut password_secret_env: Option<String> = None;
-    let mut params_kv: Vec<String> = vec![];
-    let mut output = OutputFormat::Json;
-    let mut log_entries: Vec<String> = vec![];
+    let mut state = PsqlModeState::default();
 
     let mut i = 1usize;
     while i < raw.len() {
-        match raw[i].as_str() {
-            "--mode" => {
-                i += 1;
-                let v = raw.get(i).ok_or("--mode requires value")?;
-                if v != "psql" {
-                    return Err(format!("unsupported psql-mode argument: --mode {v}; only --mode psql is allowed with psql translation"));
-                }
+        let arg = raw[i].as_str();
+        if arg == "--" {
+            i += 1;
+            while i < raw.len() {
+                state.positionals.push(raw[i].clone());
                 i += 1;
             }
-            other if other.starts_with("--mode=") => {
-                let v = other.trim_start_matches("--mode=");
-                if v != "psql" {
-                    return Err(format!("unsupported psql-mode argument: {other}; only --mode=psql is allowed with psql translation"));
-                }
-                i += 1;
-            }
-            "-c" => {
-                i += 1;
-                let v = raw.get(i).ok_or("-c requires SQL")?;
-                sql = Some(v.clone());
-                i += 1;
-            }
-            "-f" => {
-                i += 1;
-                let v = raw.get(i).ok_or("-f requires file path")?;
-                sql_file = Some(v.clone());
-                i += 1;
-            }
-            "-h" => {
-                i += 1;
-                host = Some(raw.get(i).ok_or("-h requires value")?.clone());
-                i += 1;
-            }
-            "-p" => {
-                i += 1;
-                port = Some(
-                    raw.get(i)
-                        .ok_or("-p requires value")?
-                        .parse()
-                        .map_err(|_| "invalid -p port")?,
-                );
-                i += 1;
-            }
-            "-U" => {
-                i += 1;
-                user = Some(raw.get(i).ok_or("-U requires value")?.clone());
-                i += 1;
-            }
-            "-d" => {
-                i += 1;
-                dbname = Some(raw.get(i).ok_or("-d requires value")?.clone());
-                i += 1;
-            }
-            "--dsn-secret" => {
-                i += 1;
-                dsn_secret = Some(raw.get(i).ok_or("--dsn-secret requires value")?.clone());
-                i += 1;
-            }
-            "--dsn-secret-env" => {
-                i += 1;
-                dsn_secret_env = Some(raw.get(i).ok_or("--dsn-secret-env requires value")?.clone());
-                i += 1;
-            }
-            "--conninfo-secret" => {
-                i += 1;
-                conninfo_secret = Some(
-                    raw.get(i)
-                        .ok_or("--conninfo-secret requires value")?
-                        .clone(),
-                );
-                i += 1;
-            }
-            "--password-secret" => {
-                i += 1;
-                password_secret = Some(
-                    raw.get(i)
-                        .ok_or("--password-secret requires value")?
-                        .clone(),
-                );
-                i += 1;
-            }
-            "--password-secret-env" => {
-                i += 1;
-                password_secret_env = Some(
-                    raw.get(i)
-                        .ok_or("--password-secret-env requires value")?
-                        .clone(),
-                );
-                i += 1;
-            }
-            "-v" => {
-                i += 1;
-                params_kv.push(raw.get(i).ok_or("-v requires N=value")?.clone());
-                i += 1;
-            }
-            "--output" => {
-                i += 1;
-                output = parse_output(raw.get(i).ok_or("--output requires value")?)?;
-                i += 1;
-            }
-            "--log" => {
-                i += 1;
-                let values = raw.get(i).ok_or("--log requires value")?;
-                for part in values.split(',') {
-                    let trimmed = part.trim();
-                    if !trimmed.is_empty() {
-                        log_entries.push(trimmed.to_string());
-                    }
-                }
-                i += 1;
-            }
-            other if other.starts_with("postgresql://") || other.starts_with("postgres://") => {
-                dsn_secret = Some(other.to_string());
-                i += 1;
-            }
-            unsupported => {
-                return Err(format!(
-                    "unsupported psql-mode argument: {unsupported}; only --mode psql, -c/-f/-h/-p/-U/-d/-v/--dsn-secret/--dsn-secret-env/--conninfo-secret/--password-secret/--password-secret-env/--output/--log are supported"
-                ));
-            }
+            break;
         }
+        if arg.starts_with("--") {
+            parse_psql_long_arg(raw, &mut i, &mut state)?;
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            parse_psql_short_arg(raw, &mut i, &mut state)?;
+            continue;
+        }
+        state.positionals.push(raw[i].clone());
+        i += 1;
     }
 
-    let dsn_secret = resolve_secret_value("--dsn-secret", dsn_secret, dsn_secret_env.as_deref())?;
+    if let Some(reason) = state.interactive_reason {
+        return Ok(Mode::PsqlUnsupported(PsqlUnsupportedRequest { reason }));
+    }
+
+    apply_psql_positionals(&mut state)?;
+    if state.list_databases {
+        state.sql = Some(psql_list_databases_sql());
+        state.sql_file = None;
+    }
+    if state.sql.is_none() && state.sql_file.is_none() {
+        return Ok(Mode::PsqlUnsupported(PsqlUnsupportedRequest {
+            reason: "no -c/--command, -f/--file, or -l/--list was provided".to_string(),
+        }));
+    }
+
+    let dsn_secret = resolve_secret_value(
+        "--dsn-secret",
+        state.dsn_secret,
+        state.dsn_secret_env.as_deref(),
+    )?;
     let password_secret = resolve_secret_value(
         "--password-secret",
-        password_secret,
-        password_secret_env.as_deref(),
+        state.password_secret,
+        state.password_secret_env.as_deref(),
     )?;
     let session = SessionConfig {
         dsn_secret,
-        conninfo_secret,
-        host,
-        port,
-        user,
-        dbname,
+        conninfo_secret: state.conninfo_secret,
+        host: state.host,
+        port: state.port,
+        user: state.user,
+        dbname: state.dbname,
         password_secret,
+        ssh: None,
+        ssh_options: vec![],
+        ssh_local_host: None,
+        ssh_local_port: None,
+        ssh_remote_socket: None,
+        ssh_sudo_user: None,
     };
 
-    let startup_sql = sql.clone();
-    let startup_sql_file = sql_file.clone();
-    let sql = load_sql(sql, sql_file)?;
-    let params = parse_params(&params_kv)?;
+    let startup_sql_file = state.sql_file.clone();
+    let sql = load_sql(state.sql, state.sql_file)?;
+    let params = parse_params(&state.params_kv)?;
     let startup_args = psql_startup_args(PsqlStartupArgs {
         mode: "psql",
-        sql: startup_sql.or_else(|| Some(sql.clone())),
+        sql: Some(&sql),
         sql_file: startup_sql_file,
-        params_kv: &params_kv,
-        session: &session,
-        output,
-        log_entries: &log_entries,
-        dsn_secret_env: dsn_secret_env.as_deref(),
-        password_secret_env: password_secret_env.as_deref(),
+        param_count: params.len(),
     });
     Ok(Mode::Cli(CliRequest {
         sql,
         params,
-        options: QueryOptions::default(),
+        options: QueryOptions {
+            permission: Some(Permission::Write),
+            ..Default::default()
+        },
         session,
-        output,
-        log: parse_log_categories(&log_entries),
+        output: state.output,
+        output_file: state.output_file,
+        log_file: state.log_file,
+        log: parse_log_categories(&state.log_entries),
         startup_args,
         startup_env: startup_env_snapshot(),
         startup_requested,
@@ -542,8 +505,504 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
     }))
 }
 
+struct PsqlModeState {
+    sql: Option<String>,
+    sql_file: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    dbname: Option<String>,
+    dsn_secret: Option<String>,
+    dsn_secret_env: Option<String>,
+    conninfo_secret: Option<String>,
+    password_secret: Option<String>,
+    password_secret_env: Option<String>,
+    params_kv: Vec<String>,
+    output: OutputFormat,
+    log_entries: Vec<String>,
+    output_file: Option<String>,
+    log_file: Option<String>,
+    list_databases: bool,
+    positionals: Vec<String>,
+    interactive_reason: Option<String>,
+}
+
+impl Default for PsqlModeState {
+    fn default() -> Self {
+        Self {
+            sql: None,
+            sql_file: None,
+            host: None,
+            port: None,
+            user: None,
+            dbname: None,
+            dsn_secret: None,
+            dsn_secret_env: None,
+            conninfo_secret: None,
+            password_secret: None,
+            password_secret_env: None,
+            params_kv: vec![],
+            output: OutputFormat::Json,
+            log_entries: vec![],
+            output_file: None,
+            log_file: None,
+            list_databases: false,
+            positionals: vec![],
+            interactive_reason: None,
+        }
+    }
+}
+
+impl PsqlModeState {
+    fn set_sql(&mut self, sql: String, flag: &str) -> Result<(), String> {
+        if self.sql.is_some() || self.sql_file.is_some() {
+            return Err(format!(
+                "psql mode currently supports only one -c/--command or -f/--file source; repeated source at {flag}"
+            ));
+        }
+        self.sql = Some(sql);
+        Ok(())
+    }
+
+    fn set_sql_file(&mut self, path: String, flag: &str) -> Result<(), String> {
+        if self.sql.is_some() || self.sql_file.is_some() {
+            return Err(format!(
+                "psql mode currently supports only one -c/--command or -f/--file source; repeated source at {flag}"
+            ));
+        }
+        self.sql_file = Some(path);
+        Ok(())
+    }
+}
+
+fn parse_psql_long_arg(
+    raw: &[String],
+    i: &mut usize,
+    state: &mut PsqlModeState,
+) -> Result<(), String> {
+    let arg = raw[*i].as_str();
+    if arg == "--mode" {
+        let value = take_arg_value(raw, i, "--mode")?;
+        if value != "psql" {
+            return Err(format!(
+                "unsupported psql-mode argument: --mode {value}; only --mode psql is allowed with psql translation"
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--mode=") {
+        if value != "psql" {
+            return Err(format!(
+                "unsupported psql-mode argument: {arg}; only --mode=psql is allowed with psql translation"
+            ));
+        }
+        *i += 1;
+        return Ok(());
+    }
+
+    if arg == "--help" || arg.starts_with("--help=") {
+        emit_psql_mode_help();
+        std::process::exit(0);
+    }
+    if arg == "--version" {
+        emit_psql_mode_version();
+        std::process::exit(0);
+    }
+
+    match long_name(arg) {
+        "--command" => {
+            let value = take_long_arg_value(raw, i, "--command")?;
+            state.set_sql(value, "--command")
+        }
+        "--file" => {
+            let value = take_long_arg_value(raw, i, "--file")?;
+            state.set_sql_file(value, "--file")
+        }
+        "--host" => {
+            state.host = Some(take_long_arg_value(raw, i, "--host")?);
+            Ok(())
+        }
+        "--port" => {
+            state.port = Some(parse_port(
+                &take_long_arg_value(raw, i, "--port")?,
+                "--port",
+            )?);
+            Ok(())
+        }
+        "--username" | "--user" => {
+            state.user = Some(take_long_arg_value(raw, i, long_name(arg))?);
+            Ok(())
+        }
+        "--dbname" => {
+            apply_dbname_value(state, take_long_arg_value(raw, i, "--dbname")?);
+            Ok(())
+        }
+        "--set" | "--variable" => {
+            let value = take_long_arg_value(raw, i, long_name(arg))?;
+            add_psql_variable(state, value)
+        }
+        "--list" => {
+            state.list_databases = true;
+            *i += 1;
+            Ok(())
+        }
+        "--no-password"
+        | "--no-psqlrc"
+        | "--no-readline"
+        | "--quiet"
+        | "--echo-all"
+        | "--echo-errors"
+        | "--echo-queries"
+        | "--echo-hidden"
+        | "--no-align"
+        | "--csv"
+        | "--html"
+        | "--tuples-only"
+        | "--expanded"
+        | "--field-separator-zero"
+        | "--record-separator-zero"
+        | "--single-transaction" => {
+            *i += 1;
+            Ok(())
+        }
+        "--field-separator" | "--record-separator" | "--pset" | "--table-attr" => {
+            let _ = take_long_arg_value(raw, i, long_name(arg))?;
+            Ok(())
+        }
+        "--password" => {
+            state.interactive_reason =
+                Some("--password/-W requests an interactive password prompt".to_string());
+            *i += 1;
+            Ok(())
+        }
+        "--single-step" => {
+            state.interactive_reason =
+                Some("--single-step/-s requires interactive command confirmation".to_string());
+            *i += 1;
+            Ok(())
+        }
+        "--single-line" => {
+            state.interactive_reason =
+                Some("--single-line/-S is a human-interactive input mode".to_string());
+            *i += 1;
+            Ok(())
+        }
+        "--dsn-secret" => {
+            state.dsn_secret = Some(take_long_arg_value(raw, i, "--dsn-secret")?);
+            Ok(())
+        }
+        "--dsn-secret-env" => {
+            state.dsn_secret_env = Some(take_long_arg_value(raw, i, "--dsn-secret-env")?);
+            Ok(())
+        }
+        "--conninfo-secret" => {
+            state.conninfo_secret = Some(take_long_arg_value(raw, i, "--conninfo-secret")?);
+            Ok(())
+        }
+        "--password-secret" => {
+            state.password_secret = Some(take_long_arg_value(raw, i, "--password-secret")?);
+            Ok(())
+        }
+        "--password-secret-env" => {
+            state.password_secret_env = Some(take_long_arg_value(raw, i, "--password-secret-env")?);
+            Ok(())
+        }
+        "--output" => {
+            let value = take_long_arg_value(raw, i, "--output")?;
+            if let Ok(format) = parse_output(&value) {
+                state.output = format;
+            } else {
+                state.output_file = Some(value);
+            }
+            Ok(())
+        }
+        "--output-format" => {
+            let value = take_long_arg_value(raw, i, long_name(arg))?;
+            state.output = parse_output(&value)?;
+            Ok(())
+        }
+        "--log" => {
+            let values = take_long_arg_value(raw, i, "--log")?;
+            add_log_entries(state, &values);
+            Ok(())
+        }
+        "--log-file" => {
+            state.log_file = Some(take_long_arg_value(raw, i, "--log-file")?);
+            Ok(())
+        }
+        _ => Err(format!("unsupported psql-mode argument: {arg}")),
+    }
+}
+
+fn parse_psql_short_arg(
+    raw: &[String],
+    i: &mut usize,
+    state: &mut PsqlModeState,
+) -> Result<(), String> {
+    let arg = raw[*i].as_str();
+    let mut offset = 1usize;
+    while offset < arg.len() {
+        let flag = arg.as_bytes()[offset] as char;
+        offset += 1;
+        match flag {
+            '?' => {
+                emit_psql_mode_help();
+                std::process::exit(0);
+            }
+            'V' => {
+                emit_psql_mode_version();
+                std::process::exit(0);
+            }
+            'c' => {
+                let value = take_short_arg_value(raw, i, arg, offset, "-c")?;
+                return state.set_sql(value, "-c");
+            }
+            'f' => {
+                let value = take_short_arg_value(raw, i, arg, offset, "-f")?;
+                return state.set_sql_file(value, "-f");
+            }
+            'h' => {
+                state.host = Some(take_short_arg_value(raw, i, arg, offset, "-h")?);
+                return Ok(());
+            }
+            'p' => {
+                let value = take_short_arg_value(raw, i, arg, offset, "-p")?;
+                state.port = Some(parse_port(&value, "-p")?);
+                return Ok(());
+            }
+            'U' => {
+                state.user = Some(take_short_arg_value(raw, i, arg, offset, "-U")?);
+                return Ok(());
+            }
+            'd' => {
+                apply_dbname_value(state, take_short_arg_value(raw, i, arg, offset, "-d")?);
+                return Ok(());
+            }
+            'v' => {
+                let value = take_short_arg_value(raw, i, arg, offset, "-v")?;
+                return add_psql_variable(state, value);
+            }
+            'F' | 'P' | 'R' | 'T' => {
+                let _ = take_short_arg_value(raw, i, arg, offset, &format!("-{flag}"))?;
+                return Ok(());
+            }
+            'L' => {
+                state.log_file = Some(take_short_arg_value(raw, i, arg, offset, "-L")?);
+                return Ok(());
+            }
+            'o' => {
+                state.output_file = Some(take_short_arg_value(raw, i, arg, offset, "-o")?);
+                return Ok(());
+            }
+            'l' => state.list_databases = true,
+            'W' => {
+                state.interactive_reason =
+                    Some("--password/-W requests an interactive password prompt".to_string());
+            }
+            's' => {
+                state.interactive_reason =
+                    Some("--single-step/-s requires interactive command confirmation".to_string());
+            }
+            'S' => {
+                state.interactive_reason =
+                    Some("--single-line/-S is a human-interactive input mode".to_string());
+            }
+            'a' | 'A' | 'b' | 'e' | 'E' | 'H' | 'n' | 'q' | 't' | 'w' | 'x' | 'X' | 'z' | '0'
+            | '1' => {}
+            _ => return Err(format!("unsupported psql-mode argument: -{flag}")),
+        }
+    }
+    *i += 1;
+    Ok(())
+}
+
+fn long_name(arg: &str) -> &str {
+    arg.split_once('=').map(|(name, _)| name).unwrap_or(arg)
+}
+
+fn take_arg_value(raw: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    *i += 1;
+    let value = raw
+        .get(*i)
+        .ok_or_else(|| format!("{flag} requires value"))?
+        .clone();
+    *i += 1;
+    Ok(value)
+}
+
+fn take_long_arg_value(raw: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    let arg = raw[*i].as_str();
+    if let Some((_, value)) = arg.split_once('=') {
+        *i += 1;
+        return Ok(value.to_string());
+    }
+    take_arg_value(raw, i, flag)
+}
+
+fn take_short_arg_value(
+    raw: &[String],
+    i: &mut usize,
+    arg: &str,
+    offset: usize,
+    flag: &str,
+) -> Result<String, String> {
+    if offset < arg.len() {
+        let value = arg[offset..].to_string();
+        *i += 1;
+        return Ok(value);
+    }
+    take_arg_value(raw, i, flag)
+}
+
+fn parse_port(value: &str, flag: &str) -> Result<u16, String> {
+    value.parse().map_err(|_| format!("invalid {flag} port"))
+}
+
+fn add_log_entries(state: &mut PsqlModeState, values: &str) {
+    for part in values.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            state.log_entries.push(trimmed.to_string());
+        }
+    }
+}
+
+fn add_psql_variable(state: &mut PsqlModeState, value: String) -> Result<(), String> {
+    let name = value
+        .split_once('=')
+        .map(|(name, _)| name)
+        .unwrap_or(value.as_str());
+    if name.parse::<usize>().is_ok() {
+        if value.contains('=') {
+            state.params_kv.push(value);
+            return Ok(());
+        }
+        return Err(format!("invalid param '{value}', expected N=value"));
+    }
+    if is_psql_behavior_variable(name) {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid or unsupported psql variable '{name}'; afpsql supports numeric -v N=value bind parameters, not client-side :name interpolation"
+    ))
+}
+
+fn is_psql_behavior_variable(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "ON_ERROR_STOP"
+            | "ON_ERROR_ROLLBACK"
+            | "QUIET"
+            | "ECHO"
+            | "ECHO_HIDDEN"
+            | "FETCH_COUNT"
+            | "VERBOSITY"
+            | "SHOW_CONTEXT"
+            | "HISTCONTROL"
+            | "HISTFILE"
+            | "HISTSIZE"
+            | "IGNOREEOF"
+            | "PAGER"
+            | "COLUMNS"
+    )
+}
+
+fn apply_psql_positionals(state: &mut PsqlModeState) -> Result<(), String> {
+    let positionals = std::mem::take(&mut state.positionals);
+    for value in positionals {
+        if is_postgres_uri(&value) {
+            state.dsn_secret = Some(value);
+            continue;
+        }
+        if looks_like_conninfo(&value) {
+            state.conninfo_secret = Some(value);
+            continue;
+        }
+        if state.dbname.is_none() {
+            state.dbname = Some(value);
+            continue;
+        }
+        if state.user.is_none() {
+            state.user = Some(value);
+            continue;
+        }
+        return Err(format!("too many positional psql arguments: {value}"));
+    }
+    Ok(())
+}
+
+fn apply_dbname_value(state: &mut PsqlModeState, value: String) {
+    if is_postgres_uri(&value) {
+        state.dsn_secret = Some(value);
+    } else if looks_like_conninfo(&value) {
+        state.conninfo_secret = Some(value);
+    } else {
+        state.dbname = Some(value);
+    }
+}
+
+fn is_postgres_uri(value: &str) -> bool {
+    value.starts_with("postgresql://") || value.starts_with("postgres://")
+}
+
+fn looks_like_conninfo(value: &str) -> bool {
+    value.contains('=')
+}
+
+fn psql_list_databases_sql() -> String {
+    "select datname as name from pg_catalog.pg_database where datallowconn order by datname"
+        .to_string()
+}
+
+fn emit_psql_mode_version() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "psql (afpsql wrapper) {}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn emit_psql_mode_help() {
+    let _ = writeln!(
+        std::io::stdout(),
+        "psql (afpsql wrapper) {}\n\
+Usage:\n  psql [OPTION]... [DBNAME [USERNAME]]\n\n\
+Supported non-interactive forms:\n  -c, --command=SQL\n  -f, --file=FILE\n  -l, --list\n  -h/-p/-U/-d and --host/--port/--username/--dbname\n  -v N=value, --set N=value for positional bind parameters\n\n\
+Output routing:\n  -o, --output=FILE writes structured output to FILE\n  -L, --log-file=FILE tees structured output to FILE\n  --output-format=json|yaml|plain changes afpsql rendering\n\n\
+Human-interactive psql modes and psql meta-commands are not supported by this wrapper.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 fn top_level_help_requested(raw: &[String]) -> bool {
     raw.len() == 2 && matches!(raw.get(1).map(String::as_str), Some("--help" | "-h"))
+}
+
+fn top_level_help_markdown_requested(raw: &[String]) -> bool {
+    let mut i = 1usize;
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "--help-markdown" {
+            return true;
+        }
+        if arg == "--mode" {
+            i += 2;
+            continue;
+        }
+        if top_level_arg_consumes_value(arg) {
+            i += if arg.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    false
 }
 
 fn psql_admin_action(action: PsqlCliAction) -> PsqlAdminAction {
@@ -564,6 +1023,9 @@ fn is_psql_mode_requested(raw: &[String]) -> bool {
     let mut i = 1usize;
     while i < raw.len() {
         let arg = raw[i].as_str();
+        if arg == "--" {
+            break;
+        }
         if arg == "--mode" {
             if let Some(v) = raw.get(i + 1) {
                 return v == "psql";
@@ -573,24 +1035,104 @@ fn is_psql_mode_requested(raw: &[String]) -> bool {
         if arg == "--mode=psql" {
             return true;
         }
-        i += 1;
+        if top_level_arg_consumes_value(arg) {
+            i += if arg.contains('=') { 1 } else { 2 };
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
     }
     false
 }
 
+fn top_level_arg_consumes_value(arg: &str) -> bool {
+    let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
+    matches!(
+        name,
+        "--sql"
+            | "--sql-file"
+            | "--param"
+            | "--batch-rows"
+            | "--batch-bytes"
+            | "--statement-timeout-ms"
+            | "--lock-timeout-ms"
+            | "--inline-max-rows"
+            | "--inline-max-bytes"
+            | "--permission"
+            | "--dsn-secret"
+            | "--dsn-secret-env"
+            | "--conninfo-secret"
+            | "--host"
+            | "--port"
+            | "--user"
+            | "--dbname"
+            | "--password-secret"
+            | "--password-secret-env"
+            | "--ssh"
+            | "--ssh-option"
+            | "--ssh-local-host"
+            | "--ssh-local-port"
+            | "--ssh-remote-socket"
+            | "--ssh-sudo-user"
+            | "--output"
+            | "--log"
+    )
+}
+
 fn load_sql(sql: Option<String>, sql_file: Option<String>) -> Result<String, String> {
     match (sql, sql_file) {
-        (Some(s), None) => Ok(s),
+        (Some(s), None) => validate_sql_size(s),
+        (None, Some(path)) if path == "-" => {
+            let stdin = std::io::stdin();
+            read_limited_sql(stdin.lock(), "read --sql-file -")
+        }
         (None, Some(path)) => {
-            std::fs::read_to_string(path).map_err(|e| format!("read --sql-file failed: {e}"))
+            let metadata =
+                std::fs::metadata(&path).map_err(|e| format!("read --sql-file failed: {e}"))?;
+            if metadata.is_file() && metadata.len() > MAX_SQL_BYTES as u64 {
+                return Err(sql_size_error());
+            }
+            let file =
+                std::fs::File::open(&path).map_err(|e| format!("read --sql-file failed: {e}"))?;
+            read_limited_sql(file, "read --sql-file")
         }
         (Some(_), Some(_)) => Err("--sql and --sql-file are mutually exclusive".to_string()),
         (None, None) => Err("one of --sql or --sql-file is required".to_string()),
     }
 }
 
+fn read_limited_sql<R: Read>(reader: R, context: &str) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut limited = reader.take(MAX_SQL_BYTES as u64 + 1);
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{context} failed: {e}"))?;
+    if buf.len() > MAX_SQL_BYTES {
+        return Err(sql_size_error());
+    }
+    String::from_utf8(buf).map_err(|e| format!("{context} failed: {e}"))
+}
+
+fn validate_sql_size(sql: String) -> Result<String, String> {
+    if sql.len() > MAX_SQL_BYTES {
+        return Err(sql_size_error());
+    }
+    Ok(sql)
+}
+
+fn sql_size_error() -> String {
+    format!("sql exceeds maximum size; maximum SQL size is {MAX_SQL_BYTES} bytes")
+}
+
 fn parse_output(v: &str) -> Result<OutputFormat, String> {
     cli_parse_output(v)
+}
+
+fn parse_permission_arg(v: &str) -> Result<Permission, String> {
+    v.parse()
 }
 
 fn parse_log_categories(entries: &[String]) -> Vec<String> {
@@ -625,60 +1167,98 @@ fn startup_requested_from_raw(raw: &[String]) -> bool {
     false
 }
 
-fn output_name(output: OutputFormat) -> &'static str {
-    match output {
-        OutputFormat::Json => "json",
-        OutputFormat::Yaml => "yaml",
-        OutputFormat::Plain => "plain",
+fn startup_env_snapshot() -> Value {
+    Value::Array(
+        STARTUP_ENV_KEYS
+            .iter()
+            .map(|key| {
+                json!({
+                    "key": key,
+                    "present": std::env::var_os(key).is_some(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn startup_args(
+    mode: &str,
+    sql: Option<&str>,
+    sql_file: Option<&str>,
+    param_count: usize,
+) -> Value {
+    json!({
+        "mode": mode,
+        "sql": startup_sql_summary(sql, sql_file),
+        "param_count": param_count,
+    })
+}
+
+fn startup_sql_summary(sql: Option<&str>, sql_file: Option<&str>) -> Value {
+    let Some(sql) = sql else {
+        return json!({
+            "present": false,
+            "source": "none",
+            "bytes": 0,
+            "chars": 0,
+            "operation": null,
+        });
+    };
+    json!({
+        "present": true,
+        "source": if sql_file.is_some() { "file" } else { "inline" },
+        "bytes": sql.len(),
+        "chars": sql.chars().count(),
+        "operation": sql_operation(sql),
+    })
+}
+
+fn sql_operation(sql: &str) -> Option<String> {
+    let sql = trim_leading_sql_comments(sql);
+    let token: String = sql
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '_')
+        .collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_ascii_lowercase())
     }
 }
 
-fn startup_env_snapshot() -> Value {
-    json!({
-        "AFPSQL_DSN_SECRET": std::env::var("AFPSQL_DSN_SECRET").ok(),
-        "AFPSQL_CONNINFO_SECRET": std::env::var("AFPSQL_CONNINFO_SECRET").ok(),
-        "AFPSQL_HOST": std::env::var("AFPSQL_HOST").ok(),
-        "AFPSQL_PORT": std::env::var("AFPSQL_PORT").ok(),
-        "AFPSQL_USER": std::env::var("AFPSQL_USER").ok(),
-        "AFPSQL_DBNAME": std::env::var("AFPSQL_DBNAME").ok(),
-        "AFPSQL_PASSWORD_SECRET": std::env::var("AFPSQL_PASSWORD_SECRET").ok(),
-        "PGHOST": std::env::var("PGHOST").ok(),
-        "PGPORT": std::env::var("PGPORT").ok(),
-        "PGUSER": std::env::var("PGUSER").ok(),
-        "PGDATABASE": std::env::var("PGDATABASE").ok(),
-    })
+fn trim_leading_sql_comments(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("--") {
+            sql = rest.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+            continue;
+        }
+        if let Some(rest) = sql.strip_prefix("/*") {
+            let Some((_, after)) = rest.split_once("*/") else {
+                return "";
+            };
+            sql = after;
+            continue;
+        }
+        return sql;
+    }
 }
 
 struct PsqlStartupArgs<'a> {
     mode: &'a str,
-    sql: Option<String>,
+    sql: Option<&'a str>,
     sql_file: Option<String>,
-    params_kv: &'a [String],
-    session: &'a SessionConfig,
-    output: OutputFormat,
-    log_entries: &'a [String],
-    dsn_secret_env: Option<&'a str>,
-    password_secret_env: Option<&'a str>,
+    param_count: usize,
 }
 
 fn psql_startup_args(args: PsqlStartupArgs<'_>) -> Value {
-    json!({
-        "mode": args.mode,
-        "sql": args.sql,
-        "sql_file": args.sql_file,
-        "param_count": args.params_kv.len(),
-        "dsn_secret": args.session.dsn_secret,
-        "dsn_secret_env": args.dsn_secret_env,
-        "conninfo_secret": args.session.conninfo_secret,
-        "host": args.session.host,
-        "port": args.session.port,
-        "user": args.session.user,
-        "dbname": args.session.dbname,
-        "password_secret": args.session.password_secret,
-        "password_secret_env": args.password_secret_env,
-        "output": output_name(args.output),
-        "log": parse_log_categories(args.log_entries),
-    })
+    startup_args(
+        args.mode,
+        args.sql,
+        args.sql_file.as_deref(),
+        args.param_count,
+    )
 }
 
 fn resolve_secret_value(
@@ -706,26 +1286,38 @@ fn resolve_secret_value(
 }
 
 pub fn parse_params(entries: &[String]) -> Result<Vec<Value>, String> {
+    if entries.len() > MAX_PARAMS {
+        return Err(format!("too many params; maximum params is {MAX_PARAMS}"));
+    }
+
     let mut by_index: BTreeMap<usize, Value> = BTreeMap::new();
     for entry in entries {
         let (idx, raw) = split_index_value(entry)?;
         if idx == 0 {
             return Err("param index must start at 1".to_string());
         }
-        by_index.insert(idx, parse_param_value(raw));
+        if idx > MAX_PARAMS {
+            return Err(format!(
+                "parameter index {idx} exceeds maximum params {MAX_PARAMS}"
+            ));
+        }
+        match by_index.entry(idx) {
+            Entry::Vacant(slot) => {
+                slot.insert(parse_param_value(raw));
+            }
+            Entry::Occupied(_) => return Err(format!("duplicate parameter index {idx}")),
+        }
     }
     if by_index.is_empty() {
         return Ok(vec![]);
     }
     let max = by_index.keys().max().copied().unwrap_or(0);
-    let mut out = Vec::with_capacity(max);
     for i in 1..=max {
-        let v = by_index
-            .remove(&i)
-            .ok_or_else(|| format!("missing parameter index {i}"))?;
-        out.push(v);
+        if !by_index.contains_key(&i) {
+            return Err(format!("missing parameter index {i}"));
+        }
     }
-    Ok(out)
+    Ok(by_index.into_values().collect())
 }
 
 fn split_index_value(entry: &str) -> Result<(usize, &str), String> {

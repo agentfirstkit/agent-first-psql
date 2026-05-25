@@ -55,14 +55,22 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          BIN_DIR="target/${{ matrix.target }}/release"
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            ARCHIVE="afpsql-${TAG}-${{ matrix.target }}.zip"
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          BIN_DIR="target/${TARGET}/release"
+          if [ "$ARCHIVE_KIND" = "zip" ]; then
+            ARCHIVE="afpsql-${TAG}-${TARGET}.zip"
             cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" afpsql.exe && cd -
           else
-            ARCHIVE="afpsql-${TAG}-${{ matrix.target }}.tar.gz"
+            ARCHIVE="afpsql-${TAG}-${TARGET}.tar.gz"
             tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql
           fi
           echo "TAG=$TAG" >> "$GITHUB_ENV"

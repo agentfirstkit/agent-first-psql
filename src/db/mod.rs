@@ -1,14 +1,14 @@
 mod errors;
 mod executor;
 mod params;
-mod pool;
 mod rows;
+mod session;
 
 pub use errors::ExecError;
 pub use executor::{
     DbExecutor, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
 };
-pub use pool::{cancel_query, new_cancel_slot, CancelSlot};
+pub use session::{cancel_query, new_cancel_slot, CancelSlot};
 
 #[cfg(test)]
 use crate::types::SessionConfig;

@@ -1,12 +1,14 @@
 use crate::config::sessions_to_invalidate;
+use crate::conn::resolve_session_name;
 use crate::emit::emit_output;
-use crate::handler::{self, App};
+use crate::handler::{self, App, QueryPhase, QueryState};
 use crate::limits::{
-    MAX_IN_FLIGHT, MAX_PARAMS, MAX_PIPE_LINE_BYTES, MAX_SQL_BYTES, OUTPUT_CHANNEL_CAPACITY,
+    MAX_ACTIVE_QUERIES, MAX_PARAMS, MAX_PIPE_LINE_BYTES, MAX_SQL_BYTES, OUTPUT_CHANNEL_CAPACITY,
 };
 use crate::logutil::build_startup_log;
 use crate::protocol::error_code;
 use crate::types::*;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,10 +34,8 @@ pub async fn run(init: crate::cli::PipeInit) {
     if !log.is_empty() {
         config.log = log.clone();
     }
-    let startup_config = config.clone();
-
-    if !log.is_empty() || startup_requested {
-        let event = build_startup_log(None, &startup_config, &startup_args, &startup_env);
+    if startup_requested {
+        let event = build_startup_log(None, &startup_args, &startup_env);
         emit_output(&event, output);
     }
 
@@ -43,6 +43,7 @@ pub async fn run(init: crate::cli::PipeInit) {
     tokio::spawn(crate::writer::writer_task(rx, output));
 
     let app = Arc::new(App::new(config, tx));
+    let runtime = Arc::new(PipeRuntime::new(app));
 
     let stdin = tokio::io::stdin();
     let reader = tokio::io::BufReader::new(stdin);
@@ -53,7 +54,7 @@ pub async fn run(init: crate::cli::PipeInit) {
             Ok(Some(Ok(line))) => line,
             Ok(Some(Err(()))) => {
                 send_protocol_error(
-                    &app,
+                    &runtime.app,
                     None,
                     error_code::INVALID_REQUEST,
                     "input line exceeds maximum size",
@@ -66,7 +67,7 @@ pub async fn run(init: crate::cli::PipeInit) {
             Ok(None) => break,
             Err(e) => {
                 send_protocol_error(
-                    &app,
+                    &runtime.app,
                     None,
                     error_code::INVALID_REQUEST,
                     &format!("read error: {e}"),
@@ -86,7 +87,7 @@ pub async fn run(init: crate::cli::PipeInit) {
             Ok(v) => v,
             Err(e) => {
                 send_protocol_error(
-                    &app,
+                    &runtime.app,
                     None,
                     error_code::INVALID_REQUEST,
                     &format!("parse error: {e}"),
@@ -98,19 +99,47 @@ pub async fn run(init: crate::cli::PipeInit) {
             }
         };
 
-        if dispatch_input(&app, input).await {
+        if dispatch_input(&runtime, input).await {
             break;
         }
-        app.in_flight.lock().await.retain(|_, h| !h.is_finished());
     }
 
-    wait_for_in_flight_shutdown(&app).await;
-    send_close_event(&app).await;
+    wait_for_workers_shutdown(&runtime).await;
+    send_close_event(&runtime.app).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
-async fn dispatch_input(app: &Arc<App>, input: Input) -> bool {
+struct PipeRuntime {
+    app: Arc<App>,
+    workers: tokio::sync::Mutex<HashMap<String, SessionWorker>>,
+}
+
+struct SessionWorker {
+    tx: mpsc::Sender<QueuedQuery>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct QueuedQuery {
+    id: String,
+    session: String,
+    sql: String,
+    params: Vec<serde_json::Value>,
+    options: QueryOptions,
+    cancel_slot: crate::db::CancelSlot,
+    state: Arc<QueryState>,
+}
+
+impl PipeRuntime {
+    fn new(app: Arc<App>) -> Self {
+        Self {
+            app,
+            workers: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
     match input {
         Input::Query {
             id,
@@ -118,26 +147,28 @@ async fn dispatch_input(app: &Arc<App>, input: Input) -> bool {
             sql,
             params,
             options,
-        } => dispatch_query(app, id, session, sql, params, options).await,
+        } => dispatch_query(runtime, id, session, sql, params, options).await,
         Input::Config(patch) => {
             let sessions = sessions_to_invalidate(&patch);
             let cfg_snapshot = {
-                let mut cfg = app.config.write().await;
+                let mut cfg = runtime.app.config.write().await;
                 cfg.apply_update(patch);
                 cfg.clone()
             };
-            app.executor.invalidate_sessions(&sessions).await;
-            let _ = app.writer.send(Output::Config(cfg_snapshot)).await;
+            runtime.app.executor.invalidate_sessions(&sessions).await;
+            let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
         }
-        Input::Cancel { id } => dispatch_cancel(app, id).await,
+        Input::Cancel { id } => dispatch_cancel(&runtime.app, id).await,
         Input::Ping => {
-            let _ = app
+            cleanup_finished_queries(&runtime.app).await;
+            let _ = runtime
+                .app
                 .writer
                 .send(Output::Pong {
                     trace: PongTrace {
-                        uptime_s: app.start_time.elapsed().as_secs(),
-                        requests_total: app.requests_total.load(Ordering::Relaxed),
-                        in_flight: app.in_flight.lock().await.len(),
+                        uptime_s: runtime.app.start_time.elapsed().as_secs(),
+                        requests_total: runtime.app.requests_total.load(Ordering::Relaxed),
+                        in_flight: runtime.app.in_flight.lock().await.len(),
                     },
                 })
                 .await;
@@ -148,31 +179,35 @@ async fn dispatch_input(app: &Arc<App>, input: Input) -> bool {
 }
 
 async fn dispatch_query(
-    app: &Arc<App>,
+    runtime: &Arc<PipeRuntime>,
     id: String,
     session: Option<String>,
     sql: String,
     params: Vec<serde_json::Value>,
     options: QueryOptions,
 ) {
+    let app = &runtime.app;
     if let Some(error) = validate_query_request(&id, &sql, &params) {
         let _ = app.writer.send(error).await;
         return;
     }
 
+    cleanup_finished_queries(app).await;
+
     let key = id.clone();
     let mut rejection: Option<Output> = None;
+    let cancel_slot = crate::db::new_cancel_slot();
+    let state = Arc::new(QueryState::queued());
     {
         let mut in_flight = app.in_flight.lock().await;
-        in_flight.retain(|_, h| !h.is_finished());
         if let Some(existing) = in_flight.get(&key) {
-            if existing.is_finished() {
-                in_flight.remove(&key);
+            if existing.state.is_finished() {
+                let _ = in_flight.remove(&key);
             } else {
                 rejection = Some(Output::Error {
                     id: Some(key.clone()),
                     error_code: error_code::INVALID_REQUEST.to_string(),
-                    error: "duplicate in-flight query id".to_string(),
+                    error: "duplicate active query id".to_string(),
                     hint: None,
                     retryable: false,
                     trace: Trace::only_duration(0),
@@ -180,39 +215,25 @@ async fn dispatch_query(
             }
         }
 
-        if rejection.is_none() && in_flight.len() >= MAX_IN_FLIGHT {
+        if rejection.is_none() && in_flight.len() >= MAX_ACTIVE_QUERIES {
             rejection = Some(Output::Error {
                 id: Some(key.clone()),
                 error_code: error_code::INVALID_REQUEST.to_string(),
-                error: "too many in-flight queries".to_string(),
-                hint: Some(format!("maximum in-flight queries is {MAX_IN_FLIGHT}")),
+                error: "too many queued or running queries".to_string(),
+                hint: Some(format!(
+                    "maximum queued or running queries is {MAX_ACTIVE_QUERIES}"
+                )),
                 retryable: true,
                 trace: Trace::only_duration(0),
             });
         }
 
         if rejection.is_none() {
-            let app2 = app.clone();
-            let cancel_slot = crate::db::new_cancel_slot();
-            let task_cancel_slot = cancel_slot.clone();
-            app.requests_total.fetch_add(1, Ordering::Relaxed);
-            let handle = tokio::spawn(async move {
-                handler::execute_query(
-                    &app2,
-                    Some(id),
-                    session,
-                    sql,
-                    params,
-                    options,
-                    Some(task_cancel_slot),
-                )
-                .await;
-            });
             in_flight.insert(
                 key.clone(),
                 handler::InFlightQuery {
-                    handle,
-                    cancel_slot,
+                    cancel_slot: cancel_slot.clone(),
+                    state: state.clone(),
                 },
             );
         }
@@ -220,12 +241,49 @@ async fn dispatch_query(
 
     if let Some(output) = rejection {
         let _ = app.writer.send(output).await;
+        return;
+    }
+
+    let resolved_session = {
+        let cfg = app.config.read().await;
+        resolve_session_name(&cfg, session.as_deref())
+    };
+    let tx = get_session_worker(runtime, &resolved_session).await;
+    app.requests_total.fetch_add(1, Ordering::Relaxed);
+    let queued = QueuedQuery {
+        id: key.clone(),
+        session: resolved_session,
+        sql,
+        params,
+        options,
+        cancel_slot,
+        state,
+    };
+    if tx.send(queued).await.is_err() {
+        let _ = app.in_flight.lock().await.remove(&key);
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id: Some(key),
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: "session worker is unavailable".to_string(),
+                hint: Some("retry the query; the session worker will be restarted".to_string()),
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
     }
 }
 
 async fn dispatch_cancel(app: &Arc<App>, id: String) {
-    if let Some(query) = app.in_flight.lock().await.remove(&id) {
-        if query.is_finished() {
+    let query = {
+        let in_flight = app.in_flight.lock().await;
+        in_flight.get(&id).cloned()
+    };
+
+    if let Some(query) = query {
+        if query.state.phase() == QueryPhase::Finished {
+            let _ = app.in_flight.lock().await.remove(&id);
             let _ = app
                 .writer
                 .send(Output::Error {
@@ -238,14 +296,15 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                 })
                 .await;
         } else {
+            query.state.set_phase(QueryPhase::Cancelled);
             let hint = match query.cancel_server_query().await {
                 Ok(true) => Some("server-side cancel requested".to_string()),
                 Ok(false) => {
-                    Some("query cancelled before database connection was ready".to_string())
+                    Some("query cancelled before execution reached the database".to_string())
                 }
                 Err(e) => Some(e),
             };
-            query.abort();
+            let _ = app.in_flight.lock().await.remove(&id);
             let _ = app
                 .writer
                 .send(Output::Error {
@@ -264,7 +323,7 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
             .send(Output::Error {
                 id: Some(id),
                 error_code: error_code::INVALID_REQUEST.to_string(),
-                error: "no in-flight query with this id".to_string(),
+                error: "no queued or running query with this id".to_string(),
                 hint: None,
                 retryable: false,
                 trace: Trace::only_duration(0),
@@ -273,13 +332,77 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
     }
 }
 
-async fn wait_for_in_flight_shutdown(app: &Arc<App>) {
-    let handles: Vec<tokio::task::JoinHandle<()>> = app
-        .in_flight
+async fn get_session_worker(
+    runtime: &Arc<PipeRuntime>,
+    session: &str,
+) -> mpsc::Sender<QueuedQuery> {
+    let mut workers = runtime.workers.lock().await;
+    if workers
+        .get(session)
+        .map(|worker| !worker.handle.is_finished())
+        .unwrap_or(false)
+    {
+        if let Some(worker) = workers.get(session) {
+            return worker.tx.clone();
+        }
+    }
+
+    workers.remove(session);
+    let (tx, rx) = mpsc::channel(MAX_ACTIVE_QUERIES);
+    let app = runtime.app.clone();
+    let handle = tokio::spawn(async move {
+        session_worker_loop(app, rx).await;
+    });
+    workers.insert(
+        session.to_string(),
+        SessionWorker {
+            tx: tx.clone(),
+            handle,
+        },
+    );
+    tx
+}
+
+async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<QueuedQuery>) {
+    while let Some(query) = rx.recv().await {
+        if query.cancel_slot.is_cancelled() || !query.state.try_start() {
+            query.state.set_phase(QueryPhase::Cancelled);
+            continue;
+        }
+
+        handler::execute_query(
+            &app,
+            Some(query.id),
+            Some(query.session),
+            query.sql,
+            query.params,
+            query.options,
+            Some(query.cancel_slot.clone()),
+        )
+        .await;
+
+        if query.cancel_slot.is_cancelled() || query.state.phase() == QueryPhase::Cancelled {
+            query.state.set_phase(QueryPhase::Cancelled);
+        } else {
+            query.state.set_phase(QueryPhase::Finished);
+        }
+    }
+}
+
+async fn cleanup_finished_queries(app: &Arc<App>) {
+    app.in_flight
+        .lock()
+        .await
+        .retain(|_, query| !query.state.is_finished());
+}
+
+async fn wait_for_workers_shutdown(runtime: &Arc<PipeRuntime>) {
+    let handles: Vec<tokio::task::JoinHandle<()>> = runtime
+        .workers
         .lock()
         .await
         .drain()
-        .map(|(_, q)| q.into_handle())
+        .map(|(_, worker)| worker.handle)
         .collect();
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     for handle in handles {
@@ -407,4 +530,10 @@ pub(crate) fn has_session_override(session: &SessionConfig) -> bool {
         || session.user.is_some()
         || session.dbname.is_some()
         || session.password_secret.is_some()
+        || session.ssh.is_some()
+        || !session.ssh_options.is_empty()
+        || session.ssh_local_host.is_some()
+        || session.ssh_local_port.is_some()
+        || session.ssh_remote_socket.is_some()
+        || session.ssh_sudo_user.is_some()
 }

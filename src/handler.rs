@@ -5,30 +5,79 @@ use crate::db::{
 use crate::protocol::{command_tag, error_code, log_event};
 use crate::types::*;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+const QUERY_QUEUED: u8 = 0;
+const QUERY_RUNNING: u8 = 1;
+const QUERY_FINISHED: u8 = 2;
+const QUERY_CANCELLED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryPhase {
+    Queued,
+    Running,
+    Finished,
+    Cancelled,
+}
+
+pub struct QueryState {
+    phase: AtomicU8,
+}
+
+impl QueryState {
+    pub fn queued() -> Self {
+        Self {
+            phase: AtomicU8::new(QUERY_QUEUED),
+        }
+    }
+
+    pub fn phase(&self) -> QueryPhase {
+        match self.phase.load(Ordering::SeqCst) {
+            QUERY_RUNNING => QueryPhase::Running,
+            QUERY_FINISHED => QueryPhase::Finished,
+            QUERY_CANCELLED => QueryPhase::Cancelled,
+            _ => QueryPhase::Queued,
+        }
+    }
+
+    pub fn set_phase(&self, phase: QueryPhase) {
+        let value = match phase {
+            QueryPhase::Queued => QUERY_QUEUED,
+            QueryPhase::Running => QUERY_RUNNING,
+            QueryPhase::Finished => QUERY_FINISHED,
+            QueryPhase::Cancelled => QUERY_CANCELLED,
+        };
+        self.phase.store(value, Ordering::SeqCst);
+    }
+
+    pub fn try_start(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                QUERY_QUEUED,
+                QUERY_RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self.phase(), QueryPhase::Finished | QueryPhase::Cancelled)
+    }
+}
+
+#[derive(Clone)]
 pub struct InFlightQuery {
-    pub handle: tokio::task::JoinHandle<()>,
     pub cancel_slot: crate::db::CancelSlot,
+    pub state: Arc<QueryState>,
 }
 
 impl InFlightQuery {
-    pub fn is_finished(&self) -> bool {
-        self.handle.is_finished()
-    }
-
-    pub fn abort(&self) {
-        self.handle.abort();
-    }
-
     pub async fn cancel_server_query(&self) -> Result<bool, String> {
         crate::db::cancel_query(&self.cancel_slot).await
-    }
-
-    pub fn into_handle(self) -> tokio::task::JoinHandle<()> {
-        self.handle
     }
 }
 
@@ -66,7 +115,6 @@ pub async fn execute_query(
     let start = Instant::now();
     let cfg = app.config.read().await.clone();
     let resolved_session = resolve_session_name(&cfg, session.as_deref());
-    let resolved_opts = cfg.resolve_options(&options);
 
     let Some(session_cfg) = cfg.sessions.get(&resolved_session).cloned() else {
         let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
@@ -96,6 +144,38 @@ pub async fn execute_query(
         return;
     };
 
+    let resolved_opts = match cfg.resolve_options_for_session(&options, &session_cfg) {
+        Ok(opts) => opts,
+        Err(message) => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let hint = permission_error_hint(&options, &session_cfg);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error: message,
+                    hint: Some(hint),
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(&resolved_session),
+                Some(error_code::INVALID_REQUEST),
+                None,
+                &trace,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let cancel_slot_for_suppression = cancel_slot.clone();
+
     if resolved_opts.stream_rows {
         let mut sink = OutputRowSink::new(
             app.clone(),
@@ -118,6 +198,9 @@ pub async fn execute_query(
                 &mut sink,
             )
             .await;
+        if cancel_requested(&cancel_slot_for_suppression) {
+            return;
+        }
         handle_streaming_result(app, id, resolved_session, result, sink, start).await;
         return;
     }
@@ -130,9 +213,13 @@ pub async fn execute_query(
             sql: &sql,
             params: &params,
             opts: &resolved_opts,
-            cancel_slot,
+            cancel_slot: cancel_slot.clone(),
         })
         .await;
+
+    if cancel_requested(&cancel_slot) {
+        return;
+    }
 
     match result {
         Ok(ExecOutcome::Rows { columns, rows }) => {
@@ -178,6 +265,35 @@ pub async fn execute_query(
         }
         Err(err) => emit_exec_error(app, id, &resolved_session, err, start).await,
     }
+}
+
+fn permission_error_hint(options: &QueryOptions, session: &SessionConfig) -> String {
+    let uses_ssh = session.uses_ssh_transport();
+    match (uses_ssh, options.permission) {
+        (true, Some(permission)) if !permission.allows_ssh() => {
+            format!(
+                "this session uses afpsql SSH transport, so permission `{}` is invalid; use `ssh-read` for reads or `ssh-write` for writes",
+                permission.as_str()
+            )
+        }
+        (false, Some(permission)) if permission.allows_ssh() => {
+            format!(
+                "this session does not use afpsql SSH transport, so permission `{}` is invalid; use `read` for reads or `write` for writes",
+                permission.as_str()
+            )
+        }
+        _ => {
+            "use permission read/write for direct connections and ssh-read/ssh-write for afpsql SSH transport"
+                .to_string()
+        }
+    }
+}
+
+fn cancel_requested(cancel_slot: &Option<crate::db::CancelSlot>) -> bool {
+    cancel_slot
+        .as_ref()
+        .map(|slot| slot.is_cancelled())
+        .unwrap_or(false)
 }
 
 async fn handle_streaming_result(
@@ -273,6 +389,30 @@ async fn emit_exec_error(
     start: Instant,
 ) {
     match err {
+        ExecError::Cancelled => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::CANCELLED.to_string(),
+                    error: "query cancelled".to_string(),
+                    hint: None,
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(resolved_session),
+                Some(error_code::CANCELLED),
+                None,
+                &trace,
+            )
+            .await;
+        }
         ExecError::Connect(message) => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
@@ -281,9 +421,7 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::CONNECT_FAILED.to_string(),
                     error: message,
-                    hint: Some(
-                        "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
-                    ),
+                    hint: Some("check --host/--port or PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()),
                     retryable: true,
                     trace: trace.clone(),
                 })
@@ -294,6 +432,30 @@ async fn emit_exec_error(
                 id.as_deref(),
                 Some(resolved_session),
                 Some(error_code::CONNECT_FAILED),
+                None,
+                &trace,
+            )
+            .await;
+        }
+        ExecError::Config { message, hint } => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error: message,
+                    hint,
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(resolved_session),
+                Some(error_code::INVALID_REQUEST),
                 None,
                 &trace,
             )
@@ -318,6 +480,37 @@ async fn emit_exec_error(
                 id.as_deref(),
                 Some(resolved_session),
                 Some(error_code::INVALID_PARAMS),
+                None,
+                &trace,
+            )
+            .await;
+        }
+        ExecError::ResultTooLarge {
+            row_count,
+            payload_bytes,
+        } => {
+            let trace = Trace {
+                duration_ms: start.elapsed().as_millis() as u64,
+                row_count: Some(row_count),
+                payload_bytes: Some(payload_bytes),
+            };
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::RESULT_TOO_LARGE.to_string(),
+                    error: "result exceeds inline limits".to_string(),
+                    hint: Some(result_too_large_hint()),
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(resolved_session),
+                Some(error_code::RESULT_TOO_LARGE),
                 None,
                 &trace,
             )
@@ -553,10 +746,7 @@ async fn emit_rows_result(
                 id,
                 error_code: error_code::RESULT_TOO_LARGE.to_string(),
                 error: "result exceeds inline limits".to_string(),
-                hint: Some(
-                    "retry with stream_rows=true, or increase --inline-max-rows/--inline-max-bytes"
-                        .to_string(),
-                ),
+                hint: Some(result_too_large_hint()),
                 retryable: false,
                 trace: trace.clone(),
             })
@@ -584,6 +774,10 @@ async fn emit_rows_result(
         .await;
 
     RowEmitStatus::Sent { trace }
+}
+
+fn result_too_large_hint() -> String {
+    "retry with stream_rows=true, or increase --inline-max-rows/--inline-max-bytes".to_string()
 }
 
 async fn emit_log(

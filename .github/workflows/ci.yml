@@ -22,13 +22,15 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U test -d test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
 
     env:
-      DATABASE_URL: postgres://test:test@localhost:5432/test
+      AFPSQL_TEST_DSN_SECRET: postgresql://test:test@localhost:5432/test?sslmode=disable
+      DATABASE_URL: postgresql://test:test@localhost:5432/test?sslmode=disable
+      PGSSLMODE: disable
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -50,6 +52,9 @@ jobs:
 
       - name: Unit
         run: cargo test --bin afpsql
+
+      - name: PostgreSQL smoke
+        run: cargo run -- --dsn-secret "$AFPSQL_TEST_DSN_SECRET" --sql "select 1 as n"
 
       - name: Integration
         run: |

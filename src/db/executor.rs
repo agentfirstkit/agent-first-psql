@@ -1,11 +1,12 @@
 use super::errors::{map_pg_error, ExecError};
 use super::params::{build_param_refs, build_params, validate_param_count, QueryParam};
-use super::pool::{get_pool, new_pool_map, CancelSlot, PoolMap};
 use super::rows::{row_json_size, row_to_json_fallback};
+use super::session::{connect_session, get_session, new_session_map, CancelSlot, SessionMap};
 use crate::types::{ColumnInfo, ResolvedOptions, SessionConfig};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::pin::pin;
 use tokio_postgres::types::ToSql;
 
@@ -79,13 +80,13 @@ pub trait DbExecutor: Send + Sync {
 }
 
 pub struct PostgresExecutor {
-    pools: PoolMap,
+    sessions: SessionMap,
 }
 
 impl PostgresExecutor {
     pub fn new() -> Self {
         Self {
-            pools: new_pool_map(),
+            sessions: new_session_map(),
         }
     }
 }
@@ -93,53 +94,27 @@ impl PostgresExecutor {
 #[async_trait]
 impl DbExecutor for PostgresExecutor {
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
-        let pool = get_pool(&self.pools, req.session_name, req.session_cfg).await?;
-        let mut client = pool
-            .get()
-            .await
-            .map_err(|e| ExecError::Connect(format!("get connection failed: {e}")))?;
-        install_cancel_token(&req.cancel_slot, client.cancel_token()).await;
-
-        let mut tx = client.transaction().await.map_err(map_pg_error)?;
-        apply_query_settings(&mut tx, req.opts).await?;
-        let prepared = prepare_bound_statement(&mut tx, req.sql, req.params).await?;
-        let bind_refs = build_param_refs(&prepared.query_params);
-
-        if !prepared.columns.is_empty() {
-            let rows = query_rows_wrapped_or_direct(
-                &mut tx,
-                req.sql,
-                req.params,
-                &prepared.stmt,
-                &bind_refs,
-            )
-            .await?;
-
-            tx.commit().await.map_err(map_pg_error)?;
-
-            let json_rows = rows
-                .into_iter()
-                .map(|row| {
-                    if let Ok(value) = row.try_get::<_, Value>("row_json") {
-                        return value;
-                    }
-                    row_to_json_fallback(&row)
-                })
-                .collect();
-
-            return Ok(ExecOutcome::Rows {
-                columns: prepared.columns,
-                rows: json_rows,
-            });
+        let session = get_session(&self.sessions, req.session_name).await;
+        let mut client_guard = session.client.lock().await;
+        ensure_connected(&mut client_guard, req.session_cfg).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect("connection unavailable".to_string()));
+        };
+        install_cancel_context(
+            &req.cancel_slot,
+            client.client.cancel_token(),
+            client.backend_pid,
+            req.session_cfg,
+        )
+        .await;
+        if cancel_requested(&req.cancel_slot) {
+            return Err(ExecError::Cancelled);
         }
-
-        let affected = tx
-            .execute(&prepared.stmt, &bind_refs)
-            .await
-            .map_err(map_pg_error)? as usize;
-        tx.commit().await.map_err(map_pg_error)?;
-
-        Ok(ExecOutcome::Command { affected })
+        let result = execute_with_client(&mut client.client, &req).await;
+        if should_drop_connection(&result) {
+            *client_guard = None;
+        }
+        result
     }
 
     async fn execute_streaming(
@@ -147,59 +122,195 @@ impl DbExecutor for PostgresExecutor {
         req: ExecRequest<'_>,
         sink: &mut (dyn RowSink + Send),
     ) -> Result<StreamOutcome, ExecError> {
-        let pool = get_pool(&self.pools, req.session_name, req.session_cfg).await?;
-        let mut client = pool
-            .get()
-            .await
-            .map_err(|e| ExecError::Connect(format!("get connection failed: {e}")))?;
-        install_cancel_token(&req.cancel_slot, client.cancel_token()).await;
-
-        let mut tx = client.transaction().await.map_err(map_pg_error)?;
-        apply_query_settings(&mut tx, req.opts).await?;
-        let prepared = prepare_bound_statement(&mut tx, req.sql, req.params).await?;
-        let bind_refs = build_param_refs(&prepared.query_params);
-
-        if prepared.columns.is_empty() {
-            let affected = tx
-                .execute(&prepared.stmt, &bind_refs)
-                .await
-                .map_err(map_pg_error)? as usize;
-            tx.commit().await.map_err(map_pg_error)?;
-            return Ok(StreamOutcome::Command { affected });
-        }
-
-        let stats = stream_rows_wrapped_or_direct(
-            &mut tx,
-            req.sql,
-            req.params,
-            &prepared.stmt,
-            bind_refs,
-            prepared.columns,
-            sink,
+        let session = get_session(&self.sessions, req.session_name).await;
+        let mut client_guard = session.client.lock().await;
+        ensure_connected(&mut client_guard, req.session_cfg).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect("connection unavailable".to_string()));
+        };
+        install_cancel_context(
+            &req.cancel_slot,
+            client.client.cancel_token(),
+            client.backend_pid,
+            req.session_cfg,
         )
-        .await?;
-
-        tx.commit().await.map_err(map_pg_error)?;
-        Ok(StreamOutcome::Rows {
-            row_count: stats.row_count,
-            payload_bytes: stats.payload_bytes,
-        })
+        .await;
+        if cancel_requested(&req.cancel_slot) {
+            return Err(ExecError::Cancelled);
+        }
+        let result = execute_streaming_with_client(&mut client.client, &req, sink).await;
+        if should_drop_connection(&result) {
+            *client_guard = None;
+        }
+        result
     }
 
     async fn invalidate_sessions(&self, session_names: &[String]) {
         if session_names.is_empty() {
             return;
         }
-        let mut pools = self.pools.write().await;
+        let mut sessions = self.sessions.write().await;
         for name in session_names {
-            pools.remove(name);
+            sessions.remove(name);
         }
     }
 }
 
-async fn install_cancel_token(slot: &Option<CancelSlot>, token: tokio_postgres::CancelToken) {
+async fn ensure_connected(
+    client: &mut Option<super::session::SessionClient>,
+    session_cfg: &SessionConfig,
+) -> Result<(), ExecError> {
+    if client.as_ref().map(|c| c.is_closed()).unwrap_or(false) {
+        *client = None;
+    }
+    if client.is_none() {
+        *client = Some(connect_session(session_cfg).await?);
+    }
+    Ok(())
+}
+
+fn should_drop_connection<T>(result: &Result<T, ExecError>) -> bool {
+    matches!(
+        result,
+        Err(ExecError::Connect(_)) | Err(ExecError::Internal(_))
+    )
+}
+
+fn cancel_requested(cancel_slot: &Option<CancelSlot>) -> bool {
+    cancel_slot
+        .as_ref()
+        .map(|slot| slot.is_cancelled())
+        .unwrap_or(false)
+}
+
+async fn execute_with_client(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+) -> Result<ExecOutcome, ExecError> {
+    let mut tx = start_transaction(client, req.opts.read_only).await?;
+    let result = execute_in_transaction(&mut tx, req).await;
+    finish_transaction(tx, result).await
+}
+
+async fn execute_in_transaction(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    req: &ExecRequest<'_>,
+) -> Result<ExecOutcome, ExecError> {
+    apply_query_settings(tx, req.opts).await?;
+    let prepared = prepare_bound_statement(tx, req.sql, req.params).await?;
+    let bind_refs = build_param_refs(&prepared.query_params);
+
+    if !prepared.columns.is_empty() {
+        let mut collector = InlineRowCollector::new(
+            prepared.columns,
+            req.opts.inline_max_rows,
+            req.opts.inline_max_bytes,
+        );
+        collect_rows_wrapped_or_direct(
+            tx,
+            req.sql,
+            req.params,
+            &prepared.stmt,
+            bind_refs,
+            &mut collector,
+            req.opts.batch_rows,
+        )
+        .await?;
+
+        return Ok(ExecOutcome::Rows {
+            columns: collector.columns,
+            rows: collector.rows,
+        });
+    }
+
+    let affected = tx
+        .execute(&prepared.stmt, &bind_refs)
+        .await
+        .map_err(map_pg_error)? as usize;
+
+    Ok(ExecOutcome::Command { affected })
+}
+
+async fn execute_streaming_with_client(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+    sink: &mut (dyn RowSink + Send),
+) -> Result<StreamOutcome, ExecError> {
+    let mut tx = start_transaction(client, req.opts.read_only).await?;
+    let result = execute_streaming_in_transaction(&mut tx, req, sink).await;
+    finish_transaction(tx, result).await
+}
+
+async fn execute_streaming_in_transaction(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    req: &ExecRequest<'_>,
+    sink: &mut (dyn RowSink + Send),
+) -> Result<StreamOutcome, ExecError> {
+    apply_query_settings(tx, req.opts).await?;
+    let prepared = prepare_bound_statement(tx, req.sql, req.params).await?;
+    let bind_refs = build_param_refs(&prepared.query_params);
+
+    if prepared.columns.is_empty() {
+        let affected = tx
+            .execute(&prepared.stmt, &bind_refs)
+            .await
+            .map_err(map_pg_error)? as usize;
+        return Ok(StreamOutcome::Command { affected });
+    }
+
+    let stats = stream_rows_wrapped_or_direct(
+        tx,
+        req.sql,
+        req.params,
+        &prepared.stmt,
+        bind_refs,
+        prepared.columns,
+        sink,
+    )
+    .await?;
+
+    Ok(StreamOutcome::Rows {
+        row_count: stats.row_count,
+        payload_bytes: stats.payload_bytes,
+    })
+}
+
+async fn finish_transaction<T>(
+    tx: tokio_postgres::Transaction<'_>,
+    result: Result<T, ExecError>,
+) -> Result<T, ExecError> {
+    match result {
+        Ok(outcome) => {
+            tx.commit().await.map_err(map_pg_error)?;
+            Ok(outcome)
+        }
+        Err(err) => {
+            tx.rollback().await.map_err(map_pg_error)?;
+            Err(err)
+        }
+    }
+}
+
+async fn start_transaction(
+    client: &mut tokio_postgres::Client,
+    read_only: bool,
+) -> Result<tokio_postgres::Transaction<'_>, ExecError> {
+    client
+        .build_transaction()
+        .read_only(read_only)
+        .start()
+        .await
+        .map_err(map_pg_error)
+}
+
+async fn install_cancel_context(
+    slot: &Option<CancelSlot>,
+    token: tokio_postgres::CancelToken,
+    backend_pid: i32,
+    session_cfg: &SessionConfig,
+) {
     if let Some(slot) = slot {
-        *slot.lock().await = Some(token);
+        slot.set_context(token, backend_pid, session_cfg).await;
     }
 }
 
@@ -216,6 +327,7 @@ async fn prepare_bound_statement(
 ) -> Result<PreparedStatement, ExecError> {
     let stmt = tx.prepare(sql).await.map_err(map_pg_error)?;
     let columns = statement_columns(&stmt);
+    validate_unique_column_names(&columns)?;
     validate_param_count(stmt.params().len(), params.len())?;
     let query_params = build_params(params, stmt.params())?;
     Ok(PreparedStatement {
@@ -235,47 +347,257 @@ fn statement_columns(stmt: &tokio_postgres::Statement) -> Vec<ColumnInfo> {
         .collect()
 }
 
-async fn query_rows_wrapped_or_direct(
+fn validate_unique_column_names(columns: &[ColumnInfo]) -> Result<(), ExecError> {
+    let mut seen = HashSet::new();
+    let mut duplicate_seen = HashSet::new();
+    let mut duplicates = Vec::new();
+
+    for column in columns {
+        let name = column.name.as_str();
+        if !seen.insert(name) && duplicate_seen.insert(name) {
+            duplicates.push(column.name.clone());
+        }
+    }
+
+    if duplicates.is_empty() {
+        return Ok(());
+    }
+
+    Err(ExecError::InvalidParams(format!(
+        "query result has duplicate column name(s): {}. JSON object rows cannot safely represent duplicate keys; use AS aliases such as `a.id AS a_id` and `b.id AS b_id` to make output column names unique",
+        format_column_names(&duplicates)
+    )))
+}
+
+fn format_column_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_name: "int4".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_unique_column_names_accepts_aliases() {
+        let columns = vec![column("a_id"), column("b_id")];
+        assert!(validate_unique_column_names(&columns).is_ok());
+    }
+
+    #[test]
+    fn validate_unique_column_names_rejects_duplicates_once() {
+        let columns = vec![
+            column("id"),
+            column("name"),
+            column("id"),
+            column("name"),
+            column("id"),
+        ];
+
+        assert!(matches!(
+            validate_unique_column_names(&columns),
+            Err(ExecError::InvalidParams(message))
+                if message.contains("`id`, `name`")
+                    && message.contains("JSON object rows")
+                    && message.contains("AS aliases")
+        ));
+    }
+}
+
+const INLINE_PORTAL_BATCH_ROWS: usize = 1024;
+
+struct InlineRowCollector {
+    columns: Vec<ColumnInfo>,
+    rows: Vec<Value>,
+    row_count: usize,
+    payload_bytes: usize,
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct InlineRowCollectorMark {
+    rows_len: usize,
+    row_count: usize,
+    payload_bytes: usize,
+}
+
+impl InlineRowCollector {
+    fn new(columns: Vec<ColumnInfo>, max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            columns,
+            rows: vec![],
+            row_count: 0,
+            payload_bytes: 0,
+            max_rows,
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, row: Value, row_bytes: usize) -> Result<(), ExecError> {
+        let next_row_count = self.row_count.saturating_add(1);
+        let next_payload_bytes = self.payload_bytes.saturating_add(row_bytes);
+        if next_row_count > self.max_rows || next_payload_bytes > self.max_bytes {
+            return Err(ExecError::ResultTooLarge {
+                row_count: next_row_count,
+                payload_bytes: next_payload_bytes,
+            });
+        }
+
+        self.row_count = next_row_count;
+        self.payload_bytes = next_payload_bytes;
+        self.rows.push(row);
+        Ok(())
+    }
+
+    fn mark(&self) -> InlineRowCollectorMark {
+        InlineRowCollectorMark {
+            rows_len: self.rows.len(),
+            row_count: self.row_count,
+            payload_bytes: self.payload_bytes,
+        }
+    }
+
+    fn reset(&mut self, mark: InlineRowCollectorMark) {
+        self.rows.truncate(mark.rows_len);
+        self.row_count = mark.row_count;
+        self.payload_bytes = mark.payload_bytes;
+    }
+}
+
+async fn collect_rows_wrapped_or_direct(
     tx: &mut tokio_postgres::Transaction<'_>,
     sql: &str,
     params: &[Value],
     stmt: &tokio_postgres::Statement,
-    bind_refs: &[&(dyn ToSql + Sync)],
-) -> Result<Vec<tokio_postgres::Row>, ExecError> {
+    bind_refs: Vec<&(dyn ToSql + Sync)>,
+    collector: &mut InlineRowCollector,
+    batch_rows: usize,
+) -> Result<(), ExecError> {
     let wrapped = wrapped_rows_sql(sql);
     tx.execute("savepoint afpsql_wrap", &[])
         .await
         .map_err(map_pg_error)?;
 
-    let wrapped_attempt = query_wrapped_rows(tx, &wrapped, params).await;
+    let batch_rows = batch_rows.clamp(1, INLINE_PORTAL_BATCH_ROWS);
+    let wrapped_mark = collector.mark();
+    let wrapped_attempt = collect_wrapped_rows(tx, &wrapped, params, collector, batch_rows).await;
     match wrapped_attempt {
-        Ok(rows) => {
+        Ok(()) => {
             release_wrap_savepoint(tx).await?;
-            Ok(rows)
+            Ok(())
         }
         Err(ExecError::InvalidParams(message)) => {
+            collector.reset(wrapped_mark);
             rollback_wrap_savepoint(tx).await?;
             Err(ExecError::InvalidParams(message))
         }
-        Err(_) => {
+        Err(ExecError::ResultTooLarge {
+            row_count,
+            payload_bytes,
+        }) => {
+            collector.reset(wrapped_mark);
             rollback_wrap_savepoint(tx).await?;
-            tx.query(stmt, bind_refs).await.map_err(map_pg_error)
+            Err(ExecError::ResultTooLarge {
+                row_count,
+                payload_bytes,
+            })
+        }
+        Err(_) => {
+            collector.reset(wrapped_mark);
+            rollback_wrap_savepoint(tx).await?;
+            let portal = tx.bind(stmt, &bind_refs).await.map_err(map_pg_error)?;
+            collect_portal_rows(tx, &portal, collector, false, batch_rows).await
         }
     }
 }
 
-async fn query_wrapped_rows(
+async fn bind_wrapped_rows(
     tx: &mut tokio_postgres::Transaction<'_>,
     wrapped_sql: &str,
     params: &[Value],
-) -> Result<Vec<tokio_postgres::Row>, ExecError> {
+) -> Result<tokio_postgres::Portal, ExecError> {
     let wrapped_stmt = tx.prepare(wrapped_sql).await.map_err(map_pg_error)?;
     validate_param_count(wrapped_stmt.params().len(), params.len())?;
     let wrapped_params = build_params(params, wrapped_stmt.params())?;
     let wrapped_refs = build_param_refs(&wrapped_params);
-    tx.query(&wrapped_stmt, &wrapped_refs)
+    tx.bind(&wrapped_stmt, &wrapped_refs)
         .await
         .map_err(map_pg_error)
+}
+
+async fn collect_wrapped_rows(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    wrapped_sql: &str,
+    params: &[Value],
+    collector: &mut InlineRowCollector,
+    batch_rows: usize,
+) -> Result<(), ExecError> {
+    let portal = bind_wrapped_rows(tx, wrapped_sql, params).await?;
+    collect_portal_rows(tx, &portal, collector, true, batch_rows).await
+}
+
+async fn collect_portal_rows(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    portal: &tokio_postgres::Portal,
+    collector: &mut InlineRowCollector,
+    wrapped_json: bool,
+    batch_rows: usize,
+) -> Result<(), ExecError> {
+    loop {
+        let fetch_rows = inline_fetch_rows(collector, batch_rows);
+        if drain_portal_batch(tx, portal, collector, wrapped_json, fetch_rows).await? {
+            return Ok(());
+        }
+    }
+}
+
+fn inline_fetch_rows(collector: &InlineRowCollector, batch_rows: usize) -> i32 {
+    let remaining = collector.max_rows.saturating_sub(collector.row_count);
+    let fetch_rows = remaining.saturating_add(1).min(batch_rows).max(1);
+    fetch_rows.min(i32::MAX as usize) as i32
+}
+
+async fn drain_portal_batch(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    portal: &tokio_postgres::Portal,
+    collector: &mut InlineRowCollector,
+    wrapped_json: bool,
+    fetch_rows: i32,
+) -> Result<bool, ExecError> {
+    let stream = tx
+        .query_portal_raw(portal, fetch_rows)
+        .await
+        .map_err(map_pg_error)?;
+    let mut rows = pin!(stream);
+    let mut limit_error = None;
+
+    while let Some(row) = rows.try_next().await.map_err(map_pg_error)? {
+        if limit_error.is_some() {
+            continue;
+        }
+        let value = row_to_json_value(&row, wrapped_json);
+        let row_bytes = row_json_size(&value);
+        if let Err(err) = collector.push(value, row_bytes) {
+            limit_error = Some(err);
+        }
+    }
+
+    let portal_exhausted = rows.rows_affected().is_some();
+    if let Some(err) = limit_error {
+        return Err(err);
+    }
+    Ok(portal_exhausted)
 }
 
 struct StreamStats {
@@ -300,9 +622,10 @@ async fn stream_rows_wrapped_or_direct(
     let wrapped_setup = stream_wrapped_rows(tx, &wrapped, params).await;
     match wrapped_setup {
         Ok(stream) => {
-            release_wrap_savepoint(tx).await?;
             sink.start(columns).await?;
-            drain_row_stream(stream, sink, true).await
+            let stats = drain_row_stream(stream, sink, true).await?;
+            release_wrap_savepoint(tx).await?;
+            Ok(stats)
         }
         Err(ExecError::InvalidParams(message)) => {
             rollback_wrap_savepoint(tx).await?;
@@ -340,12 +663,7 @@ async fn drain_row_stream(
     let mut row_count = 0usize;
     let mut payload_bytes = 0usize;
     while let Some(row) = rows.try_next().await.map_err(map_pg_error)? {
-        let value = if wrapped_json {
-            row.try_get::<_, Value>("row_json")
-                .unwrap_or_else(|_| row_to_json_fallback(&row))
-        } else {
-            row_to_json_fallback(&row)
-        };
+        let value = row_to_json_value(&row, wrapped_json);
         let row_bytes = row_json_size(&value);
         payload_bytes += row_bytes;
         row_count += 1;
@@ -355,6 +673,15 @@ async fn drain_row_stream(
         row_count,
         payload_bytes,
     })
+}
+
+fn row_to_json_value(row: &tokio_postgres::Row, wrapped_json: bool) -> Value {
+    if wrapped_json {
+        row.try_get::<_, Value>("row_json")
+            .unwrap_or_else(|_| row_to_json_fallback(row))
+    } else {
+        row_to_json_fallback(row)
+    }
 }
 
 fn wrapped_rows_sql(sql: &str) -> String {
@@ -398,10 +725,5 @@ async fn apply_query_settings(
     .await
     .map_err(map_pg_error)?;
 
-    if opts.read_only {
-        tx.execute("set local transaction read only", &[])
-            .await
-            .map_err(map_pg_error)?;
-    }
     Ok(())
 }

@@ -22,6 +22,7 @@ mod output_fmt;
 mod pipe;
 mod protocol;
 mod psql_admin;
+mod ssh_transport;
 mod types;
 mod writer;
 
@@ -42,6 +43,14 @@ async fn main() {
         Mode::Cli(req) => cli_runner::run(req).await,
         Mode::Pipe(init) => pipe::run(init).await,
         Mode::PsqlAdmin(req) => std::process::exit(psql_admin::run(req)),
+        Mode::PsqlUnsupported(req) => {
+            emit::emit_cli_error(
+                &format!("unsupported psql mode: {}", req.reason),
+                Some("run the original psql binary directly, for example /path/to/postgresql/bin/psql, or put that PostgreSQL bin directory before the afpsql wrapper in PATH"),
+                OutputFormat::Json,
+            );
+            std::process::exit(2);
+        }
     }
 }
 

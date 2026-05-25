@@ -1,7 +1,16 @@
 #[derive(Debug)]
 pub enum ExecError {
+    Cancelled,
     Connect(String),
+    Config {
+        message: String,
+        hint: Option<String>,
+    },
     InvalidParams(String),
+    ResultTooLarge {
+        row_count: usize,
+        payload_bytes: usize,
+    },
     Sql {
         sqlstate: String,
         message: String,
@@ -28,4 +37,13 @@ pub(super) fn map_pg_error(err: tokio_postgres::Error) -> ExecError {
         };
     }
     ExecError::Internal(err.to_string())
+}
+
+impl From<crate::conn::ConnectionConfigError> for ExecError {
+    fn from(err: crate::conn::ConnectionConfigError) -> Self {
+        ExecError::Config {
+            message: err.message().to_string(),
+            hint: err.hint().map(std::string::ToString::to_string),
+        }
+    }
 }

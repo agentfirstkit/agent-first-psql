@@ -2,10 +2,10 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
-  "synopsis": "A PostgreSQL tool for AI agents — SQL in, typed rows out, on a connection that stays open.",
+  "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and safe by default.",
   "intent": [
     "Give AI agents a persistent PostgreSQL client that reuses long-lived database connections and sessions, so agents send SQL requests as JSONL and receive structured JSONL responses without managing connection setup",
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
@@ -13,19 +13,23 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Migrate to the agentfirstkit identity",
-    "Rewrite README around agent ergonomics, with the full guide in docs/overview.md",
-    "Add TLS support for PostgreSQL connections",
-    "Stream rows without buffering so large result sets no longer balloon memory",
-    "Support server-side cancellation of running queries",
-    "Install a psql wrapper alongside afpsql",
-    "Harden config building (no string interpolation) and drop argv from startup logs",
-    "Bump agent-first-data dependency to 0.8"
+    "Add SSH transport (--ssh) so afpsql can run locally against PostgreSQL listening only on a remote loopback.",
+    "Make write permission explicit with --permission read|write|ssh-read|ssh-write; reads are the default.",
+    "Require explicit sudo bridge socket path for sudo-based SSH auth.",
+    "Harden pipe mode: stricter config validation, SSH tunnel checks, savepoint stream draining, duplicate-column rejection.",
+    "Pin named pipe sessions to stable PostgreSQL backend sessions with FIFO execution for predictable session state.",
+    "Tighten CLI input limits, result limits, and startup logging so argv and secrets no longer leak.",
+    "Adopt afdata's redaction options for consistent secret scrubbing across the toolkit.",
+    "Render psql result rows raw to preserve structured values.",
+    "Add --mode psql covering common non-interactive psql flags so existing scripts can swap in afpsql.",
+    "Add the afpsql Agent Skill so coding agents pick up read-by-default and SQLSTATE-based error handling.",
+    "Document the psql wrapper workflow (afpsql psql install/status) and reframe README around the reliability contract.",
+    "Harden release packaging to drop local path deps and stale workspace metadata."
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.DRSaYD5qjBZoBHEukpEoRzDoBk3aangKVgYo8hBrftqZ",
+      "uri": "cmn://agentfirstkit.com/b3.DLwVyPLJRtv7KwfXD25E7zkpveZVykRgo2RQJkHp9zZZ",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

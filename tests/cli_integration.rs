@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "support/env.rs"]
+mod test_env;
+
 fn test_dsn() -> String {
-    std::env::var("AFPSQL_TEST_DSN_SECRET")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set AFPSQL_TEST_DSN_SECRET or DATABASE_URL for PostgreSQL integration tests")
+    test_env::required_test_dsn()
 }
 
 fn bin() -> PathBuf {
@@ -220,7 +221,7 @@ fn psql_mode_positional_dsn_before_sql_flag() {
 }
 
 #[test]
-fn pipe_rejects_duplicate_inflight_query_id() {
+fn pipe_rejects_duplicate_active_query_id() {
     let payload = serde_json::json!({
         "code": "query",
         "id": "dup1",
@@ -260,5 +261,5 @@ fn pipe_rejects_duplicate_inflight_query_id() {
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"error_code\":\"invalid_request\""));
-    assert!(text.contains("duplicate in-flight query id"));
+    assert!(text.contains("duplicate active query id"));
 }

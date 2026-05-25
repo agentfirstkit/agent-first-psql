@@ -15,6 +15,15 @@ This protocol is the only runtime interface.
 - no legacy text interpolation
 - no table/text output contract
 
+Agent-facing reliability guarantees:
+
+- recoverable runtime conditions are stdout events, not stderr prose
+- native CLI and pipe writes require explicit permission
+- pipe named sessions execute FIFO and are intended to preserve PostgreSQL
+  backend session state until invalidation or shutdown
+- database failures preserve PostgreSQL `SQLSTATE`
+- validation and permission failures include actionable hints when possible
+
 ## Input (stdin)
 
 ### `query`
@@ -39,15 +48,21 @@ Execute one SQL statement.
 | `batch_bytes` | 262144 | soft byte target per streamed batch |
 | `statement_timeout_ms` | config default | per-query statement timeout |
 | `lock_timeout_ms` | config default | per-query lock timeout |
-| `read_only` | false | enforce read-only transaction for this query |
+| `permission` | native/pipe transport default | `read`, `write`, `ssh-read`, or `ssh-write` |
 | `inline_max_rows` | config default | inline row cap for non-streaming |
 | `inline_max_bytes` | config default | inline payload bytes cap for non-streaming |
+
+In native CLI and pipe mode, permission defaults to `read` for direct sessions
+and `ssh-read` for sessions using afpsql SSH transport. `read` and `ssh-read`
+run in PostgreSQL read-only transactions. Direct writes require `write`; SSH
+writes require `ssh-write`.
 
 ### Parameter Binding Rules
 
 1. Dynamic values should be passed via `params` with `$1..$N` placeholders.
 2. Placeholder count must equal `params` length (validated from prepared-statement metadata, not SQL text scanning).
-3. Count/type validation failures return `error_code: "invalid_params"`.
+3. Client-side count/shape/local binding conversion failures return `error_code: "invalid_params"`.
+4. PostgreSQL server conversion/execution failures return `code: "sql_error"` with the original SQLSTATE.
 
 Driver-side type mapping (prepared statement parameter OIDs):
 
@@ -91,28 +106,43 @@ Session connection shape supports:
 - `user`
 - `dbname`
 - `password_secret`
+- `ssh`
+- `ssh_options`
+- `ssh_local_host`
+- `ssh_local_port`
+- `ssh_remote_socket`
+- `ssh_sudo_user`
 
-TLS settings supplied in `dsn_secret` or `conninfo_secret` (for example
-`sslmode=require`) are honored by the PostgreSQL driver.
+Supported TLS settings supplied in `dsn_secret` or `conninfo_secret` are
+honored. afpsql currently accepts `sslmode=disable/prefer/require`; unsupported
+libpq TLS modes/options such as `verify-ca`, `verify-full`, `sslrootcert`,
+`sslcert`, and `sslkey` fail with structured errors and hints.
+
+SSH transport fields start a local OpenSSH tunnel or Unix-socket bridge before
+connecting. They currently expect discrete connection fields rather than
+`dsn_secret` or `conninfo_secret`.
 
 CLI translation notes:
 
 - agent-first mode uses direct agent-first flags (`--dsn-secret`, `--host`, ...)
 - `psql mode` may translate legacy flags (`-h`, `-p`, `-U`, `-d`, `-c`, `-f`)
   into these same canonical fields
+- `psql mode` does not expose afpsql permission or SSH transport extensions, and
+  preserves psql's writable default for script compatibility; use native afpsql
+  for agent-safe permissions and managed SSH transport
 
 ### `cancel`
 
-Cancel an in-flight query by id.
+Cancel a queued or running query by id.
 
 ```json
 {"code":"cancel","id":"q-123"}
 ```
 
-When the database connection is already established, `afpsql` sends a
-PostgreSQL server-side cancel request before aborting local output handling.
-Cancellation is still race-prone: a query may finish normally before the cancel
-request is processed.
+When the database connection is already executing the query, `afpsql` sends a
+PostgreSQL server-side cancel request. When the query is still queued, `afpsql`
+removes it before execution. Cancellation is still race-prone: a query may
+finish normally before the cancel request is processed.
 
 ### `ping`
 
@@ -236,9 +266,10 @@ Canonical `error_code` values:
 - `command_tag` (optional)
 - `trace`
 
-Startup `log` events include parsed `args`, redacted `config`, and selected
-redacted environment fallback fields. They intentionally omit raw `argv`.
-Bind values are summarized as `param_count`, not logged as plaintext.
+Startup `log` events include `version`, parsed/summarized `args`, and selected
+environment fallback presence metadata (`key` plus `present`). They intentionally
+omit raw `argv`, raw environment values, and config snapshots. Bind values are
+summarized as `param_count`, not logged as plaintext.
 
 `log` category matching (from `config.log` / `--log`):
 
@@ -254,7 +285,7 @@ Pipe mode applies hard protocol limits before executing a request:
 - max JSONL line: 1 MiB
 - max SQL text: 1 MiB
 - max params per query: 65,535
-- max concurrent in-flight queries: 64
+- max queued/running query ids: 64
 
 ## Environment Fallback
 
@@ -274,6 +305,8 @@ Standard PostgreSQL environment fallback (lower precedence):
 - `PGPORT`
 - `PGUSER`
 - `PGDATABASE`
+- `PGPASSWORD`
+- `PGSSLMODE` (`disable`, `prefer`, or `require`)
 
 ## Example: Small Result
 

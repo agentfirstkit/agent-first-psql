@@ -1,5 +1,5 @@
 use super::*;
-use tokio_postgres::config::Host;
+use tokio_postgres::config::{Host, SslMode};
 
 #[test]
 fn resolve_conn_uses_dsn_secret_first() {
@@ -27,6 +27,60 @@ fn resolve_conn_from_conninfo() {
         assert_eq!(out.get_dbname(), Some("postgres"));
         assert_eq!(out.get_ports(), &[5432]);
         assert_eq!(out.get_hosts(), &[Host::Tcp("localhost".to_string())]);
+    }
+}
+
+#[test]
+fn resolve_conn_accepts_supported_sslmodes() {
+    let cfg = SessionConfig {
+        dsn_secret: Some("postgresql://localhost/postgres?sslmode=require".to_string()),
+        ..Default::default()
+    };
+    let out = resolve_pg_config(&cfg);
+    assert!(out.is_ok());
+    if let Ok(out) = out {
+        assert_eq!(out.get_ssl_mode(), SslMode::Require);
+    }
+
+    let cfg2 = SessionConfig {
+        conninfo_secret: Some("host=localhost dbname=postgres sslmode=disable".to_string()),
+        ..Default::default()
+    };
+    let out2 = resolve_pg_config(&cfg2);
+    assert!(out2.is_ok());
+    if let Ok(out2) = out2 {
+        assert_eq!(out2.get_ssl_mode(), SslMode::Disable);
+    }
+}
+
+#[test]
+fn resolve_conn_rejects_unsupported_tls_options_with_hint() {
+    let cfg = SessionConfig {
+        dsn_secret: Some("postgresql://localhost/postgres?sslmode=verify-full".to_string()),
+        ..Default::default()
+    };
+    let err = resolve_pg_config(&cfg);
+    assert!(err.is_err());
+    if let Err(err) = err {
+        assert!(err.message().contains("unsupported dsn sslmode"));
+        assert!(err
+            .hint()
+            .unwrap_or_default()
+            .contains("disable, prefer, and require"));
+    }
+
+    let cfg2 = SessionConfig {
+        conninfo_secret: Some("host=localhost sslrootcert=/tmp/root.crt".to_string()),
+        ..Default::default()
+    };
+    let err2 = resolve_pg_config(&cfg2);
+    assert!(err2.is_err());
+    if let Err(err2) = err2 {
+        assert!(err2.message().contains("sslrootcert"));
+        assert!(err2
+            .hint()
+            .unwrap_or_default()
+            .contains("verify-ca/verify-full"));
     }
 }
 
@@ -135,5 +189,28 @@ fn resolve_conn_discrete_fields_are_not_conninfo_or_url_interpolated() {
         assert_eq!(out.get_user(), Some("u@x"));
         assert_eq!(out.get_dbname(), Some("d/name"));
         assert_eq!(out.get_password(), Some("p@ ss/word".as_bytes()));
+    }
+}
+
+#[test]
+fn resolve_conn_uses_pgpassword_fallback() {
+    let old = std::env::var_os("PGPASSWORD");
+    std::env::set_var("PGPASSWORD", "pgpass-test");
+
+    let out_res = resolve_pg_config(&SessionConfig {
+        host: Some("localhost".to_string()),
+        user: Some("roger".to_string()),
+        dbname: Some("postgres".to_string()),
+        ..Default::default()
+    });
+
+    match old {
+        Some(value) => std::env::set_var("PGPASSWORD", value),
+        None => std::env::remove_var("PGPASSWORD"),
+    }
+
+    assert!(out_res.is_ok());
+    if let Ok(out) = out_res {
+        assert_eq!(out.get_password(), Some("pgpass-test".as_bytes()));
     }
 }

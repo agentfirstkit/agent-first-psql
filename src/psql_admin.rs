@@ -1,5 +1,4 @@
 use crate::cli::{PsqlAdminAction, PsqlAdminRequest};
-use crate::protocol::error_code;
 use agent_first_data::{cli_output, OutputFormat};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -15,14 +14,7 @@ pub fn run(req: PsqlAdminRequest) -> i32 {
         Ok(value) => (0, value),
         Err(err) => (
             1,
-            json!({
-                "code": "error",
-                "error_code": err.code,
-                "error": err.message,
-                "hint": err.hint,
-                "retryable": false,
-                "trace": {"duration_ms": 0}
-            }),
+            agent_first_data::build_cli_error(&err.message, err.hint.as_deref()),
         ),
     };
     emit_value(&value, req.output);
@@ -52,16 +44,19 @@ fn status(bin_dir: Option<String>) -> Result<Value, AdminError> {
         .map(|p| same_path(p, &target.wrapper_path))
         .unwrap_or(false);
 
-    Ok(json!({
-        "code": "psql_status",
-        "wrapper_path": target.wrapper_path,
-        "bin_dir": target.bin_dir,
-        "installed": installed,
-        "managed": managed,
-        "active_in_path": active_in_path,
-        "current_psql": current_psql,
-        "afpsql": current_afpsql_path()?,
-    }))
+    Ok(agent_first_data::build_json(
+        "psql_status",
+        json!({
+            "wrapper_path": target.wrapper_path,
+            "bin_dir": target.bin_dir,
+            "installed": installed,
+            "managed": managed,
+            "active_in_path": active_in_path,
+            "current_psql": current_psql,
+            "afpsql": current_afpsql_path()?,
+        }),
+        None,
+    ))
 }
 
 fn install(bin_dir: Option<String>) -> Result<Value, AdminError> {
@@ -89,29 +84,35 @@ fn install(bin_dir: Option<String>) -> Result<Value, AdminError> {
         .map(|p| same_path(p, &target.wrapper_path))
         .unwrap_or(false);
 
-    Ok(json!({
-        "code": "psql_install",
-        "wrapper_path": target.wrapper_path,
-        "bin_dir": target.bin_dir,
-        "installed": true,
-        "managed": true,
-        "active_in_path": active_in_path,
-        "current_psql": current_psql,
-        "afpsql": afpsql,
-        "hint": if active_in_path { Value::Null } else { json!(format!("add {} to the front of PATH for this psql to take effect", target.bin_dir.display())) },
-    }))
+    Ok(agent_first_data::build_json(
+        "psql_install",
+        json!({
+            "wrapper_path": target.wrapper_path,
+            "bin_dir": target.bin_dir,
+            "installed": true,
+            "managed": true,
+            "active_in_path": active_in_path,
+            "current_psql": current_psql,
+            "afpsql": afpsql,
+            "hint": if active_in_path { Value::Null } else { json!(format!("add {} to the front of PATH for this psql to take effect", target.bin_dir.display())) },
+        }),
+        None,
+    ))
 }
 
 fn uninstall(bin_dir: Option<String>) -> Result<Value, AdminError> {
     let target = resolve_target(bin_dir)?;
     if !target.wrapper_path.exists() {
-        return Ok(json!({
-            "code": "psql_uninstall",
-            "wrapper_path": target.wrapper_path,
-            "bin_dir": target.bin_dir,
-            "removed": false,
-            "message": "psql wrapper is not installed"
-        }));
+        return Ok(agent_first_data::build_json(
+            "psql_uninstall",
+            json!({
+                "wrapper_path": target.wrapper_path,
+                "bin_dir": target.bin_dir,
+                "removed": false,
+                "message": "psql wrapper is not installed"
+            }),
+            None,
+        ));
     }
     if !is_managed_wrapper(&target.wrapper_path)? {
         return Err(AdminError::invalid_request(
@@ -125,12 +126,15 @@ fn uninstall(bin_dir: Option<String>) -> Result<Value, AdminError> {
 
     std::fs::remove_file(&target.wrapper_path)
         .map_err(|e| AdminError::io("remove psql wrapper", e))?;
-    Ok(json!({
-        "code": "psql_uninstall",
-        "wrapper_path": target.wrapper_path,
-        "bin_dir": target.bin_dir,
-        "removed": true
-    }))
+    Ok(agent_first_data::build_json(
+        "psql_uninstall",
+        json!({
+            "wrapper_path": target.wrapper_path,
+            "bin_dir": target.bin_dir,
+            "removed": true
+        }),
+        None,
+    ))
 }
 
 struct TargetPath {
@@ -281,7 +285,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct AdminError {
-    code: String,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
@@ -289,16 +292,11 @@ pub(crate) struct AdminError {
 
 impl AdminError {
     fn invalid_request(message: String, hint: Option<String>) -> Self {
-        Self {
-            code: error_code::INVALID_REQUEST.to_string(),
-            message,
-            hint,
-        }
+        Self { message, hint }
     }
 
     fn io(action: &str, err: std::io::Error) -> Self {
         Self {
-            code: error_code::INVALID_REQUEST.to_string(),
             message: format!("{action} failed: {err}"),
             hint: None,
         }

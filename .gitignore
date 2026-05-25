@@ -1,6 +1,13 @@
 /target
 
+# Local integration test database connection settings.
+/tests/.env
+/tests/.env.local
+
 # macOS metadata files
 .DS_Store
 # hypha spawn working directory
 .cmn
+
+# Python venv (auto-provisioned by test.sh when system python lacks deps)
+.venv

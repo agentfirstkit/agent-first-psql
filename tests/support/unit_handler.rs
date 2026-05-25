@@ -188,7 +188,15 @@ async fn execute_query_maps_executor_outcomes() {
         }),
         Ok(ExecOutcome::Command { affected: 2 }),
         Err(ExecError::Connect("down".to_string())),
+        Err(ExecError::Config {
+            message: "unsupported sslmode".to_string(),
+            hint: Some("use sslmode=require".to_string()),
+        }),
         Err(ExecError::InvalidParams("bad".to_string())),
+        Err(ExecError::ResultTooLarge {
+            row_count: 2,
+            payload_bytes: 200,
+        }),
         Err(ExecError::Sql {
             sqlstate: "22023".to_string(),
             message: "bad".to_string(),
@@ -211,5 +219,173 @@ async fn execute_query_maps_executor_outcomes() {
         .await;
         let msg_opt = rx.recv().await;
         assert!(msg_opt.is_some());
+    }
+}
+
+#[tokio::test]
+async fn execute_query_maps_executor_result_too_large() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions
+        .insert("default".to_string(), SessionConfig::default());
+    let (app, mut rx) = test_app_with_executor(
+        cfg,
+        Err(ExecError::ResultTooLarge {
+            row_count: 3,
+            payload_bytes: 300,
+        }),
+    );
+
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions::default(),
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
+        error_code,
+        retryable,
+        trace,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "result_too_large");
+        assert!(!retryable);
+        assert_eq!(trace.row_count, Some(3));
+        assert_eq!(trace.payload_bytes, Some(300));
+    }
+}
+
+#[tokio::test]
+async fn execute_query_rejects_permission_mismatched_to_transport() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions.insert(
+        "default".to_string(),
+        SessionConfig {
+            ssh: Some("user@example.com".to_string()),
+            ..Default::default()
+        },
+    );
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 1 }));
+
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions {
+            permission: Some(Permission::Write),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
+        error_code,
+        error,
+        hint,
+        retryable,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "invalid_request");
+        assert!(error.contains("does not allow SSH transport"));
+        let hint = hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("uses afpsql SSH transport"));
+        assert!(hint.contains("ssh-write"));
+        assert!(!retryable);
+    }
+}
+
+#[tokio::test]
+async fn execute_query_rejects_ssh_permission_without_ssh_hint() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions
+        .insert("default".to_string(), SessionConfig::default());
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 1 }));
+
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions {
+            permission: Some(Permission::SshWrite),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
+        error_code,
+        error,
+        hint,
+        retryable,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "invalid_request");
+        assert!(error.contains("requires SSH transport"));
+        let hint = hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("does not use afpsql SSH transport"));
+        assert!(hint.contains("write"));
+        assert!(!retryable);
+    }
+}
+
+#[tokio::test]
+async fn execute_query_emits_config_hint() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions
+        .insert("default".to_string(), SessionConfig::default());
+    let (app, mut rx) = test_app_with_executor(
+        cfg,
+        Err(ExecError::Config {
+            message: "unsupported dsn sslmode `verify-full`".to_string(),
+            hint: Some("afpsql supports sslmode=disable, prefer, and require".to_string()),
+        }),
+    );
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions::default(),
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
+        error_code,
+        error,
+        hint,
+        retryable,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "invalid_request");
+        assert!(error.contains("verify-full"));
+        assert_eq!(
+            hint.as_deref(),
+            Some("afpsql supports sslmode=disable, prefer, and require")
+        );
+        assert!(!retryable);
     }
 }

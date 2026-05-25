@@ -5,6 +5,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "support/env.rs"]
+mod test_env;
+
 fn bin() -> PathBuf {
     let exe = std::env::current_exe().expect("current exe");
     let debug_dir = exe
@@ -15,9 +18,7 @@ fn bin() -> PathBuf {
 }
 
 fn test_dsn() -> String {
-    std::env::var("AFPSQL_TEST_DSN_SECRET")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set AFPSQL_TEST_DSN_SECRET or DATABASE_URL for PostgreSQL integration tests")
+    test_env::required_test_dsn()
 }
 
 fn run(mut cmd: Command) -> (i32, String, String) {
@@ -168,6 +169,7 @@ fn cli_emits_structured_stdout_log_events_when_enabled() {
     assert!(stdout.contains("\"code\":\"result\""));
     assert!(stdout.contains("\"code\":\"log\""));
     assert!(stdout.contains("\"event\":\"query.result\""));
+    assert!(!stdout.contains("\"event\":\"startup\""));
     assert!(stdout.contains("\"duration_ms\""));
     assert!(stderr.trim().is_empty());
 }

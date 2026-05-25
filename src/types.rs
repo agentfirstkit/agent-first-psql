@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "code")]
+#[serde(tag = "code", deny_unknown_fields)]
 pub enum Input {
     #[serde(rename = "query")]
     Query {
@@ -26,7 +26,55 @@ pub enum Input {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Permission {
+    #[serde(rename = "read")]
+    Read,
+    #[serde(rename = "write")]
+    Write,
+    #[serde(rename = "ssh-read")]
+    SshRead,
+    #[serde(rename = "ssh-write")]
+    SshWrite,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::SshRead => "ssh-read",
+            Self::SshWrite => "ssh-write",
+        }
+    }
+
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Read | Self::SshRead)
+    }
+
+    pub fn allows_ssh(self) -> bool {
+        matches!(self, Self::SshRead | Self::SshWrite)
+    }
+}
+
+impl std::str::FromStr for Permission {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            "ssh-read" => Ok(Self::SshRead),
+            "ssh-write" => Ok(Self::SshWrite),
+            _ => Err(format!(
+                "invalid permission `{value}`; expected read, write, ssh-read, or ssh-write"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct QueryOptions {
     #[serde(default)]
@@ -35,7 +83,7 @@ pub struct QueryOptions {
     pub batch_bytes: Option<usize>,
     pub statement_timeout_ms: Option<u64>,
     pub lock_timeout_ms: Option<u64>,
-    pub read_only: Option<bool>,
+    pub permission: Option<Permission>,
     pub inline_max_rows: Option<usize>,
     pub inline_max_bytes: Option<usize>,
 }
@@ -182,6 +230,7 @@ pub struct CloseTrace {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dsn_secret: Option<String>,
@@ -197,6 +246,29 @@ pub struct SessionConfig {
     pub dbname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_options: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_local_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_local_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_remote_socket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_sudo_user: Option<String>,
+}
+
+impl SessionConfig {
+    pub fn uses_ssh_transport(&self) -> bool {
+        self.ssh.is_some()
+            || !self.ssh_options.is_empty()
+            || self.ssh_local_host.is_some()
+            || self.ssh_local_port.is_some()
+            || self.ssh_remote_socket.is_some()
+            || self.ssh_sudo_user.is_some()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -229,6 +301,7 @@ impl Default for RuntimeConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigPatch {
     pub default_session: Option<String>,
     pub sessions: Option<HashMap<String, SessionConfigPatch>>,
@@ -274,6 +347,7 @@ impl<T> PatchField<T> {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfigPatch {
     #[serde(default)]
     pub dsn_secret: PatchField<String>,
@@ -289,6 +363,18 @@ pub struct SessionConfigPatch {
     pub dbname: PatchField<String>,
     #[serde(default)]
     pub password_secret: PatchField<String>,
+    #[serde(default)]
+    pub ssh: PatchField<String>,
+    #[serde(default)]
+    pub ssh_options: PatchField<Vec<String>>,
+    #[serde(default)]
+    pub ssh_local_host: PatchField<String>,
+    #[serde(default)]
+    pub ssh_local_port: PatchField<u16>,
+    #[serde(default)]
+    pub ssh_remote_socket: PatchField<String>,
+    #[serde(default)]
+    pub ssh_sudo_user: PatchField<String>,
 }
 
 #[derive(Debug, Clone)]
