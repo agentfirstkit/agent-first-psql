@@ -15,6 +15,10 @@ This document contains the help content for the `afpsql` command-line program.
 * [`afpsql psql status`↴](#afpsql-psql-status)
 * [`afpsql psql install`↴](#afpsql-psql-install)
 * [`afpsql psql uninstall`↴](#afpsql-psql-uninstall)
+* [`afpsql skill`↴](#afpsql-skill)
+* [`afpsql skill status`↴](#afpsql-skill-status)
+* [`afpsql skill install`↴](#afpsql-skill-install)
+* [`afpsql skill uninstall`↴](#afpsql-skill-uninstall)
 
 ## `afpsql`
 
@@ -65,6 +69,8 @@ afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
 afpsql psql status
 afpsql psql install
+afpsql skill status
+afpsql skill install
 ```
 
 ### Exit Codes
@@ -78,6 +84,7 @@ afpsql psql install
 ###### **Subcommands:**
 
 * `psql` — Manage the local psql wrapper for afpsql --mode psql
+* `skill` — Manage Agent-First PSQL skills for Codex and Claude Code
 
 ###### **Options:**
 
@@ -168,3 +175,121 @@ Remove an afpsql-managed psql wrapper
 ###### **Options:**
 
 * `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+
+
+
+## `afpsql skill`
+
+Manage Agent-First PSQL skills for Codex and Claude Code
+
+**Usage:** `afpsql skill <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show whether the Agent-First PSQL skill is installed and valid
+* `install` — Install the Agent-First PSQL skill
+* `uninstall` — Remove an afpsql-managed Agent-First PSQL skill
+
+
+
+## `afpsql skill status`
+
+Show whether the Agent-First PSQL skill is installed and valid
+
+**Usage:** `afpsql skill status [OPTIONS]`
+
+###### **Options:**
+
+* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+
+  Default value: `all`
+
+  Possible values:
+  - `all`:
+    Manage both Codex and Claude Code personal skills
+  - `codex`:
+    Manage the Codex local skill under $CODEX_HOME/skills
+  - `claude-code`:
+    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+
+* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+
+  Default value: `personal`
+
+  Possible values:
+  - `personal`:
+    Install under the user-level skills directory
+  - `project`:
+    Install under the current project's skills directory
+
+* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
+
+
+
+## `afpsql skill install`
+
+Install the Agent-First PSQL skill
+
+**Usage:** `afpsql skill install [OPTIONS]`
+
+###### **Options:**
+
+* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+
+  Default value: `all`
+
+  Possible values:
+  - `all`:
+    Manage both Codex and Claude Code personal skills
+  - `codex`:
+    Manage the Codex local skill under $CODEX_HOME/skills
+  - `claude-code`:
+    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+
+* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+
+  Default value: `personal`
+
+  Possible values:
+  - `personal`:
+    Install under the user-level skills directory
+  - `project`:
+    Install under the current project's skills directory
+
+* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
+* `--force` — Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
+
+
+
+## `afpsql skill uninstall`
+
+Remove an afpsql-managed Agent-First PSQL skill
+
+**Usage:** `afpsql skill uninstall [OPTIONS]`
+
+###### **Options:**
+
+* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+
+  Default value: `all`
+
+  Possible values:
+  - `all`:
+    Manage both Codex and Claude Code personal skills
+  - `codex`:
+    Manage the Codex local skill under $CODEX_HOME/skills
+  - `claude-code`:
+    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+
+* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+
+  Default value: `personal`
+
+  Possible values:
+  - `personal`:
+    Install under the user-level skills directory
+  - `project`:
+    Install under the current project's skills directory
+
+* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
+* `--force` — Overwrite or remove an unmanaged Agent-First PSQL skill at the target path

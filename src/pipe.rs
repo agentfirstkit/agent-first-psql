@@ -105,6 +105,7 @@ pub async fn run(init: crate::cli::PipeInit) {
     }
 
     wait_for_workers_shutdown(&runtime).await;
+    runtime.app.executor.shutdown().await;
     send_close_event(&runtime.app).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

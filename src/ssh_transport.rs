@@ -75,20 +75,40 @@ impl Drop for SshTunnelGuard {
 }
 
 pub struct SshBridgeGuard {
-    child: tokio::process::Child,
-    connection_task: tokio::task::JoinHandle<()>,
+    child: Option<tokio::process::Child>,
+    connection_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SshBridgeGuard {
     pub fn is_finished(&self) -> bool {
-        self.connection_task.is_finished()
+        self.connection_task
+            .as_ref()
+            .map(|task| task.is_finished())
+            .unwrap_or(true)
+    }
+
+    pub async fn shutdown(mut self, timeout: Duration) {
+        if let Some(task) = self.connection_task.take() {
+            let mut task = task;
+            if tokio::time::timeout(timeout, &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(timeout, child.wait()).await;
+        }
     }
 }
 
 impl Drop for SshBridgeGuard {
     fn drop(&mut self) {
-        self.connection_task.abort();
-        let _ = self.child.start_kill();
+        if let Some(task) = self.connection_task.as_ref() {
+            task.abort();
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -225,8 +245,8 @@ pub async fn connect_stdio_bridge(cfg: &SessionConfig) -> Result<(Client, SshBri
     Ok((
         client,
         SshBridgeGuard {
-            child,
-            connection_task,
+            child: Some(child),
+            connection_task: Some(connection_task),
         },
     ))
 }

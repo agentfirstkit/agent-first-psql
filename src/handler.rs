@@ -413,16 +413,20 @@ async fn emit_exec_error(
             )
             .await;
         }
-        ExecError::Connect(message) => {
+        ExecError::Connect(connect) => {
+            let connect = *connect;
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
-                .send(Output::Error {
+                .send(Output::ConnectError {
                     id: id.clone(),
                     error_code: error_code::CONNECT_FAILED.to_string(),
-                    error: message,
-                    hint: Some("check --host/--port or PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()),
-                    retryable: true,
+                    error: connect.error,
+                    sqlstate: connect.sqlstate,
+                    message: connect.message,
+                    detail: connect.detail,
+                    hint: connect.hint,
+                    retryable: connect.retryable,
                     trace: trace.clone(),
                 })
                 .await;

@@ -31,6 +31,43 @@ fn unique_suffix() -> String {
 }
 
 #[test]
+fn cli_closes_backend_connection_before_exit() {
+    let first = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select pg_backend_pid() as pid")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        first.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_json: Value = serde_json::from_slice(&first.stdout).expect("json output");
+    let pid = first_json["rows"][0]["pid"].as_i64().expect("backend pid");
+
+    let check = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select count(*)::int as n from pg_stat_activity where pid = $1::int")
+        .arg("--param")
+        .arg(format!("1={pid}"))
+        .output()
+        .expect("run afpsql");
+    assert!(
+        check.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let check_json: Value = serde_json::from_slice(&check.stdout).expect("json output");
+    assert_eq!(check_json["rows"][0]["n"], 0);
+}
+
+#[test]
 fn cli_invalid_param_count_returns_error() {
     let out = Command::new(bin())
         .arg("--dsn-secret")

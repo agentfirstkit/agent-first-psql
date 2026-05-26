@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::{DbExecutor, ExecError, ExecOutcome, ExecRequest};
+use crate::db::{ConnectError, DbExecutor, ExecError, ExecOutcome, ExecRequest};
 use async_trait::async_trait;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -187,7 +187,7 @@ async fn execute_query_maps_executor_outcomes() {
             rows: vec![serde_json::json!({"n":1})],
         }),
         Ok(ExecOutcome::Command { affected: 2 }),
-        Err(ExecError::Connect("down".to_string())),
+        Err(ExecError::Connect(Box::new(ConnectError::new("down")))),
         Err(ExecError::Config {
             message: "unsupported sslmode".to_string(),
             hint: Some("use sslmode=require".to_string()),
@@ -219,6 +219,61 @@ async fn execute_query_maps_executor_outcomes() {
         .await;
         let msg_opt = rx.recv().await;
         assert!(msg_opt.is_some());
+    }
+}
+
+#[tokio::test]
+async fn execute_query_emits_structured_connect_error_details() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions
+        .insert("default".to_string(), SessionConfig::default());
+    let (app, mut rx) = test_app_with_executor(
+        cfg,
+        Err(ExecError::Connect(Box::new(ConnectError {
+            error: "connect failed: role \"root\" does not exist".to_string(),
+            sqlstate: Some("28000".to_string()),
+            message: Some("role \"root\" does not exist".to_string()),
+            detail: Some("connection matched pg_hba peer rule".to_string()),
+            hint: Some("try --user postgres or configure peer auth".to_string()),
+            retryable: false,
+        }))),
+    );
+
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions::default(),
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::ConnectError { .. })));
+    if let Some(Output::ConnectError {
+        error_code,
+        sqlstate,
+        message,
+        detail,
+        hint,
+        retryable,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "connect_failed");
+        assert_eq!(sqlstate.as_deref(), Some("28000"));
+        assert_eq!(message.as_deref(), Some("role \"root\" does not exist"));
+        assert_eq!(
+            detail.as_deref(),
+            Some("connection matched pg_hba peer rule")
+        );
+        assert!(hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--user postgres"));
+        assert!(!retryable);
     }
 }
 

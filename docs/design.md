@@ -204,12 +204,18 @@ Client/protocol/runtime failure. Include:
 
 - `error_code`
 - `error`
+- optional `sqlstate`, `message`, `detail` when PostgreSQL rejects the
+  connection before query execution
 - optional `hint`
 - `retryable`
 - `trace`
 
 Permission mismatches, validation errors, connection setup failures, unsupported
 TLS settings, and SSH transport validation should use this path.
+Connection-stage PostgreSQL failures still use `code:"error"` with
+`error_code:"connect_failed"`, but should preserve SQLSTATE diagnostics when
+available so agents can distinguish authentication, role, database, capacity, and
+startup failures without parsing prose.
 
 ## psql compatibility boundary: scripts yes, terminal semantics no
 

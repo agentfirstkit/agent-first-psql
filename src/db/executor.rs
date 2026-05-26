@@ -1,7 +1,10 @@
-use super::errors::{map_pg_error, ExecError};
+use super::errors::{map_pg_error, ConnectError, ExecError};
 use super::params::{build_param_refs, build_params, validate_param_count, QueryParam};
 use super::rows::{row_json_size, row_to_json_fallback};
-use super::session::{connect_session, get_session, new_session_map, CancelSlot, SessionMap};
+use super::session::{
+    connect_session, get_session, new_session_map, remove_sessions, shutdown_all_sessions,
+    CancelSlot, SessionMap,
+};
 use crate::types::{ColumnInfo, ResolvedOptions, SessionConfig};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -77,6 +80,8 @@ pub trait DbExecutor: Send + Sync {
     }
 
     async fn invalidate_sessions(&self, _session_names: &[String]) {}
+
+    async fn shutdown(&self) {}
 }
 
 pub struct PostgresExecutor {
@@ -98,11 +103,18 @@ impl DbExecutor for PostgresExecutor {
         let mut client_guard = session.client.lock().await;
         ensure_connected(&mut client_guard, req.session_cfg).await?;
         let Some(client) = client_guard.as_mut() else {
-            return Err(ExecError::Connect("connection unavailable".to_string()));
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
         };
         install_cancel_context(
             &req.cancel_slot,
-            client.client.cancel_token(),
+            pg_client.cancel_token(),
             client.backend_pid,
             req.session_cfg,
         )
@@ -110,7 +122,7 @@ impl DbExecutor for PostgresExecutor {
         if cancel_requested(&req.cancel_slot) {
             return Err(ExecError::Cancelled);
         }
-        let result = execute_with_client(&mut client.client, &req).await;
+        let result = execute_with_client(pg_client, &req).await;
         if should_drop_connection(&result) {
             *client_guard = None;
         }
@@ -126,11 +138,18 @@ impl DbExecutor for PostgresExecutor {
         let mut client_guard = session.client.lock().await;
         ensure_connected(&mut client_guard, req.session_cfg).await?;
         let Some(client) = client_guard.as_mut() else {
-            return Err(ExecError::Connect("connection unavailable".to_string()));
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
         };
         install_cancel_context(
             &req.cancel_slot,
-            client.client.cancel_token(),
+            pg_client.cancel_token(),
             client.backend_pid,
             req.session_cfg,
         )
@@ -138,7 +157,7 @@ impl DbExecutor for PostgresExecutor {
         if cancel_requested(&req.cancel_slot) {
             return Err(ExecError::Cancelled);
         }
-        let result = execute_streaming_with_client(&mut client.client, &req, sink).await;
+        let result = execute_streaming_with_client(pg_client, &req, sink).await;
         if should_drop_connection(&result) {
             *client_guard = None;
         }
@@ -146,13 +165,11 @@ impl DbExecutor for PostgresExecutor {
     }
 
     async fn invalidate_sessions(&self, session_names: &[String]) {
-        if session_names.is_empty() {
-            return;
-        }
-        let mut sessions = self.sessions.write().await;
-        for name in session_names {
-            sessions.remove(name);
-        }
+        remove_sessions(&self.sessions, session_names).await;
+    }
+
+    async fn shutdown(&self) {
+        shutdown_all_sessions(&self.sessions).await;
     }
 }
 

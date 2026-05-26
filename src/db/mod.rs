@@ -4,6 +4,8 @@ mod params;
 mod rows;
 mod session;
 
+#[cfg(test)]
+pub use errors::ConnectError;
 pub use errors::ExecError;
 pub use executor::{
     DbExecutor, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,

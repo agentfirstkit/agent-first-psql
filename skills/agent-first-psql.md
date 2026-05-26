@@ -1,6 +1,6 @@
 ---
 name: agent-first-psql
-description: Use Agent-First PSQL for reliable agent/script PostgreSQL access: structured stdout events, explicit read/write permissions, stable pipe sessions, psql-compatible non-interactive translation, SSH transport, secret handling, and SQLSTATE-aware troubleshooting.
+description: "Use Agent-First PSQL for reliable agent/script PostgreSQL access: structured stdout events, explicit read/write permissions, stable pipe sessions, psql-compatible non-interactive translation, SSH transport, secret handling, and SQLSTATE-aware troubleshooting."
 disable-model-invocation: true
 allowed-tools: Bash, Read, Edit, Write, Glob, Grep
 ---
@@ -19,6 +19,12 @@ a high-performance pooler. Prefer a predictable structured contract over parsing
 
 - Prefer local `afpsql` for agent/script database work; do not SSH into a server
   just to run human-oriented `psql` unless the user explicitly asks.
+- For routine SQL work, do not run `afpsql --help` as a preflight. Use the
+  canonical command forms in this skill. Run `--help` only when the user asks,
+  when troubleshooting an unknown flag, or when updating afpsql itself.
+- The setup checklist is only for installation/preparation tasks. Do not rerun
+  setup checks such as `afpsql --version` before every database query if
+  `afpsql` is already known to be installed.
 - Treat stdout as the protocol: parse `code:"result"`, `code:"sql_error"`,
   `code:"error"`, and other Agent-First Data events instead of human text.
 - Default to read-only queries. Native CLI and pipe mode are read-only unless a
@@ -36,6 +42,11 @@ a high-performance pooler. Prefer a predictable structured contract over parsing
   invalidation or shutdown.
 - Keep secret names compatible with PostgreSQL conventions. Use `PGPASSWORD` as
   the env var name; do not invent `PGPASSWORD_SECRET`.
+- In sandboxed coding agents, a direct local TCP database query may need
+  command approval. If an otherwise-correct read-only `afpsql` query returns
+  an immediate `connect_failed` and the same command can be rerun with approval,
+  retry the same command once with approval before changing host, port, user, or
+  SQL. Do not run `afpsql --help` to diagnose that case.
 
 ## Setup Checklist
 
@@ -53,12 +64,20 @@ If Homebrew is unavailable, use:
 cargo install agent-first-psql
 ```
 
-2. Install this skill if the agent supports Codex-style local skills:
+2. Install this skill if the agent supports local skills:
 
 ```bash
-mkdir -p ~/.codex/skills/agent-first-psql
-curl -fsSL https://raw.githubusercontent.com/agentfirstkit/agent-first-psql/main/skills/agent-first-psql.md \
-  -o ~/.codex/skills/agent-first-psql/SKILL.md
+afpsql skill status
+afpsql skill install
+afpsql skill status
+```
+
+The default skill target installs personal skills for Codex and Claude Code.
+For a Claude Code project-local skill, use:
+
+```bash
+afpsql skill install --agent claude-code --scope project
+afpsql skill status --agent claude-code --scope project
 ```
 
 3. If the user wants existing non-interactive scripts to call `psql`, install
@@ -247,6 +266,7 @@ options when the name must appear in structured output.
 
 - `sql_error` with SQLSTATE `25006`: a write was attempted in a read-only transaction; confirm intent and rerun with `write` or `ssh-write` only if appropriate.
 - `invalid_request` mentioning permission mismatch: use direct permissions (`read`/`write`) for direct sessions and SSH permissions (`ssh-read`/`ssh-write`) for afpsql SSH transport.
+- immediate `connect_failed` from local `127.0.0.1`/`localhost` in a sandboxed agent: if the command shape is known good and approval is available, rerun the same read-only command with approval once before treating it as a PostgreSQL configuration problem.
 - `connection refused` on `127.0.0.1:15432`: the SSH tunnel is not running, the local port is wrong, or the SSH tunnel failed.
 - `password authentication failed`: the forwarded connection uses TCP auth rules; try the remote Unix socket forwarding pattern if bare server-side `psql` works only through socket/peer auth.
 - `peer authentication failed`: the SSH login user does not match the requested database role, PostgreSQL lacks a peer mapping, or sudo bridge mode is needed.

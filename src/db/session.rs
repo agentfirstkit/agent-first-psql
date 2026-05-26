@@ -1,7 +1,7 @@
 use crate::conn::resolve_pg_config;
 use crate::types::SessionConfig;
 
-use super::errors::ExecError;
+use super::errors::{map_connect_error, ConnectError, ExecError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub type CancelSlot = Arc<CancelState>;
 pub(super) type SessionMap = RwLock<HashMap<String, Arc<SessionEntry>>>;
+const SESSION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct CancelState {
     token: Mutex<Option<tokio_postgres::CancelToken>>,
@@ -22,7 +23,7 @@ pub(super) struct SessionEntry {
 }
 
 pub(super) struct SessionClient {
-    pub(super) client: tokio_postgres::Client,
+    pub(super) client: Option<tokio_postgres::Client>,
     pub(super) backend_pid: i32,
     connection_task: Option<tokio::task::JoinHandle<()>>,
     _ssh_tunnel: Option<crate::ssh_transport::SshTunnelGuard>,
@@ -119,14 +120,42 @@ pub(super) async fn get_session(sessions: &SessionMap, session_name: &str) -> Ar
         .clone()
 }
 
+pub(super) async fn shutdown_all_sessions(sessions: &SessionMap) {
+    let entries: Vec<Arc<SessionEntry>> = sessions.write().await.drain().map(|(_, v)| v).collect();
+    shutdown_entries(entries).await;
+}
+
+pub(super) async fn remove_sessions(sessions: &SessionMap, session_names: &[String]) {
+    if session_names.is_empty() {
+        return;
+    }
+    let entries: Vec<Arc<SessionEntry>> = {
+        let mut sessions = sessions.write().await;
+        session_names
+            .iter()
+            .filter_map(|name| sessions.remove(name))
+            .collect()
+    };
+    shutdown_entries(entries).await;
+}
+
+async fn shutdown_entries(entries: Vec<Arc<SessionEntry>>) {
+    for entry in entries {
+        let client = entry.client.lock().await.take();
+        if let Some(client) = client {
+            client.shutdown().await;
+        }
+    }
+}
+
 pub(super) async fn connect_session(cfg: &SessionConfig) -> Result<SessionClient, ExecError> {
     if crate::ssh_transport::needs_stdio_bridge(cfg) {
         let (client, bridge) = crate::ssh_transport::connect_stdio_bridge(cfg)
             .await
-            .map_err(ExecError::Connect)?;
+            .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
         let backend_pid = fetch_backend_pid(&client).await?;
         return Ok(SessionClient {
-            client,
+            client: Some(client),
             backend_pid,
             connection_task: None,
             _ssh_tunnel: None,
@@ -136,21 +165,21 @@ pub(super) async fn connect_session(cfg: &SessionConfig) -> Result<SessionClient
 
     let (connect_cfg, ssh_tunnel) = crate::ssh_transport::prepare_session(cfg)
         .await
-        .map_err(ExecError::Connect)?;
+        .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
     let pg_cfg = resolve_pg_config(&connect_cfg).map_err(ExecError::from)?;
-    let tls = make_supported_tls()
-        .map_err(|e| ExecError::Connect(format!("create TLS connector failed: {e}")))?;
-    let (client, connection) = pg_cfg
-        .connect(tls)
-        .await
-        .map_err(|e| ExecError::Connect(format!("connect failed: {e}")))?;
+    let tls = make_supported_tls().map_err(|e| {
+        ExecError::Connect(Box::new(ConnectError::new(format!(
+            "create TLS connector failed: {e}"
+        ))))
+    })?;
+    let (client, connection) = pg_cfg.connect(tls).await.map_err(map_connect_error)?;
     let connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
     let backend_pid = fetch_backend_pid(&client).await?;
 
     Ok(SessionClient {
-        client,
+        client: Some(client),
         backend_pid,
         connection_task: Some(connection_task),
         _ssh_tunnel: ssh_tunnel,
@@ -177,17 +206,27 @@ async fn cancel_backend_from_slot(slot: &CancelSlot) -> Result<bool, String> {
     let client = connect_session(&session_cfg)
         .await
         .map_err(|e| format!("pg_cancel_backend connect failed: {e:?}"))?;
-    let row = client
-        .client
-        .query_one("select pg_cancel_backend($1)", &[&backend_pid])
-        .await
-        .map_err(|e| format!("pg_cancel_backend failed: {e}"))?;
-    row.try_get(0)
-        .map_err(|e| format!("decode pg_cancel_backend result failed: {e}"))
+    let result = async {
+        let Some(pg_client) = client.client.as_ref() else {
+            return Err("pg_cancel_backend connection unavailable".to_string());
+        };
+        let row = pg_client
+            .query_one("select pg_cancel_backend($1)", &[&backend_pid])
+            .await
+            .map_err(|e| format!("pg_cancel_backend failed: {e}"))?;
+        row.try_get(0)
+            .map_err(|e| format!("decode pg_cancel_backend result failed: {e}"))
+    }
+    .await;
+    client.shutdown().await;
+    result
 }
 
 impl SessionClient {
     pub(super) fn is_closed(&self) -> bool {
+        if self.client.is_none() {
+            return true;
+        }
         self.connection_task
             .as_ref()
             .map(|task| task.is_finished())
@@ -197,6 +236,24 @@ impl SessionClient {
                 .as_ref()
                 .map(crate::ssh_transport::SshBridgeGuard::is_finished)
                 .unwrap_or(false)
+    }
+
+    pub(super) async fn shutdown(mut self) {
+        // Let tokio-postgres send Terminate; aborting the driver leaves the
+        // backend visible until TCP cleanup notices the dead client.
+        drop(self.client.take());
+        if let Some(task) = self.connection_task.take() {
+            let mut task = task;
+            if tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        if let Some(bridge) = self._ssh_bridge.take() {
+            bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
+        }
     }
 }
 

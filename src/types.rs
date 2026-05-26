@@ -151,6 +151,23 @@ pub enum Output {
         retryable: bool,
         trace: Trace,
     },
+    #[serde(rename = "error")]
+    ConnectError {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        error_code: String,
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sqlstate: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        retryable: bool,
+        trace: Trace,
+    },
     #[serde(rename = "dry_run")]
     DryRun {
         #[serde(skip_serializing_if = "Option::is_none")]

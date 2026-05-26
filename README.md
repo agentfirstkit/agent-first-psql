@@ -1,6 +1,6 @@
 # Agent-First PSQL
 
-A PostgreSQL interface for AI agents: reliable, structured, explicit, and safe by default.
+A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.
 
 ## The problem: a terminal transcript is not a database contract
 
@@ -11,7 +11,7 @@ execution, and turns many failures into prose that an agent has to guess about.
 `afpsql` gives agents a dependable PostgreSQL contract:
 
 - **Structured results.** Rows, columns, command tags, logs, and errors are emitted as machine-readable Agent-First Data events.
-- **Machine-readable failures.** PostgreSQL errors carry `SQLSTATE`; runtime/protocol failures use stable `error_code` values and actionable hints.
+- **Machine-readable failures.** PostgreSQL execution errors carry `SQLSTATE`; connection-time PostgreSQL rejections preserve SQLSTATE diagnostics on `connect_failed`; runtime/protocol failures use stable `error_code` values and actionable hints.
 - **Safe write boundary.** Native CLI and pipe mode default to PostgreSQL read-only transactions; writes must opt in with explicit permission.
 - **Predictable session state.** Pipe named sessions map to stable PostgreSQL backend sessions with FIFO execution, so temp tables, GUCs, and other session state behave predictably.
 - **No SQL guesswork.** Runtime behavior is derived from PostgreSQL metadata, not SQL-text heuristics.
@@ -98,13 +98,10 @@ Agent-First PSQL is most useful when the agent treats it as the default way to
 touch PostgreSQL, and treats human `psql` as the fallback for interactive admin
 work. Paste this to your coding agent:
 
-> Install Agent-First PSQL locally and install/load its Agent Skill. If `afpsql`
-> is missing, use `brew install agentfirstkit/tap/afpsql` or `cargo install
-> agent-first-psql`. Then read
-> https://agentfirstkit.com/agent-first-psql/docs/overview and
-> https://agentfirstkit.com/agent-first-psql/docs/agent-skill. Prefer native
-> `afpsql` for ad-hoc database work, default to read-only queries, and ask before
-> using `--permission write` or `--permission ssh-write`. If I ask to replace
+> Ensure `afpsql` is installed locally (`brew install agentfirstkit/tap/afpsql`
+> or `cargo install agent-first-psql` if missing). Then run
+> `afpsql skill install` and verify `afpsql skill status`. After that, follow
+> the installed Agent-First PSQL skill for PostgreSQL work. If I ask to replace
 > non-interactive `psql`, run `afpsql psql install` and verify
 > `afpsql psql status` reports `active_in_path: true`.
 
@@ -115,9 +112,14 @@ brew install agentfirstkit/tap/afpsql   # macOS / Linux
 cargo install agent-first-psql          # any platform
 ```
 
-For agents with local skill support, install or load the
-[Agent Skill](skills/agent-first-psql.md) so the permission and session rules
-travel with the tool.
+For agents with local skill support, install the embedded
+[Agent Skill](skills/agent-first-psql.md) from the binary:
+
+```bash
+afpsql skill status
+afpsql skill install
+afpsql skill status
+```
 
 To replace `psql` for non-interactive scripts:
 

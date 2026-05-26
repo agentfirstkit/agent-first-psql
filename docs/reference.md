@@ -237,6 +237,10 @@ Client/runtime/protocol error.
 | `id` | optional related query id |
 | `error_code` | machine-readable code |
 | `error` | human-readable detail |
+| `sqlstate` | optional SQLSTATE when PostgreSQL rejects connection setup |
+| `message` | optional PostgreSQL primary message for connection setup failures |
+| `detail` | optional PostgreSQL detail for connection setup failures |
+| `hint` | optional remediation hint |
 | `retryable` | whether retry may succeed |
 | `trace` | timing and counters |
 
@@ -247,6 +251,12 @@ Canonical `error_code` values:
 - `connect_failed`
 - `result_too_large`
 - `cancelled`
+
+For connection setup failures, `code` remains `"error"` and `error_code` remains
+`"connect_failed"`. If PostgreSQL returns a server diagnostic during startup
+(for example password auth failure, missing role/database, too many connections,
+or cannot-connect-now), `afpsql` also includes `sqlstate` plus PostgreSQL
+diagnostic fields and a SQLSTATE-specific `hint`.
 
 ### Other output codes
 

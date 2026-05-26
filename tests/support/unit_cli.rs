@@ -128,6 +128,38 @@ fn clap_accepts_psql_admin_subcommands() {
 }
 
 #[test]
+fn clap_accepts_skill_admin_subcommands() {
+    let cli_res = AfdCli::try_parse_from([
+        "afpsql",
+        "skill",
+        "install",
+        "--agent",
+        "claude-code",
+        "--scope",
+        "project",
+        "--force",
+    ]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert!(matches!(
+            cli.command,
+            Some(AfdCommand::Skill(SkillCommand {
+                action: SkillCliAction::Install(_)
+            }))
+        ));
+    }
+}
+
+#[test]
+fn clap_accepts_global_output_after_admin_subcommands() {
+    let cli_res = AfdCli::try_parse_from(["afpsql", "skill", "status", "--output", "yaml"]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert_eq!(cli.output, "yaml");
+    }
+}
+
+#[test]
 fn clap_accepts_ssh_transport_flags() {
     let cli_res = AfdCli::try_parse_from([
         "afpsql",

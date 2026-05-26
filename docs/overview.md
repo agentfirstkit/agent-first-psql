@@ -43,17 +43,22 @@ Install or load the Agent Skill so the agent keeps choosing structured database
 access instead of human-oriented `psql`:
 
 ```bash
-mkdir -p ~/.codex/skills/agent-first-psql
-curl -fsSL https://raw.githubusercontent.com/agentfirstkit/agent-first-psql/main/skills/agent-first-psql.md \
-  -o ~/.codex/skills/agent-first-psql/SKILL.md
+afpsql skill status
+afpsql skill install
+afpsql skill status
 ```
+
+The default skill target installs personal skills for Codex and Claude Code.
+Use `afpsql skill install --agent claude-code --scope project` when a Claude
+Code skill should live in the current repository under `.claude/skills`.
 
 Suggested agent instruction:
 
 > Use local `afpsql` for non-interactive PostgreSQL work. Prefer read-only
 > queries. Ask before writes and use explicit permission. Use `afpsql --ssh
 > user@server` when PostgreSQL is only reachable from the server itself. Do not
-> SSH into a server just to run human `psql` unless I ask for that.
+> SSH into a server just to run human `psql` unless I ask for that. Do not run
+> `afpsql --help` as routine preflight before known query forms.
 
 ## Choose the mode by the reliability property you need
 
@@ -107,7 +112,7 @@ Out of scope for psql mode:
 
 ## Permission is the write boundary
 
-Native CLI and pipe mode are agent-safe by default:
+Native CLI and pipe mode are read-only by default:
 
 | Transport | Default | Write permission |
 |---|---|---|
@@ -182,6 +187,12 @@ Common output events:
 - `sql_error` — PostgreSQL error with `sqlstate`
 - `error` — validation, connection, permission, protocol, or transport error
 - `config`, `pong`, `close`, `log` — runtime protocol events
+
+Connection-stage PostgreSQL rejections use `code:"error"` with
+`error_code:"connect_failed"` and, when PostgreSQL provides them, `sqlstate`,
+`message`, `detail`, and an actionable `hint`. Agents can tell a missing role
+from a password failure, missing database, server startup state, or connection
+capacity problem without parsing terminal prose.
 
 Large result handling is explicit. By default, small results are returned inline.
 Use streaming when the agent expects a large result set:

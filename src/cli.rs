@@ -32,6 +32,7 @@ pub enum Mode {
     Cli(CliRequest),
     Pipe(PipeInit),
     PsqlAdmin(PsqlAdminRequest),
+    SkillAdmin(SkillAdminRequest),
     PsqlUnsupported(PsqlUnsupportedRequest),
 }
 
@@ -55,6 +56,46 @@ pub enum PsqlAdminAction {
     Status { bin_dir: Option<String> },
     Install { bin_dir: Option<String> },
     Uninstall { bin_dir: Option<String> },
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillAdminRequest {
+    pub action: SkillAdminAction,
+    pub output: OutputFormat,
+}
+
+#[derive(Debug, Clone)]
+pub enum SkillAdminAction {
+    Status(SkillAdminOptions),
+    Install(SkillAdminOptions),
+    Uninstall(SkillAdminOptions),
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillAdminOptions {
+    pub agent: SkillAgentSelection,
+    pub scope: SkillScope,
+    pub skills_dir: Option<String>,
+    pub force: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SkillAgentSelection {
+    /// Manage both Codex and Claude Code personal skills.
+    All,
+    /// Manage the Codex local skill under $CODEX_HOME/skills.
+    Codex,
+    /// Manage the Claude Code skill under ~/.claude/skills or .claude/skills.
+    #[value(name = "claude-code", alias = "claude")]
+    ClaudeCode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SkillScope {
+    /// Install under the user-level skills directory.
+    Personal,
+    /// Install under the current project's skills directory.
+    Project,
 }
 
 pub struct CliRequest {
@@ -88,6 +129,8 @@ enum RuntimeMode {
 enum AfdCommand {
     /// Manage the local psql wrapper for afpsql --mode psql.
     Psql(PsqlCommand),
+    /// Manage Agent-First PSQL skills for Codex and Claude Code.
+    Skill(SkillCommand),
 }
 
 #[derive(Args)]
@@ -111,6 +154,44 @@ struct PsqlPathArgs {
     /// Directory that contains the psql wrapper. Defaults to the afpsql executable directory.
     #[arg(long = "bin-dir")]
     bin_dir: Option<String>,
+}
+
+#[derive(Args)]
+struct SkillCommand {
+    #[command(subcommand)]
+    action: SkillCliAction,
+}
+
+#[derive(Subcommand)]
+enum SkillCliAction {
+    /// Show whether the Agent-First PSQL skill is installed and valid.
+    Status(SkillTargetArgs),
+    /// Install the Agent-First PSQL skill.
+    Install(SkillWriteArgs),
+    /// Remove an afpsql-managed Agent-First PSQL skill.
+    Uninstall(SkillWriteArgs),
+}
+
+#[derive(Args)]
+struct SkillTargetArgs {
+    /// Agent to manage. Defaults to all personal skill targets.
+    #[arg(long = "agent", value_enum, default_value_t = SkillAgentSelection::All)]
+    agent: SkillAgentSelection,
+    /// Skill scope. Project scope is supported for Claude Code only.
+    #[arg(long = "scope", value_enum, default_value_t = SkillScope::Personal)]
+    scope: SkillScope,
+    /// Directory that contains skill folders. Requires an explicit single --agent.
+    #[arg(long = "skills-dir")]
+    skills_dir: Option<String>,
+}
+
+#[derive(Args)]
+struct SkillWriteArgs {
+    #[command(flatten)]
+    target: SkillTargetArgs,
+    /// Overwrite or remove an unmanaged Agent-First PSQL skill at the target path.
+    #[arg(long)]
+    force: bool,
 }
 
 #[doc = r#"Agent-First PostgreSQL client.
@@ -160,6 +241,8 @@ afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
 afpsql psql status
 afpsql psql install
+afpsql skill status
+afpsql skill install
 ```
 
 ### Exit Codes
@@ -255,7 +338,7 @@ pub struct AfdCli {
     ssh_sudo_user: Option<String>,
 
     /// Output format: json (default), yaml, or plain.
-    #[arg(long, default_value = "json", help_heading = "Runtime")]
+    #[arg(long, default_value = "json", global = true, help_heading = "Runtime")]
     output: String,
     /// Diagnostic log categories.
     #[arg(long = "log", value_delimiter = ',', help_heading = "Runtime")]
@@ -353,6 +436,10 @@ pub fn parse_args() -> Result<Mode, String> {
         return Ok(match command {
             AfdCommand::Psql(psql) => Mode::PsqlAdmin(PsqlAdminRequest {
                 action: psql_admin_action(psql.action),
+                output,
+            }),
+            AfdCommand::Skill(skill) => Mode::SkillAdmin(SkillAdminRequest {
+                action: skill_admin_action(skill.action),
                 output,
             }),
         });
@@ -1016,6 +1103,27 @@ fn psql_admin_action(action: PsqlCliAction) -> PsqlAdminAction {
         PsqlCliAction::Uninstall(args) => PsqlAdminAction::Uninstall {
             bin_dir: args.bin_dir,
         },
+    }
+}
+
+fn skill_admin_action(action: SkillCliAction) -> SkillAdminAction {
+    match action {
+        SkillCliAction::Status(args) => SkillAdminAction::Status(skill_options(args, false)),
+        SkillCliAction::Install(args) => {
+            SkillAdminAction::Install(skill_options(args.target, args.force))
+        }
+        SkillCliAction::Uninstall(args) => {
+            SkillAdminAction::Uninstall(skill_options(args.target, args.force))
+        }
+    }
+}
+
+fn skill_options(args: SkillTargetArgs, force: bool) -> SkillAdminOptions {
+    SkillAdminOptions {
+        agent: args.agent,
+        scope: args.scope,
+        skills_dir: args.skills_dir,
+        force,
     }
 }
 

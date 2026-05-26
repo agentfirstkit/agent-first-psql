@@ -76,11 +76,15 @@ pub async fn run(req: crate::cli::CliRequest) {
     )
     .await;
 
+    app.executor.shutdown().await;
     drop(app);
 
     let mut had_error = false;
     while let Some(event) = rx.recv().await {
-        if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
+        if matches!(
+            event,
+            Output::Error { .. } | Output::ConnectError { .. } | Output::SqlError { .. }
+        ) {
             had_error = true;
         }
         sink.emit(&event);

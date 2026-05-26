@@ -2,10 +2,10 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
-  "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and safe by default.",
+  "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
   "intent": [
     "Give AI agents a persistent PostgreSQL client that reuses long-lived database connections and sessions, so agents send SQL requests as JSONL and receive structured JSONL responses without managing connection setup",
     "Bridge ad-hoc psql shell usage and protocol-specific integrations by providing transport-neutral, agent-native request and response framing",
@@ -13,18 +13,10 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Add SSH transport (--ssh) so afpsql can run locally against PostgreSQL listening only on a remote loopback.",
-    "Make write permission explicit with --permission read|write|ssh-read|ssh-write; reads are the default.",
-    "Require explicit sudo bridge socket path for sudo-based SSH auth.",
-    "Harden pipe mode: stricter config validation, SSH tunnel checks, savepoint stream draining, duplicate-column rejection.",
-    "Pin named pipe sessions to stable PostgreSQL backend sessions with FIFO execution for predictable session state.",
-    "Tighten CLI input limits, result limits, and startup logging so argv and secrets no longer leak.",
-    "Adopt afdata's redaction options for consistent secret scrubbing across the toolkit.",
-    "Render psql result rows raw to preserve structured values.",
-    "Add --mode psql covering common non-interactive psql flags so existing scripts can swap in afpsql.",
-    "Add the afpsql Agent Skill so coding agents pick up read-by-default and SQLSTATE-based error handling.",
-    "Document the psql wrapper workflow (afpsql psql install/status) and reframe README around the reliability contract.",
-    "Harden release packaging to drop local path deps and stale workspace metadata."
+    "Add `afpsql skill install/status/uninstall` to ship an embedded Agent-First PSQL skill for Claude Code and Codex, so permission and session rules travel with the binary",
+    "Preserve PostgreSQL SQLSTATE plus message/detail/hint on `connect_failed`, so agents can distinguish auth, role, database, capacity, and startup failures without parsing prose",
+    "Tighten skill guidance: skip routine `afpsql --help` preflight before known query forms, and retry sandbox-blocked local connections once with approval before changing host/user/SQL",
+    "Rename the project synopsis from \"safe by default\" to \"read-only by default\" to make the write boundary explicit"
   ],
   "bonds": [
     {
