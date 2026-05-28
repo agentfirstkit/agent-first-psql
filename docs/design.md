@@ -18,8 +18,8 @@ creates brittle automation:
 1. Results are rendered as text tables instead of typed records.
 2. Errors are prose instead of structured data with stable codes.
 3. Writes can happen accidentally when a generated SQL statement is wrong.
-4. Remote access often pushes agents toward SSHing into servers and running
-   human `psql` commands.
+4. Remote/container access often pushes agents toward SSHing into servers or
+   using container exec commands for human `psql`.
 5. Stateful multi-step work is unclear when every command opens an unrelated
    backend session.
 6. Large results can flood stdout instead of using a bounded protocol.
@@ -59,7 +59,9 @@ Non-goals:
 7. Session state is explicit: pipe named sessions are stable backend sessions.
 8. Per-session query execution is FIFO.
 9. Runtime behavior is based on PostgreSQL metadata, not SQL-text heuristics.
-10. `psql mode` is compatibility translation only; it does not fork runtime semantics.
+10. SSH and container boundaries are first-class transports, including
+    `--ssh + --container` for containers on SSH hosts.
+11. `psql mode` is compatibility translation only; it does not fork runtime semantics.
 
 ## Execution architecture: translate inputs, preserve one contract
 
@@ -70,7 +72,8 @@ High-level layering:
 - Handler resolves session config, permissions, timeouts, cancellation, and output routing.
 - `DbExecutor` is the database adapter boundary.
 - PostgreSQL execution uses `tokio-postgres` and transaction settings derived from resolved options.
-- SSH transport is an implementation detail of session connection setup.
+- SSH and container transports are first-class connection setup paths that still
+  feed the same runtime protocol.
 
 The user-facing model should stay simple: an agent sends SQL plus params and gets
 structured events back.
@@ -83,17 +86,23 @@ Native CLI and pipe mode resolve a `permission` value for each query:
 |---|---|---|
 | direct PostgreSQL connection | `read` | `write` |
 | afpsql SSH transport | `ssh-read` | `ssh-write` |
+| afpsql container transport | `container-read` | `container-write` |
 
-`read` and `ssh-read` start PostgreSQL read-only transactions. A write attempt in
+Read permissions start PostgreSQL read-only transactions. A write attempt in
 that transaction fails as a `sql_error` with SQLSTATE `25006`.
 
 Permission values are intentionally tied to transport:
 
 - direct sessions accept only `read` or `write`
 - afpsql SSH sessions accept only `ssh-read` or `ssh-write`
+- afpsql container sessions accept only `container-read` or `container-write`
 
 Mismatches fail before execution as `invalid_request` with a hint that tells the
 agent which permission family to use.
+
+`--ssh` and `--container` can be combined to run the selected container driver
+on the SSH host. The database boundary is still the container, so the session
+uses container permissions rather than SSH permissions.
 
 `psql mode` keeps psql's writable default for script compatibility and does not
 expose native permission flags.
@@ -125,6 +134,7 @@ Input commands:
 - `config`
 - `ping`
 - `close`
+- `session_info`
 
 Output events:
 
@@ -137,6 +147,7 @@ Output events:
 - `config`
 - `pong`
 - `close`
+- `session_info`
 - `log`
 
 Every recoverable runtime condition should be represented by one of these stdout
@@ -248,3 +259,37 @@ It must reject or mark unsupported:
 - Avoid destructive changes to session state on config updates until active work is safe.
 - Keep generated CLI docs in sync with `--help-markdown`.
 - Preserve `clippy.toml` bans that prevent SQL keyword scanning and stderr protocol leaks.
+
+## Skill design: behavior, not flag reference
+
+`skills/agent-first-psql.md` is loaded by Claude Code and Codex as the agent's
+behavior contract when working with afpsql. Its audience is users of the
+installed binary — the source tree and `docs/reference.md` may not be present on
+the user's machine, but `afpsql --help` always is. The skill is shaped around
+that asymmetry.
+
+Keep in the skill:
+
+- behavior rules (defaults, what to do / not do)
+- decision rules (when to use which mode, permission, or transport)
+- recovery rules (specific `SQLSTATE` or `error_code` → action)
+- non-obvious defaults the agent would otherwise miss (e.g. read-only default,
+  libpq `PG*` env silently filling missing fields)
+- a small set of canonical examples that establish the pattern
+
+Drop from the skill:
+
+- flag enumerations
+- driver / option matrices
+- env-var lists beyond the few that change agent behavior
+- full canonical command variants for every transport combination
+
+For anything in the "drop" list, the agent runs `afpsql --help` or
+`afpsql --help-markdown` to discover the current flag surface. Mirroring
+`--help` content into the skill makes it rot every release, bloats agent
+context, and trains the agent on stale flag names.
+
+This sits alongside the existing "skip routine `afpsql --help` preflight before
+known query forms" guidance: the agent should not help-probe for **known** query
+shapes, but should help-probe for **unknown** flag detail rather than reading it
+from the skill.

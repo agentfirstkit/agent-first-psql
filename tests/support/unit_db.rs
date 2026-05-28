@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{ColumnInfo, QueryOptions, RuntimeConfig};
+use crate::types::{ColumnInfo, ContainerConfig, QueryOptions, RuntimeConfig, SshConfig};
 
 #[path = "env.rs"]
 mod test_env;
@@ -72,6 +72,34 @@ fn anynull_to_sql() {
     }
 }
 
+#[test]
+fn transport_chain_summary_reports_selected_chain() {
+    let cfg = SessionConfig {
+        ssh: SshConfig {
+            destination: Some("root@example.com".to_string()),
+            ..Default::default()
+        },
+        container: ContainerConfig {
+            target: Some("app-pod".to_string()),
+            driver: Some("kubectl".to_string()),
+            pod_container: Some("postgres".to_string()),
+            ..Default::default()
+        },
+        host: Some("127.0.0.1".to_string()),
+        port: Some(5432),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        super::session::transport_chain_summary(&cfg, true),
+        "ssh:root@example.com -> kubectl exec app-pod -c postgres -> tcp 127.0.0.1:5432"
+    );
+    assert_eq!(
+        super::session::transport_chain_summary(&cfg, false),
+        "ssh -> kubectl exec -> tcp"
+    );
+}
+
 #[tokio::test]
 async fn postgres_executor_connect_error() {
     let exec = PostgresExecutor::new();
@@ -87,6 +115,7 @@ async fn postgres_executor_connect_error() {
             params: &[],
             opts: &test_options(),
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert!(matches!(out, Err(ExecError::Connect(_))));
@@ -107,6 +136,7 @@ async fn postgres_executor_rejects_unsupported_tls_config() {
             params: &[],
             opts: &test_options(),
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
 
@@ -163,6 +193,7 @@ async fn query_rows(
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await?
     {
@@ -188,6 +219,7 @@ async fn execute_command(
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await?
     {
@@ -243,6 +275,7 @@ async fn postgres_executor_success_and_sql_error() {
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert!(out_res.is_ok());
@@ -258,6 +291,7 @@ async fn postgres_executor_success_and_sql_error() {
             params: &[Value::String("x".to_string())],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert!(matches!(err, Err(ExecError::InvalidParams(_))));
@@ -270,6 +304,7 @@ async fn postgres_executor_success_and_sql_error() {
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert!(matches!(err, Err(ExecError::Sql { .. })));
@@ -476,6 +511,7 @@ async fn postgres_executor_rejects_duplicate_result_columns() {
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert_duplicate_column_error(out, "`id`");
@@ -488,6 +524,7 @@ async fn postgres_executor_rejects_duplicate_result_columns() {
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert_duplicate_column_error(out, "`id`");
@@ -500,6 +537,7 @@ async fn postgres_executor_rejects_duplicate_result_columns() {
             params: &[],
             opts: &opts,
             cancel_slot: None,
+            transport_log: None,
         })
         .await;
     assert!(matches!(out, Ok(ExecOutcome::Rows { .. })));
@@ -557,6 +595,7 @@ async fn postgres_executor_streams_large_wrapped_result() {
                 params: &[],
                 opts: &opts,
                 cancel_slot: None,
+                transport_log: None,
             },
             &mut sink,
         ),

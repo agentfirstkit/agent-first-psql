@@ -14,6 +14,17 @@ fn has_session_override_true_for_host() {
 }
 
 #[test]
+fn has_session_override_true_for_container() {
+    assert!(has_session_override(&SessionConfig {
+        container: ContainerConfig {
+            target: Some("pg".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+}
+
+#[test]
 fn build_startup_log_has_afdata_fields() {
     let out = build_startup_log(
         Some("default"),

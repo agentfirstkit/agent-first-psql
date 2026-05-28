@@ -25,8 +25,8 @@ This document contains the help content for the `afpsql` command-line program.
 Agent-First PostgreSQL client.
 
 `afpsql` gives agents a reliable PostgreSQL contract: structured stdout
-events, explicit write permissions, stable pipe sessions, and machine-readable
-failures.
+events, first-class SSH/container transports, explicit write permissions,
+stable pipe sessions, and machine-readable failures.
 
 ### Interface Policy
 
@@ -34,6 +34,7 @@ failures.
 - `--mode psql` is argument translation only; runtime output stays JSONL
 - stdout carries protocol events; stderr is not a protocol channel
 - native CLI and pipe mode default to read-only transactions; writes require permission
+- SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
 ### Query Sources and Parameters
 
@@ -46,7 +47,11 @@ failures.
 - `--dsn-secret` for a PostgreSQL URI
 - `--conninfo-secret` for libpq-style conninfo
 - or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
-- add `--ssh user@server` when PostgreSQL is reachable only from the server
+- add `--ssh user@server` when PostgreSQL is reachable only from the server boundary
+- add `--container TARGET` when PostgreSQL is reachable only from inside a container boundary
+- use named container scope flags instead of raw driver option passthrough
+- use `--container-driver docker|podman|nerdctl|compose|kubectl` for the exec syntax
+- combine `--ssh user@server --container TARGET` for containers on an SSH host
 - agent-first environment fallbacks: `AFPSQL_*`
 - PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`
 
@@ -64,6 +69,8 @@ afpsql --sql-file ./query.sql
 afpsql --sql "select * from users where id = $1" --param 1=123
 afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
 afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
+afpsql --container pg-container --dsn-secret-env DATABASE_URL --sql "select 1"
+afpsql --ssh root@server --container app --host host.container.internal --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
@@ -98,7 +105,7 @@ afpsql skill install
 * `--lock-timeout-ms <LOCK_TIMEOUT_MS>` — Per-query lock timeout in milliseconds
 * `--inline-max-rows <INLINE_MAX_ROWS>` — Maximum inline rows before returning `result_too_large`
 * `--inline-max-bytes <INLINE_MAX_BYTES>` — Maximum inline payload bytes before returning `result_too_large`
-* `--permission <PERMISSION>` — Query permission: read, write, ssh-read, or ssh-write. Defaults to read, or ssh-read with --ssh
+* `--permission <PERMISSION>` — Query permission: read, write, ssh-read, ssh-write, container-read, or container-write. Defaults to read, ssh-read with --ssh, or container-read with --container
 * `--dry-run` — Preview the query without executing it
 * `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
 * `--dsn-secret-env <DSN_SECRET_ENV>` — Read PostgreSQL DSN URI from an environment variable
@@ -115,6 +122,15 @@ afpsql skill install
 * `--ssh-local-port <SSH_LOCAL_PORT>` — Local bind port for the SSH tunnel. Defaults to an ephemeral port
 * `--ssh-remote-socket <SSH_REMOTE_SOCKET>` — Explicit remote PostgreSQL Unix socket path for SSH forwarding
 * `--ssh-sudo-user <SSH_SUDO_USER>` — Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket
+* `--container <CONTAINER>` — Run a container exec stdio bridge in TARGET before connecting to PostgreSQL
+* `--container-driver <CONTAINER_DRIVER>` — Container exec driver: docker, podman, nerdctl, compose, or kubectl
+* `--container-runtime <CONTAINER_RUNTIME>` — Runtime command for the selected container driver. Defaults to the driver command
+* `--container-user <CONTAINER_USER>` — OS user passed to drivers that support exec user selection
+* `--container-namespace <CONTAINER_NAMESPACE>` — Kubernetes namespace for kubectl exec
+* `--container-context <CONTAINER_CONTEXT>` — Docker or Kubernetes context for the selected driver
+* `--container-compose-file <CONTAINER_COMPOSE_FILES>` — Compose file passed before compose exec. Repeat for multiple files
+* `--container-compose-project <CONTAINER_COMPOSE_PROJECT>` — Compose project name passed before compose exec
+* `--container-pod-container <CONTAINER_POD_CONTAINER>` — Kubernetes container name for multi-container pods
 * `--output <OUTPUT>` — Output format: json (default), yaml, or plain
 
   Default value: `json`

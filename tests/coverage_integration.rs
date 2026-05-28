@@ -133,6 +133,7 @@ fn has_session_override_each_field_in_pipe_mode() {
         vec!["--user", "roger"],
         vec!["--dbname", "postgres"],
         vec!["--password-secret", "pw"],
+        vec!["--container", "pg"],
     ] {
         let payload = serde_json::json!({"code":"close"}).to_string() + "\n";
         let mut cmd = Command::new(bin());

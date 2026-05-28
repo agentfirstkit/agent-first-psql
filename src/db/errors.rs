@@ -176,6 +176,9 @@ fn connect_hint_for_message(message: &str) -> Option<String> {
     if message.contains("SSH transport currently supports discrete connection fields") {
         return Some("with --ssh, pass discrete connection fields such as --host/--port/--user/--dbname/--password-secret-env instead of --dsn-secret or --conninfo-secret".to_string());
     }
+    if message.contains("container bridge") || message.contains("container transport") {
+        return Some("check the container target, runtime access, driver selection, and whether PostgreSQL is listening on the requested container-internal host/port or socket".to_string());
+    }
     if message.contains("explicit remote PostgreSQL Unix socket") {
         return Some("pass --ssh-remote-socket /var/run/postgresql/.s.PGSQL.5432, or set --host/PGHOST to the remote socket directory when not using sudo bridge mode".to_string());
     }
@@ -195,7 +198,7 @@ fn connect_retryable_for_message(message: &str) -> bool {
 }
 
 fn default_connect_hint() -> String {
-    "check --host/--port or PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
+    "check --host/--port or PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server; for container-local PostgreSQL use --container TARGET; for containers on an SSH host combine --ssh user@server --container TARGET; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
 }
 
 #[cfg(test)]

@@ -193,12 +193,71 @@ fn clap_accepts_ssh_transport_flags() {
 }
 
 #[test]
-fn clap_accepts_permission_flag() {
-    let cli_res =
-        AfdCli::try_parse_from(["afpsql", "--permission", "ssh-write", "--sql", "select 1"]);
+fn clap_accepts_container_transport_flags() {
+    let cli_res = AfdCli::try_parse_from([
+        "afpsql",
+        "--container",
+        "pg",
+        "--container-driver",
+        "kubectl",
+        "--container-namespace",
+        "prod",
+        "--container-context",
+        "cluster-a",
+        "--container-pod-container",
+        "postgres",
+        "--container-user",
+        "postgres",
+        "--sql",
+        "select 1",
+    ]);
     assert!(cli_res.is_ok());
     if let Ok(cli) = cli_res {
-        assert_eq!(cli.permission, Some(Permission::SshWrite));
+        assert_eq!(cli.container.as_deref(), Some("pg"));
+        assert_eq!(cli.container_driver.as_deref(), Some("kubectl"));
+        assert_eq!(cli.container_namespace.as_deref(), Some("prod"));
+        assert_eq!(cli.container_context.as_deref(), Some("cluster-a"));
+        assert_eq!(cli.container_pod_container.as_deref(), Some("postgres"));
+        assert_eq!(cli.container_user.as_deref(), Some("postgres"));
+    }
+}
+
+#[test]
+fn clap_accepts_ssh_plus_container_transport_flags() {
+    let cli_res = AfdCli::try_parse_from([
+        "afpsql",
+        "--ssh",
+        "root@example.com",
+        "--ssh-option",
+        "ProxyJump=bastion",
+        "--container",
+        "pg",
+        "--container-driver",
+        "podman",
+        "--sql",
+        "select 1",
+    ]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert_eq!(cli.ssh.as_deref(), Some("root@example.com"));
+        assert_eq!(cli.ssh_options, vec!["ProxyJump=bastion".to_string()]);
+        assert_eq!(cli.container.as_deref(), Some("pg"));
+        assert_eq!(cli.container_driver.as_deref(), Some("podman"));
+    }
+}
+
+#[test]
+fn clap_accepts_permission_flag() {
+    let cli_res = AfdCli::try_parse_from([
+        "afpsql",
+        "--permission",
+        "container-write",
+        "--sql",
+        "select 1",
+    ]);
+    assert!(cli_res.is_ok());
+    if let Ok(cli) = cli_res {
+        assert_eq!(cli.permission, Some(Permission::ContainerWrite));
     }
 }
 
@@ -511,6 +570,43 @@ fn parse_psql_mode_dsn_and_errors() {
     assert!(err_res.is_err());
     if let Err(err) = err_res {
         assert!(err.contains("unsupported psql-mode argument"));
+    }
+}
+
+#[test]
+fn parse_psql_mode_accepts_container_transport() {
+    let raw = vec![
+        "afpsql".to_string(),
+        "--mode".to_string(),
+        "psql".to_string(),
+        "--container".to_string(),
+        "pg".to_string(),
+        "--container-driver".to_string(),
+        "compose".to_string(),
+        "--container-compose-file".to_string(),
+        "compose.yml".to_string(),
+        "--container-compose-project".to_string(),
+        "demo".to_string(),
+        "--container-user".to_string(),
+        "postgres".to_string(),
+        "-c".to_string(),
+        "select 1".to_string(),
+    ];
+    let mode_res = parse_psql_mode(&raw);
+    assert!(mode_res.is_ok());
+    if let Ok(Mode::Cli(req)) = mode_res {
+        assert_eq!(req.session.container.target.as_deref(), Some("pg"));
+        assert_eq!(req.session.container.driver.as_deref(), Some("compose"));
+        assert_eq!(
+            req.session.container.compose_files,
+            vec!["compose.yml".to_string()]
+        );
+        assert_eq!(
+            req.session.container.compose_project.as_deref(),
+            Some("demo")
+        );
+        assert_eq!(req.session.container.user.as_deref(), Some("postgres"));
+        assert_eq!(req.options.permission, Some(Permission::ContainerWrite));
     }
 }
 

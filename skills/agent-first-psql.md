@@ -1,70 +1,55 @@
 ---
 name: agent-first-psql
-description: "Use Agent-First PSQL for reliable agent/script PostgreSQL access: structured stdout events, explicit read/write permissions, stable pipe sessions, psql-compatible non-interactive translation, SSH transport, secret handling, and SQLSTATE-aware troubleshooting."
+description: "Reliable agent/script access to PostgreSQL via structured stdout events, explicit read/write permissions, and SSH/container transports. Use instead of parsing human psql output or SSHing in to run psql."
 disable-model-invocation: true
-allowed-tools: Bash, Read, Edit, Write, Glob, Grep
+allowed-tools: Bash, Read
 ---
 
 # Agent-First PSQL
 
-Use this skill when an agent needs to query PostgreSQL, run non-interactive
-PostgreSQL scripts, preserve database session state, or connect to PostgreSQL
-that is reachable only from a remote server.
+Use this skill when an agent needs PostgreSQL access that is structured,
+read-only by default, safe for scripts, or reachable only across SSH/container
+boundaries. Prefer `afpsql` over parsing human `psql` tables, SSHing in to run
+`psql`, or `docker exec`/`kubectl exec` with human output.
 
-`afpsql` is for agent reliability, not for human terminal interaction and not as
-a high-performance pooler. Prefer a predictable structured contract over parsing
-`psql` tables or SSHing into a server to run human commands.
+For flag-level detail, run `afpsql --help` or `afpsql --help-markdown`. This
+skill covers behavior, decisions, and recovery only.
 
 ## Core Rules
 
-- Prefer local `afpsql` for agent/script database work; do not SSH into a server
-  just to run human-oriented `psql` unless the user explicitly asks.
-- For routine SQL work, do not run `afpsql --help` as a preflight. Use the
-  canonical command forms in this skill. Run `--help` only when the user asks,
-  when troubleshooting an unknown flag, or when updating afpsql itself.
-- The setup checklist is only for installation/preparation tasks. Do not rerun
-  setup checks such as `afpsql --version` before every database query if
-  `afpsql` is already known to be installed.
-- Treat stdout as the protocol: parse `code:"result"`, `code:"sql_error"`,
-  `code:"error"`, and other Agent-First Data events instead of human text.
-- Default to read-only queries. Native CLI and pipe mode are read-only unless a
-  write permission is explicitly requested.
-- Ask or verify intent before writes. Use `--permission write` for direct writes
-  and `--permission ssh-write` for writes through afpsql SSH transport.
-- Do not add permission flags to psql-compatible mode. It preserves psql's
-  writable default for script compatibility and does not expose afpsql SSH
-  transport extensions.
-- Use `$1..$N` placeholders and `--param N=value` / `params` for dynamic values.
-  Do not interpolate user data into SQL text.
-- Branch on `sql_error.sqlstate` when handling database failures.
-- Use pipe mode/named sessions when PostgreSQL session state matters; queries in
-  the same session are FIFO and should preserve backend session state until
-  invalidation or shutdown.
-- Keep secret names compatible with PostgreSQL conventions. Use `PGPASSWORD` as
-  the env var name; do not invent `PGPASSWORD_SECRET`.
-- In sandboxed coding agents, a direct local TCP database query may need
-  command approval. If an otherwise-correct read-only `afpsql` query returns
-  an immediate `connect_failed` and the same command can be rerun with approval,
-  retry the same command once with approval before changing host, port, user, or
-  SQL. Do not run `afpsql --help` to diagnose that case.
+- Treat stdout as the protocol: parse Agent-First Data events such as
+  `code:"result"`, `code:"sql_error"`, and `code:"error"`.
+- Default to read-only. Native CLI and pipe mode require explicit write
+  permissions: `write`, `ssh-write`, or `container-write`.
+- Use `--ssh`, `--container`, or `--ssh + --container` as afpsql transports;
+  keep afpsql local unless the user explicitly asks for server-side tools.
+- Use `$1..$N` placeholders plus `--param N=value` / JSON `params`; do not
+  interpolate user data into SQL text.
+- Branch on `sql_error.sqlstate` for database failures; do not scrape message
+  text when SQLSTATE is present.
+- Use pipe mode and named sessions when transaction/session state, FIFO query
+  ordering, cancellation, or streaming matters.
+- In pipe mode, send `{"code":"session_info","session":"NAME"}` once before
+  running queries to discover that session's `transport_kind`, `permission_default`,
+  inline/batch limits, stream default, and timeouts; this avoids probing limits
+  with failing queries.
+- Keep PostgreSQL secret env names conventional (`PGPASSWORD`, `DATABASE_URL`);
+  do not invent names such as `PGPASSWORD_SECRET`.
+- In sandboxed agents, if a known-good local TCP read returns immediate
+  `connect_failed`, rerun once with approval if available before changing SQL or
+  connection details.
 
 ## Setup Checklist
 
-When asked to prepare a machine for PostgreSQL agent work:
-
-1. Install or verify `afpsql` on the machine where the agent runs:
+Only run setup when asked to prepare or repair the machine; do not run it before
+every query.
 
 ```bash
 afpsql --version || brew install agentfirstkit/tap/afpsql
+cargo install agent-first-psql  # fallback when Homebrew is unavailable
 ```
 
-If Homebrew is unavailable, use:
-
-```bash
-cargo install agent-first-psql
-```
-
-2. Install this skill if the agent supports local skills:
+Install/update local skills:
 
 ```bash
 afpsql skill status
@@ -72,216 +57,102 @@ afpsql skill install
 afpsql skill status
 ```
 
-The default skill target installs personal skills for Codex and Claude Code.
-For a Claude Code project-local skill, use:
-
-```bash
-afpsql skill install --agent claude-code --scope project
-afpsql skill status --agent claude-code --scope project
-```
-
-3. If the user wants existing non-interactive scripts to call `psql`, install
-   the managed wrapper and verify `active_in_path: true`:
+Install the managed non-interactive `psql` wrapper only when the user wants
+existing scripts to invoke `psql` but receive structured afpsql output:
 
 ```bash
 afpsql psql install
 afpsql psql status
 ```
-
-Do not install afpsql on a database server only to query local PostgreSQL there;
-prefer local afpsql with `--ssh user@server`.
-
-## Basic Agent Usage
-
-Read query, native flags:
-
-```bash
-afpsql --host 127.0.0.1 --port 5432 --user app --dbname appdb \
-  --sql "select id, status from jobs where id = $1" \
-  --param 1=123
-```
-
-Direct write after confirming intent:
-
-```bash
-afpsql --permission write \
-  --host 127.0.0.1 --port 5432 --user app --dbname appdb \
-  --sql "update jobs set checked_at = now() where id = $1" \
-  --param 1=123
-```
-
-psql-compatible translation for scripts:
-
-```bash
-afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
-```
-
-Long-running agent sessions should use pipe mode when ordering, cancellation,
-streaming, or PostgreSQL session state matters. Do not describe this as a
-performance pool; describe it as predictable session semantics for agents.
 
 ## Permission Model
 
-Native CLI and pipe mode permissions:
-
 | Transport | Default | Write permission |
 |---|---|---|
-| direct PostgreSQL connection | `read` | `write` |
+| direct PostgreSQL | `read` | `write` |
 | afpsql SSH transport | `ssh-read` | `ssh-write` |
+| afpsql container transport | `container-read` | `container-write` |
 
-`read` and `ssh-read` run in PostgreSQL read-only transactions. If a write SQL
-fails with SQLSTATE `25006`, decide whether the user actually intended a write;
-if yes, rerun with the correct explicit permission.
+`read`, `ssh-read`, and `container-read` run SQL in PostgreSQL read-only
+transactions. If a write fails with SQLSTATE `25006`, confirm write intent and
+rerun with the matching write permission only when appropriate. In psql mode,
+do not add permission flags; it preserves psql's writable default for script
+compatibility. Pass `--log mode` to surface a
+`mode.permission_default_changed` event whenever psql mode bypasses the
+native read-only default.
 
-Permission mismatch errors are pre-execution `code:"error"` events with
-`error_code:"invalid_request"` and a corrective `hint`:
+## Canonical Examples
 
-- direct session + `ssh-read`/`ssh-write` -> use `read`/`write`
-- SSH transport session + `read`/`write` -> use `ssh-read`/`ssh-write`
-
-## Replace Non-Interactive psql
-
-Install the managed wrapper when the user wants existing scripts to call `psql`
-but receive afpsql structured output:
+Direct read with bind parameters:
 
 ```bash
-afpsql psql status
-afpsql psql install
-afpsql psql status
-```
-
-For a custom bin directory:
-
-```bash
-afpsql psql install --bin-dir ~/.local/bin
-export PATH="$HOME/.local/bin:$PATH"
-afpsql psql status --bin-dir ~/.local/bin
-```
-
-Confirm `active_in_path: true`. The wrapper is managed only when it contains the
-afpsql marker, and must not overwrite unmanaged system `psql` binaries.
-
-The wrapper is for non-interactive usage: `psql -c`, `psql -f`, `psql -l`,
-connection flags, positional DB names, PostgreSQL URIs, and conninfo strings. If
-an invocation needs a terminal prompt or `psql` meta-command behavior, return or
-explain the structured error with a `hint` to use the original `psql`.
-
-In psql mode, `-o/--output` means psql-compatible output file routing, and
-`-L/--log-file` tees the same structured event stream to a file. Use
-`--output-format json|yaml|plain` to choose the afpsql rendering format.
-
-## Remote Server With Local-Only PostgreSQL
-
-If a server does not expose PostgreSQL publicly, keep `afpsql` on the local
-machine and use afpsql's built-in SSH transport. The server does not need afpsql
-installed.
-
-Prefer remote TCP with a normal database password when available:
-
-```bash
-afpsql --ssh user@server \
-  --host 127.0.0.1 --port 5432 \
-  --user dbuser --dbname appdb \
-  --password-secret-env PGPASSWORD \
-  --sql "select now()"
-```
-
-SSH reads default to `ssh-read`; SSH writes must use `--permission ssh-write`:
-
-```bash
-afpsql --permission ssh-write --ssh user@server \
-  --host 127.0.0.1 --port 5432 \
-  --user dbuser --dbname appdb \
-  --password-secret-env PGPASSWORD \
-  --sql "update jobs set checked_at = now() where id = $1" \
+afpsql --host 127.0.0.1 --port 5432 --user app --dbname appdb \
+  --sql 'select id, status from jobs where id = $1' \
   --param 1=123
 ```
 
-The managed `psql` wrapper does not expose afpsql SSH transport extensions. Use
-native afpsql or create an SSH tunnel yourself first.
-
-When the server only allows Unix-socket/peer authentication and the SSH login
-user maps to the database role:
+Remote PostgreSQL reachable only from a server:
 
 ```bash
 afpsql --ssh user@server \
-  --host /var/run/postgresql \
-  --user user --dbname appdb \
-  --sql "select current_user"
+  --host 127.0.0.1 --port 5432 \
+  --user app --dbname appdb --password-secret-env PGPASSWORD \
+  --sql 'select now()'
 ```
 
-If the only working manual command is `sudo -u postgres psql`, avoid sudo bridge
-mode when possible. Prefer creating a password-authenticated database role for
-remote TCP, or a role/`pg_ident` mapping that lets the SSH login user peer-auth
-through the remote socket. Use original server-side `psql` for human admin
-sessions.
-
-As an advanced fallback, afpsql can run a sudo bridge:
+Container-local PostgreSQL:
 
 ```bash
-afpsql --ssh user@server \
-  --ssh-sudo-user postgres \
-  --ssh-remote-socket /path/to/.s.PGSQL.5432 \
-  --user postgres --dbname postgres \
-  --sql "select current_user"
+afpsql --container pg-container \
+  --host 127.0.0.1 --port 5432 \
+  --user app --dbname appdb --password-secret-env PGPASSWORD \
+  --sql 'select 1'
 ```
 
-This uses `sudo -n` and a small Python stdio bridge on the server. It does not
-guess socket paths; require an explicit `--ssh-remote-socket`, or set
-`--host`/`PGHOST` to the remote socket directory. It fails instead of prompting
-if sudo needs a password.
-
-Find the remote socket path with:
+Non-interactive psql-compatible script translation:
 
 ```bash
-ssh user@server 'sudo -n -u postgres psql -Atqc "show unix_socket_directories; show port"'
+afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c 'select 1'
 ```
 
-SSH transport currently expects discrete connection fields; avoid `--dsn-secret`
-or `--conninfo-secret` with `--ssh`.
+For writes, `--ssh + --container` combos, Kubernetes pods, Compose drivers, or
+other transport combinations, run `afpsql --help` to discover the current flag
+set.
 
-## Secrets
+## Non-Obvious Behaviors
 
-Prefer environment variables for secrets:
-
-```bash
-export PGPASSWORD='...'
-afpsql --host 127.0.0.1 --port 15432 --user app --dbname appdb \
-  --password-secret-env PGPASSWORD \
-  --sql "select 1"
-```
-
-Also supported:
-
-```bash
-afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
-afpsql --conninfo-secret "host=127.0.0.1 port=15432 user=app dbname=appdb" --sql "select 1"
-```
-
-Never rename PostgreSQL compatibility inputs to fake secret names like
-`PGPASSWORD_SECRET`. Keep the compatibility name and rely on AFDATA redaction
-options when the name must appear in structured output.
+- SSH transport expects discrete connection fields; avoid `--dsn-secret` and
+  `--conninfo-secret` with `--ssh`.
+- SSH sudo bridge is a last-resort fallback for socket/peer setups. Prefer a
+  password-authenticated database role or peer mapping when possible.
+- Container transport runs a no-TTY stdio bridge. The target container needs
+  `sh` plus one of `python3`, `python`, or `perl`, but does not need afpsql or
+  `psql` installed.
+- libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
+  `PGPASSWORD`, `PGSSLMODE`) silently fill connection fields not given via
+  flags or secrets. Prefer explicit flags for agent runs, and pass `--log connect`
+  to surface a `connect.libpq_env_fallback` event listing the variables in use.
+- Enable `--log transport` to emit `transport.selected` once per new session,
+  including a summary of the selected direct/SSH/container chain.
 
 ## Troubleshooting
 
-- `sql_error` with SQLSTATE `25006`: a write was attempted in a read-only transaction; confirm intent and rerun with `write` or `ssh-write` only if appropriate.
-- `invalid_request` mentioning permission mismatch: use direct permissions (`read`/`write`) for direct sessions and SSH permissions (`ssh-read`/`ssh-write`) for afpsql SSH transport.
-- immediate `connect_failed` from local `127.0.0.1`/`localhost` in a sandboxed agent: if the command shape is known good and approval is available, rerun the same read-only command with approval once before treating it as a PostgreSQL configuration problem.
-- `connection refused` on `127.0.0.1:15432`: the SSH tunnel is not running, the local port is wrong, or the SSH tunnel failed.
-- `password authentication failed`: the forwarded connection uses TCP auth rules; try the remote Unix socket forwarding pattern if bare server-side `psql` works only through socket/peer auth.
-- `peer authentication failed`: the SSH login user does not match the requested database role, PostgreSQL lacks a peer mapping, or sudo bridge mode is needed.
-- missing sudo bridge socket: pass `--ssh-remote-socket /path/to/.s.PGSQL.PORT`, or set `--host`/`PGHOST` to the remote socket directory; afpsql does not guess.
-- `sudo` failure in bridge mode: configure NOPASSWD sudo for the bridge user, use a database role matching the SSH user, or use original server-side `psql` for human admin work.
-- No command source in psql mode: use `-c`, `-f`, or `-l`; otherwise use original `psql` for a human terminal session.
-
-## Implementation Checklist
-
-When editing afpsql itself:
-
-1. Preserve the reliability contract before optimizing internals.
-2. Use Agent-First Data helpers for protocol builders, CLI errors, output formats, log filters, and redaction.
-3. Emit recoverable runtime errors as structured stdout events with `hint`, not as stderr text.
-4. Keep native/pipe write permissions explicit and tested.
-5. Support psql-compatible non-interactive flags at the argument layer without adding native-only behavior to psql mode.
-6. Reject unsupported interactive behavior with structured data rather than silently falling through to human `psql` behavior.
-7. Cover psql flag behavior with tests, including accepted aliases, unsupported interactive flags, `-o/--output`, `-L/--log-file`, and secret redaction.
+- `invalid_request` permission mismatch: use `read/write` for direct sessions,
+  `ssh-read/ssh-write` for SSH, and `container-read/container-write` for
+  container transport.
+- SQLSTATE `25006`: the SQL attempted a write in a read-only transaction;
+  confirm intent and rerun with the matching write permission.
+- `connect_failed` on container transport: the host/port are interpreted inside
+  the container; verify the container/pod name, selected pod container,
+  PostgreSQL listener, and whether a Unix socket is required.
+- Bridge prerequisite errors: install `python3`, `python`, or `perl` in the
+  target/sidecar, or connect through a host network path instead.
+- SSH `connection refused`: check the remote host/port or Unix socket path, not
+  the local workstation's PostgreSQL service.
+- `password authentication failed`: TCP auth rules are in effect; use the correct
+  secret or switch to a valid remote Unix-socket/peer pattern.
+- `peer authentication failed`: the OS user does not match the database role;
+  use a matching role, a `pg_ident` mapping, `--container-user`, or an explicit
+  SSH sudo bridge only when needed.
+- psql mode without `-c`, `-f`, or `-l`: use native afpsql or original human
+  `psql` for interactive terminal sessions.

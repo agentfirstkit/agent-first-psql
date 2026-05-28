@@ -3,7 +3,8 @@ use crate::handler::App;
 use crate::limits::OUTPUT_CHANNEL_CAPACITY;
 use crate::logutil::build_startup_log;
 use crate::output_fmt;
-use crate::types::{Output, RuntimeConfig, Trace};
+use crate::protocol::{log_enabled, log_event};
+use crate::types::{Output, QueryOptions, RuntimeConfig, Trace};
 use agent_first_data::OutputFormat;
 use std::fs::File;
 use std::io::Write;
@@ -25,6 +26,7 @@ pub async fn run(req: crate::cli::CliRequest) {
         startup_env,
         startup_requested,
         dry_run,
+        psql_mode,
     } = req;
 
     let mut sink = match CliOutputSink::new(output_format, output_file, log_file) {
@@ -62,6 +64,10 @@ pub async fn run(req: crate::cli::CliRequest) {
     if startup_requested {
         let event = build_startup_log(Some("default"), &startup_args, &startup_env);
         sink.emit(&event);
+    }
+
+    if psql_mode && log_enabled(&log, log_event::MODE_PERMISSION_DEFAULT_CHANGED) {
+        sink.emit(&psql_mode_permission_event(&options));
     }
 
     app.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -125,6 +131,35 @@ impl CliOutputSink {
     }
 }
 
+fn psql_mode_permission_event(options: &QueryOptions) -> Output {
+    let permission = options.permission.map(|p| p.as_str()).unwrap_or("write");
+    let mut config = serde_json::Map::new();
+    config.insert("mode".to_string(), serde_json::Value::from("psql"));
+    config.insert(
+        "permission".to_string(),
+        serde_json::Value::from(permission),
+    );
+    config.insert(
+        "note".to_string(),
+        serde_json::Value::from(
+            "psql mode inherits psql's writable default; native mode defaults to read",
+        ),
+    );
+    Output::Log {
+        event: log_event::MODE_PERMISSION_DEFAULT_CHANGED.to_string(),
+        request_id: None,
+        session: Some("default".to_string()),
+        error_code: None,
+        command_tag: None,
+        version: None,
+        config: Some(serde_json::Value::Object(config)),
+        args: None,
+        env: None,
+        chain: None,
+        trace: Trace::only_duration(0),
+    }
+}
+
 fn open_output_file(path: Option<&str>, flag: &str) -> Result<Option<File>, String> {
     let Some(path) = path else {
         return Ok(None);
@@ -136,4 +171,39 @@ fn open_output_file(path: Option<&str>, flag: &str) -> Result<Option<File>, Stri
         .open(path)
         .map(Some)
         .map_err(|e| format!("{flag} file open failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Permission;
+
+    #[test]
+    fn psql_mode_event_reports_resolved_permission_and_filter_prefix() {
+        let opts = QueryOptions {
+            permission: Some(Permission::ContainerWrite),
+            ..Default::default()
+        };
+        let emitted = psql_mode_permission_event(&opts);
+        assert!(matches!(emitted, Output::Log { .. }));
+        let Output::Log { event, config, .. } = emitted else {
+            return;
+        };
+        assert_eq!(event, "mode.permission_default_changed");
+        let cfg = config.unwrap_or_default();
+        assert_eq!(cfg.get("mode").and_then(|v| v.as_str()), Some("psql"));
+        assert_eq!(
+            cfg.get("permission").and_then(|v| v.as_str()),
+            Some("container-write")
+        );
+        assert!(cfg.get("note").is_some());
+        assert!(log_enabled(
+            &["mode".to_string()],
+            log_event::MODE_PERMISSION_DEFAULT_CHANGED
+        ));
+        assert!(!log_enabled(
+            &[],
+            log_event::MODE_PERMISSION_DEFAULT_CHANGED
+        ));
+    }
 }

@@ -214,3 +214,57 @@ fn resolve_conn_uses_pgpassword_fallback() {
         assert_eq!(out.get_password(), Some("pgpass-test".as_bytes()));
     }
 }
+
+#[test]
+fn libpq_env_fallbacks_lists_only_unfilled_pg_vars() {
+    let names = [
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGDATABASE",
+        "PGPASSWORD",
+        "PGSSLMODE",
+        "AFPSQL_HOST",
+        "AFPSQL_PORT",
+        "AFPSQL_USER",
+        "AFPSQL_DBNAME",
+        "AFPSQL_PASSWORD_SECRET",
+        "AFPSQL_DSN_SECRET",
+        "AFPSQL_CONNINFO_SECRET",
+    ];
+    let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var_os(n))).collect();
+    for n in &names {
+        std::env::remove_var(n);
+    }
+    std::env::set_var("PGHOST", "envhost");
+    std::env::set_var("PGPASSWORD", "envpw");
+
+    let only_explicit = libpq_env_fallbacks_in_use(&SessionConfig {
+        host: Some("explicit".to_string()),
+        password_secret: Some("explicit-secret".to_string()),
+        ..Default::default()
+    });
+    let with_defaults = libpq_env_fallbacks_in_use(&SessionConfig::default());
+    let with_dsn = libpq_env_fallbacks_in_use(&SessionConfig {
+        dsn_secret: Some("postgresql://u:p@h/db".to_string()),
+        ..Default::default()
+    });
+
+    for (n, value) in saved {
+        match value {
+            Some(v) => std::env::set_var(n, v),
+            None => std::env::remove_var(n),
+        }
+    }
+
+    assert!(
+        only_explicit.is_empty(),
+        "explicit fields must suppress fallback report, got {only_explicit:?}"
+    );
+    assert!(with_defaults.contains(&"PGHOST"));
+    assert!(with_defaults.contains(&"PGPASSWORD"));
+    assert!(
+        with_dsn.is_empty(),
+        "dsn_secret short-circuits libpq fallback reporting, got {with_dsn:?}"
+    );
+}

@@ -353,13 +353,8 @@ fn tunnel_child_status(guard: &SshTunnelGuard) -> Result<Option<ExitStatus>, Str
 }
 
 fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, String> {
-    let destination = cfg.ssh.clone();
-    let has_ssh_fields = cfg.ssh.is_some()
-        || !cfg.ssh_options.is_empty()
-        || cfg.ssh_local_host.is_some()
-        || cfg.ssh_local_port.is_some()
-        || cfg.ssh_remote_socket.is_some()
-        || cfg.ssh_sudo_user.is_some();
+    let destination = cfg.ssh.destination.clone();
+    let has_ssh_fields = cfg.ssh.has_transport_fields();
 
     let Some(destination) = destination else {
         if has_ssh_fields {
@@ -373,14 +368,15 @@ fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, Stri
 
     Ok(Some(SshSettings {
         destination,
-        options: cfg.ssh_options.clone(),
+        options: cfg.ssh.options.clone(),
         local_host: cfg
-            .ssh_local_host
+            .ssh
+            .local_host
             .clone()
             .unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_string()),
-        local_port: cfg.ssh_local_port,
-        remote_socket: cfg.ssh_remote_socket.clone(),
-        sudo_user: cfg.ssh_sudo_user.clone(),
+        local_port: cfg.ssh.local_port,
+        remote_socket: cfg.ssh.remote_socket.clone(),
+        sudo_user: cfg.ssh.sudo_user.clone(),
     }))
 }
 
@@ -557,8 +553,11 @@ mod tests {
             sudo_user: Some("postgres".to_string()),
         };
         let cfg = SessionConfig {
-            ssh: Some("user@example.com".to_string()),
-            ssh_sudo_user: Some("postgres".to_string()),
+            ssh: crate::types::SshConfig {
+                destination: Some("user@example.com".to_string()),
+                sudo_user: Some("postgres".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
 

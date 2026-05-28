@@ -24,6 +24,13 @@ pub enum Input {
     Ping,
     #[serde(rename = "close")]
     Close,
+    #[serde(rename = "session_info")]
+    SessionInfo {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +43,10 @@ pub enum Permission {
     SshRead,
     #[serde(rename = "ssh-write")]
     SshWrite,
+    #[serde(rename = "container-read")]
+    ContainerRead,
+    #[serde(rename = "container-write")]
+    ContainerWrite,
 }
 
 impl Permission {
@@ -45,15 +56,21 @@ impl Permission {
             Self::Write => "write",
             Self::SshRead => "ssh-read",
             Self::SshWrite => "ssh-write",
+            Self::ContainerRead => "container-read",
+            Self::ContainerWrite => "container-write",
         }
     }
 
     pub fn is_read_only(self) -> bool {
-        matches!(self, Self::Read | Self::SshRead)
+        matches!(self, Self::Read | Self::SshRead | Self::ContainerRead)
     }
 
     pub fn allows_ssh(self) -> bool {
         matches!(self, Self::SshRead | Self::SshWrite)
+    }
+
+    pub fn allows_container(self) -> bool {
+        matches!(self, Self::ContainerRead | Self::ContainerWrite)
     }
 }
 
@@ -66,8 +83,10 @@ impl std::str::FromStr for Permission {
             "write" => Ok(Self::Write),
             "ssh-read" => Ok(Self::SshRead),
             "ssh-write" => Ok(Self::SshWrite),
+            "container-read" => Ok(Self::ContainerRead),
+            "container-write" => Ok(Self::ContainerWrite),
             _ => Err(format!(
-                "invalid permission `{value}`; expected read, write, ssh-read, or ssh-write"
+                "invalid permission `{value}`; expected read, write, ssh-read, ssh-write, container-read, or container-write"
             )),
         }
     }
@@ -184,6 +203,22 @@ pub enum Output {
     Pong { trace: PongTrace },
     #[serde(rename = "close")]
     Close { message: String, trace: CloseTrace },
+    #[serde(rename = "session_info")]
+    SessionInfo {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        session: String,
+        transport_kind: String,
+        permission_default: String,
+        stream_rows_default: bool,
+        batch_rows: usize,
+        batch_bytes: usize,
+        inline_max_rows: usize,
+        inline_max_bytes: usize,
+        statement_timeout_ms: u64,
+        lock_timeout_ms: u64,
+        trace: Trace,
+    },
     #[serde(rename = "log")]
     Log {
         event: String,
@@ -203,6 +238,8 @@ pub enum Output {
         args: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         env: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain: Option<String>,
         trace: Trace,
     },
 }
@@ -246,8 +283,7 @@ pub struct CloseTrace {
     pub requests_total: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Serialize, Clone, Default)]
 pub struct SessionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dsn_secret: Option<String>,
@@ -263,28 +299,223 @@ pub struct SessionConfig {
     pub dbname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password_secret: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ssh_options: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_local_host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_local_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_remote_socket: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_sudo_user: Option<String>,
+    #[serde(flatten)]
+    pub ssh: SshConfig,
+    #[serde(flatten)]
+    pub container: ContainerConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SshConfig {
+    #[serde(rename = "ssh", skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(rename = "ssh_options", default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(rename = "ssh_local_host", skip_serializing_if = "Option::is_none")]
+    pub local_host: Option<String>,
+    #[serde(rename = "ssh_local_port", skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+    #[serde(rename = "ssh_remote_socket", skip_serializing_if = "Option::is_none")]
+    pub remote_socket: Option<String>,
+    #[serde(rename = "ssh_sudo_user", skip_serializing_if = "Option::is_none")]
+    pub sudo_user: Option<String>,
+}
+
+impl SshConfig {
+    pub fn has_transport_fields(&self) -> bool {
+        self.destination.is_some()
+            || !self.options.is_empty()
+            || self.local_host.is_some()
+            || self.local_port.is_some()
+            || self.remote_socket.is_some()
+            || self.sudo_user.is_some()
+    }
+
+    pub fn has_tunnel_or_bridge_options(&self) -> bool {
+        self.local_host.is_some()
+            || self.local_port.is_some()
+            || self.remote_socket.is_some()
+            || self.sudo_user.is_some()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ContainerConfig {
+    #[serde(rename = "container", skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(rename = "container_driver", skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(rename = "container_runtime", skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(rename = "container_user", skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(
+        rename = "container_namespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub namespace: Option<String>,
+    #[serde(rename = "container_context", skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(
+        rename = "container_compose_files",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub compose_files: Vec<String>,
+    #[serde(
+        rename = "container_compose_project",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub compose_project: Option<String>,
+    #[serde(
+        rename = "container_pod_container",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pod_container: Option<String>,
+}
+
+impl ContainerConfig {
+    pub fn has_transport_fields(&self) -> bool {
+        self.target.is_some()
+            || self.driver.is_some()
+            || self.runtime.is_some()
+            || self.user.is_some()
+            || self.namespace.is_some()
+            || self.context.is_some()
+            || !self.compose_files.is_empty()
+            || self.compose_project.is_some()
+            || self.pod_container.is_some()
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SessionConfigFlat {
+    #[serde(default)]
+    dsn_secret: Option<String>,
+    #[serde(default)]
+    conninfo_secret: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    dbname: Option<String>,
+    #[serde(default)]
+    password_secret: Option<String>,
+    #[serde(default)]
+    ssh: Option<String>,
+    #[serde(default)]
+    ssh_options: Vec<String>,
+    #[serde(default)]
+    ssh_local_host: Option<String>,
+    #[serde(default)]
+    ssh_local_port: Option<u16>,
+    #[serde(default)]
+    ssh_remote_socket: Option<String>,
+    #[serde(default)]
+    ssh_sudo_user: Option<String>,
+    #[serde(default)]
+    container: Option<String>,
+    #[serde(default)]
+    container_driver: Option<String>,
+    #[serde(default)]
+    container_runtime: Option<String>,
+    #[serde(default)]
+    container_user: Option<String>,
+    #[serde(default)]
+    container_namespace: Option<String>,
+    #[serde(default)]
+    container_context: Option<String>,
+    #[serde(default)]
+    container_compose_files: Vec<String>,
+    #[serde(default)]
+    container_compose_project: Option<String>,
+    #[serde(default)]
+    container_pod_container: Option<String>,
+}
+
+impl From<SessionConfigFlat> for SessionConfig {
+    fn from(flat: SessionConfigFlat) -> Self {
+        Self {
+            dsn_secret: flat.dsn_secret,
+            conninfo_secret: flat.conninfo_secret,
+            host: flat.host,
+            port: flat.port,
+            user: flat.user,
+            dbname: flat.dbname,
+            password_secret: flat.password_secret,
+            ssh: SshConfig {
+                destination: flat.ssh,
+                options: flat.ssh_options,
+                local_host: flat.ssh_local_host,
+                local_port: flat.ssh_local_port,
+                remote_socket: flat.ssh_remote_socket,
+                sudo_user: flat.ssh_sudo_user,
+            },
+            container: ContainerConfig {
+                target: flat.container,
+                driver: flat.container_driver,
+                runtime: flat.container_runtime,
+                user: flat.container_user,
+                namespace: flat.container_namespace,
+                context: flat.container_context,
+                compose_files: flat.container_compose_files,
+                compose_project: flat.container_compose_project,
+                pod_container: flat.container_pod_container,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        SessionConfigFlat::deserialize(deserializer).map(Self::from)
+    }
 }
 
 impl SessionConfig {
     pub fn uses_ssh_transport(&self) -> bool {
-        self.ssh.is_some()
-            || !self.ssh_options.is_empty()
-            || self.ssh_local_host.is_some()
-            || self.ssh_local_port.is_some()
-            || self.ssh_remote_socket.is_some()
-            || self.ssh_sudo_user.is_some()
+        self.ssh.has_transport_fields()
+    }
+
+    pub fn uses_container_transport(&self) -> bool {
+        self.container.has_transport_fields()
+    }
+
+    pub fn transport_kind(&self) -> Result<TransportKind, String> {
+        let uses_ssh = self.uses_ssh_transport();
+        let uses_container = self.uses_container_transport();
+        match (uses_ssh, uses_container) {
+            (false, false) => Ok(TransportKind::Direct),
+            (true, false) => Ok(TransportKind::Ssh),
+            (false, true) => Ok(TransportKind::Container),
+            // --ssh + --container means "run container exec on that remote host".
+            // The PostgreSQL connection still crosses the container boundary.
+            (true, true) => Ok(TransportKind::Container),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    Direct,
+    Ssh,
+    Container,
+}
+
+impl TransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Ssh => "ssh",
+            Self::Container => "container",
+        }
     }
 }
 
@@ -363,35 +594,131 @@ impl<T> PatchField<T> {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct SessionConfigPatch {
+    pub dsn_secret: PatchField<String>,
+    pub conninfo_secret: PatchField<String>,
+    pub host: PatchField<String>,
+    pub port: PatchField<u16>,
+    pub user: PatchField<String>,
+    pub dbname: PatchField<String>,
+    pub password_secret: PatchField<String>,
+    pub ssh: SshConfigPatch,
+    pub container: ContainerConfigPatch,
+}
+
+#[derive(Debug, Default)]
+pub struct SshConfigPatch {
+    pub destination: PatchField<String>,
+    pub options: PatchField<Vec<String>>,
+    pub local_host: PatchField<String>,
+    pub local_port: PatchField<u16>,
+    pub remote_socket: PatchField<String>,
+    pub sudo_user: PatchField<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ContainerConfigPatch {
+    pub target: PatchField<String>,
+    pub driver: PatchField<String>,
+    pub runtime: PatchField<String>,
+    pub user: PatchField<String>,
+    pub namespace: PatchField<String>,
+    pub context: PatchField<String>,
+    pub compose_files: PatchField<Vec<String>>,
+    pub compose_project: PatchField<String>,
+    pub pod_container: PatchField<String>,
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct SessionConfigPatch {
+struct SessionConfigPatchFlat {
     #[serde(default)]
-    pub dsn_secret: PatchField<String>,
+    dsn_secret: PatchField<String>,
     #[serde(default)]
-    pub conninfo_secret: PatchField<String>,
+    conninfo_secret: PatchField<String>,
     #[serde(default)]
-    pub host: PatchField<String>,
+    host: PatchField<String>,
     #[serde(default)]
-    pub port: PatchField<u16>,
+    port: PatchField<u16>,
     #[serde(default)]
-    pub user: PatchField<String>,
+    user: PatchField<String>,
     #[serde(default)]
-    pub dbname: PatchField<String>,
+    dbname: PatchField<String>,
     #[serde(default)]
-    pub password_secret: PatchField<String>,
+    password_secret: PatchField<String>,
     #[serde(default)]
-    pub ssh: PatchField<String>,
+    ssh: PatchField<String>,
     #[serde(default)]
-    pub ssh_options: PatchField<Vec<String>>,
+    ssh_options: PatchField<Vec<String>>,
     #[serde(default)]
-    pub ssh_local_host: PatchField<String>,
+    ssh_local_host: PatchField<String>,
     #[serde(default)]
-    pub ssh_local_port: PatchField<u16>,
+    ssh_local_port: PatchField<u16>,
     #[serde(default)]
-    pub ssh_remote_socket: PatchField<String>,
+    ssh_remote_socket: PatchField<String>,
     #[serde(default)]
-    pub ssh_sudo_user: PatchField<String>,
+    ssh_sudo_user: PatchField<String>,
+    #[serde(default)]
+    container: PatchField<String>,
+    #[serde(default)]
+    container_driver: PatchField<String>,
+    #[serde(default)]
+    container_runtime: PatchField<String>,
+    #[serde(default)]
+    container_user: PatchField<String>,
+    #[serde(default)]
+    container_namespace: PatchField<String>,
+    #[serde(default)]
+    container_context: PatchField<String>,
+    #[serde(default)]
+    container_compose_files: PatchField<Vec<String>>,
+    #[serde(default)]
+    container_compose_project: PatchField<String>,
+    #[serde(default)]
+    container_pod_container: PatchField<String>,
+}
+
+impl From<SessionConfigPatchFlat> for SessionConfigPatch {
+    fn from(flat: SessionConfigPatchFlat) -> Self {
+        Self {
+            dsn_secret: flat.dsn_secret,
+            conninfo_secret: flat.conninfo_secret,
+            host: flat.host,
+            port: flat.port,
+            user: flat.user,
+            dbname: flat.dbname,
+            password_secret: flat.password_secret,
+            ssh: SshConfigPatch {
+                destination: flat.ssh,
+                options: flat.ssh_options,
+                local_host: flat.ssh_local_host,
+                local_port: flat.ssh_local_port,
+                remote_socket: flat.ssh_remote_socket,
+                sudo_user: flat.ssh_sudo_user,
+            },
+            container: ContainerConfigPatch {
+                target: flat.container,
+                driver: flat.container_driver,
+                runtime: flat.container_runtime,
+                user: flat.container_user,
+                namespace: flat.container_namespace,
+                context: flat.container_context,
+                compose_files: flat.container_compose_files,
+                compose_project: flat.container_compose_project,
+                pod_container: flat.container_pod_container,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionConfigPatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        SessionConfigPatchFlat::deserialize(deserializer).map(Self::from)
+    }
 }
 
 #[derive(Debug, Clone)]

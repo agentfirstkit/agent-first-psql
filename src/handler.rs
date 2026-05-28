@@ -1,8 +1,9 @@
 use crate::conn::resolve_session_name;
 use crate::db::{
     DbExecutor, ExecError, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
+    TransportLogContext,
 };
-use crate::protocol::{command_tag, error_code, log_event};
+use crate::protocol::{command_tag, error_code, log_enabled, log_event};
 use crate::types::*;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -194,6 +195,11 @@ pub async fn execute_query(
                     params: &params,
                     opts: &resolved_opts,
                     cancel_slot: cancel_slot.clone(),
+                    transport_log: Some(TransportLogContext {
+                        session: resolved_session.clone(),
+                        log: cfg.log.clone(),
+                        writer: app.writer.clone(),
+                    }),
                 },
                 &mut sink,
             )
@@ -214,6 +220,11 @@ pub async fn execute_query(
             params: &params,
             opts: &resolved_opts,
             cancel_slot: cancel_slot.clone(),
+            transport_log: Some(TransportLogContext {
+                session: resolved_session.clone(),
+                log: cfg.log.clone(),
+                writer: app.writer.clone(),
+            }),
         })
         .await;
 
@@ -268,22 +279,26 @@ pub async fn execute_query(
 }
 
 fn permission_error_hint(options: &QueryOptions, session: &SessionConfig) -> String {
-    let uses_ssh = session.uses_ssh_transport();
-    match (uses_ssh, options.permission) {
-        (true, Some(permission)) if !permission.allows_ssh() => {
-            format!(
-                "this session uses afpsql SSH transport, so permission `{}` is invalid; use `ssh-read` for reads or `ssh-write` for writes",
-                permission.as_str()
-            )
-        }
-        (false, Some(permission)) if permission.allows_ssh() => {
-            format!(
-                "this session does not use afpsql SSH transport, so permission `{}` is invalid; use `read` for reads or `write` for writes",
-                permission.as_str()
-            )
-        }
+    match (session.transport_kind(), options.permission) {
+        (Ok(TransportKind::Ssh), Some(permission)) if !permission.allows_ssh() => format!(
+            "this session uses afpsql SSH transport, so permission `{}` is invalid; use `ssh-read` for reads or `ssh-write` for writes",
+            permission.as_str()
+        ),
+        (Ok(TransportKind::Container), Some(permission)) if !permission.allows_container() => format!(
+            "this session uses afpsql container transport, so permission `{}` is invalid; use `container-read` for reads or `container-write` for writes",
+            permission.as_str()
+        ),
+        (Ok(TransportKind::Direct), Some(permission)) if permission.allows_ssh() => format!(
+            "this session does not use afpsql SSH transport, so permission `{}` is invalid; use `read` for reads or `write` for writes",
+            permission.as_str()
+        ),
+        (Ok(TransportKind::Direct), Some(permission)) if permission.allows_container() => format!(
+            "this session does not use afpsql container transport, so permission `{}` is invalid; use `read` for reads or `write` for writes",
+            permission.as_str()
+        ),
+        (Err(message), _) => message,
         _ => {
-            "use permission read/write for direct connections and ssh-read/ssh-write for afpsql SSH transport"
+            "use read/write for direct connections, ssh-read/ssh-write for afpsql SSH transport, and container-read/container-write for afpsql container transport"
                 .to_string()
         }
     }
@@ -294,6 +309,102 @@ fn cancel_requested(cancel_slot: &Option<crate::db::CancelSlot>) -> bool {
         .as_ref()
         .map(|slot| slot.is_cancelled())
         .unwrap_or(false)
+}
+
+pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Option<String>) {
+    let start = Instant::now();
+    let cfg = app.config.read().await.clone();
+    let resolved_session = resolve_session_name(&cfg, session.as_deref());
+
+    let Some(session_cfg) = cfg.sessions.get(&resolved_session).cloned() else {
+        let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id: id.clone(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: format!("unknown session: {resolved_session}"),
+                hint: Some(
+                    "list active sessions with a `config` request, or pick the default session by omitting `session`"
+                        .to_string(),
+                ),
+                retryable: false,
+                trace,
+            })
+            .await;
+        return;
+    };
+
+    let transport_kind = match session_cfg.transport_kind() {
+        Ok(kind) => kind,
+        Err(message) => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error: message,
+                    hint: Some(
+                        "this session's transport flags are inconsistent; update the session via a `config` request before requesting `session_info`"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                    trace,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let permission_default = match transport_kind {
+        TransportKind::Direct => Permission::Read,
+        TransportKind::Ssh => Permission::SshRead,
+        TransportKind::Container => Permission::ContainerRead,
+    };
+
+    let resolved_opts = match cfg
+        .resolve_options_for_session(&QueryOptions::default(), &session_cfg)
+    {
+        Ok(opts) => opts,
+        Err(message) => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error: message,
+                    hint: Some(
+                        "the runtime config could not resolve query defaults for this session; update inline_max_rows/inline_max_bytes via `config` and retry"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                    trace,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+    let _ = app
+        .writer
+        .send(Output::SessionInfo {
+            id,
+            session: resolved_session,
+            transport_kind: transport_kind.as_str().to_string(),
+            permission_default: permission_default.as_str().to_string(),
+            stream_rows_default: resolved_opts.stream_rows,
+            batch_rows: resolved_opts.batch_rows,
+            batch_bytes: resolved_opts.batch_bytes,
+            inline_max_rows: resolved_opts.inline_max_rows,
+            inline_max_bytes: resolved_opts.inline_max_bytes,
+            statement_timeout_ms: resolved_opts.statement_timeout_ms,
+            lock_timeout_ms: resolved_opts.lock_timeout_ms,
+            trace,
+        })
+        .await;
 }
 
 async fn handle_streaming_result(
@@ -397,7 +508,10 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::CANCELLED.to_string(),
                     error: "query cancelled".to_string(),
-                    hint: None,
+                    hint: Some(
+                        "cancellation is final; submit a new query with a fresh id to retry"
+                            .to_string(),
+                    ),
                     retryable: false,
                     trace: trace.clone(),
                 })
@@ -473,7 +587,10 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::INVALID_PARAMS.to_string(),
                     error: message,
-                    hint: None,
+                    hint: Some(
+                        "check that `params` count and types match the $1, $2, ... placeholders in `sql`"
+                            .to_string(),
+                    ),
                     retryable: false,
                     trace: trace.clone(),
                 })
@@ -560,7 +677,10 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
-                    hint: None,
+                    hint: Some(
+                        "afpsql hit an internal error; retry the query, then restart the session if it persists"
+                            .to_string(),
+                    ),
                     retryable: false,
                     trace: trace.clone(),
                 })
@@ -813,23 +933,10 @@ async fn emit_log(
             config: None,
             args: None,
             env: None,
+            chain: None,
             trace: trace.clone(),
         })
         .await;
-}
-
-fn log_enabled(filters: &[String], event: &str) -> bool {
-    if filters.is_empty() {
-        return false;
-    }
-    if filters.iter().any(|f| f == "all" || f == "*") {
-        return true;
-    }
-    if filters.iter().any(|f| f == event) {
-        return true;
-    }
-    let prefix = event.split('.').next().unwrap_or(event);
-    filters.iter().any(|f| f == prefix)
 }
 
 #[cfg(test)]

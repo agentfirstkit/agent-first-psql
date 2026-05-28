@@ -1,10 +1,11 @@
 use crate::conn::resolve_pg_config;
-use crate::types::SessionConfig;
+use crate::types::{SessionConfig, TransportKind};
 
 use super::errors::{map_connect_error, ConnectError, ExecError};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 pub type CancelSlot = Arc<CancelState>;
@@ -26,8 +27,13 @@ pub(super) struct SessionClient {
     pub(super) client: Option<tokio_postgres::Client>,
     pub(super) backend_pid: i32,
     connection_task: Option<tokio::task::JoinHandle<()>>,
-    _ssh_tunnel: Option<crate::ssh_transport::SshTunnelGuard>,
-    _ssh_bridge: Option<crate::ssh_transport::SshBridgeGuard>,
+    ssh_tunnel: Option<crate::ssh_transport::SshTunnelGuard>,
+    ssh_bridge: Option<crate::ssh_transport::SshBridgeGuard>,
+    container_bridge: Option<crate::container_transport::ContainerBridgeGuard>,
+}
+
+pub(super) struct TransportSelection {
+    pub(super) duration_ms: u64,
 }
 
 impl Drop for SessionClient {
@@ -148,19 +154,51 @@ async fn shutdown_entries(entries: Vec<Arc<SessionEntry>>) {
     }
 }
 
-pub(super) async fn connect_session(cfg: &SessionConfig) -> Result<SessionClient, ExecError> {
+pub(super) async fn connect_session(
+    cfg: &SessionConfig,
+) -> Result<(SessionClient, TransportSelection), ExecError> {
+    let start = Instant::now();
+    let transport = cfg
+        .transport_kind()
+        .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
+    if transport == TransportKind::Container {
+        let (client, bridge) = crate::container_transport::connect_stdio_bridge(cfg)
+            .await
+            .map_err(|e| ExecError::Connect(Box::new(e)))?;
+        let backend_pid = fetch_backend_pid(&client).await?;
+        return Ok((
+            SessionClient {
+                client: Some(client),
+                backend_pid,
+                connection_task: None,
+                ssh_tunnel: None,
+                ssh_bridge: None,
+                container_bridge: Some(bridge),
+            },
+            TransportSelection {
+                duration_ms: start.elapsed().as_millis() as u64,
+            },
+        ));
+    }
+
     if crate::ssh_transport::needs_stdio_bridge(cfg) {
         let (client, bridge) = crate::ssh_transport::connect_stdio_bridge(cfg)
             .await
             .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
         let backend_pid = fetch_backend_pid(&client).await?;
-        return Ok(SessionClient {
-            client: Some(client),
-            backend_pid,
-            connection_task: None,
-            _ssh_tunnel: None,
-            _ssh_bridge: Some(bridge),
-        });
+        return Ok((
+            SessionClient {
+                client: Some(client),
+                backend_pid,
+                connection_task: None,
+                ssh_tunnel: None,
+                ssh_bridge: Some(bridge),
+                container_bridge: None,
+            },
+            TransportSelection {
+                duration_ms: start.elapsed().as_millis() as u64,
+            },
+        ));
     }
 
     let (connect_cfg, ssh_tunnel) = crate::ssh_transport::prepare_session(cfg)
@@ -178,13 +216,101 @@ pub(super) async fn connect_session(cfg: &SessionConfig) -> Result<SessionClient
     });
     let backend_pid = fetch_backend_pid(&client).await?;
 
-    Ok(SessionClient {
-        client: Some(client),
-        backend_pid,
-        connection_task: Some(connection_task),
-        _ssh_tunnel: ssh_tunnel,
-        _ssh_bridge: None,
-    })
+    Ok((
+        SessionClient {
+            client: Some(client),
+            backend_pid,
+            connection_task: Some(connection_task),
+            ssh_tunnel,
+            ssh_bridge: None,
+            container_bridge: None,
+        },
+        TransportSelection {
+            duration_ms: start.elapsed().as_millis() as u64,
+        },
+    ))
+}
+
+pub(super) fn transport_chain_summary(cfg: &SessionConfig, reveal_targets: bool) -> String {
+    match cfg.transport_kind().unwrap_or(TransportKind::Direct) {
+        TransportKind::Direct => postgres_endpoint_summary(cfg, reveal_targets),
+        TransportKind::Ssh => {
+            let ssh = if reveal_targets {
+                cfg.ssh
+                    .destination
+                    .as_deref()
+                    .map(|destination| format!("ssh:{destination}"))
+                    .unwrap_or_else(|| "ssh".to_string())
+            } else {
+                "ssh".to_string()
+            };
+            format!(
+                "{ssh} -> {}",
+                postgres_endpoint_summary(cfg, reveal_targets)
+            )
+        }
+        TransportKind::Container => {
+            let mut parts = Vec::new();
+            if cfg.ssh.destination.is_some() {
+                parts.push(if reveal_targets {
+                    format!("ssh:{}", cfg.ssh.destination.as_deref().unwrap_or_default())
+                } else {
+                    "ssh".to_string()
+                });
+            }
+            parts.push(container_exec_summary(cfg, reveal_targets));
+            parts.push(postgres_endpoint_summary(cfg, reveal_targets));
+            parts.join(" -> ")
+        }
+    }
+}
+
+fn container_exec_summary(cfg: &SessionConfig, reveal_targets: bool) -> String {
+    let driver = cfg.container.driver.as_deref().unwrap_or("docker");
+    let driver = match driver {
+        "kubernetes" | "k8s" => "kubectl",
+        "docker-compose" => "compose",
+        other => other,
+    };
+    let target = cfg.container.target.as_deref().unwrap_or("target");
+    match (reveal_targets, cfg.container.pod_container.as_deref()) {
+        (true, Some(container)) if matches!(driver, "kubectl") => {
+            format!("{driver} exec {target} -c {container}")
+        }
+        (true, _) => format!("{driver} exec {target}"),
+        (false, _) => format!("{driver} exec"),
+    }
+}
+
+fn postgres_endpoint_summary(cfg: &SessionConfig, reveal_targets: bool) -> String {
+    let Ok(pg_cfg) = resolve_pg_config(cfg) else {
+        return if reveal_targets {
+            "postgres".to_string()
+        } else {
+            "tcp".to_string()
+        };
+    };
+    let port = pg_cfg.get_ports().first().copied().unwrap_or(5432);
+    match pg_cfg.get_hosts().first() {
+        Some(tokio_postgres::config::Host::Tcp(host)) if reveal_targets => {
+            if host.starts_with('/') {
+                format!("unix {host}/.s.PGSQL.{port}")
+            } else {
+                format!("tcp {host}:{port}")
+            }
+        }
+        Some(tokio_postgres::config::Host::Tcp(host)) if host.starts_with('/') => {
+            "unix".to_string()
+        }
+        #[cfg(unix)]
+        Some(tokio_postgres::config::Host::Unix(path)) if reveal_targets => {
+            format!("unix {}/.s.PGSQL.{port}", path.to_string_lossy())
+        }
+        #[cfg(unix)]
+        Some(tokio_postgres::config::Host::Unix(_)) => "unix".to_string(),
+        _ if reveal_targets => format!("tcp 127.0.0.1:{port}"),
+        _ => "tcp".to_string(),
+    }
 }
 
 async fn fetch_backend_pid(client: &tokio_postgres::Client) -> Result<i32, ExecError> {
@@ -207,7 +333,7 @@ async fn cancel_backend_from_slot(slot: &CancelSlot) -> Result<bool, String> {
         .await
         .map_err(|e| format!("pg_cancel_backend connect failed: {e:?}"))?;
     let result = async {
-        let Some(pg_client) = client.client.as_ref() else {
+        let Some(pg_client) = client.0.client.as_ref() else {
             return Err("pg_cancel_backend connection unavailable".to_string());
         };
         let row = pg_client
@@ -218,7 +344,7 @@ async fn cancel_backend_from_slot(slot: &CancelSlot) -> Result<bool, String> {
             .map_err(|e| format!("decode pg_cancel_backend result failed: {e}"))
     }
     .await;
-    client.shutdown().await;
+    client.0.shutdown().await;
     result
 }
 
@@ -232,9 +358,14 @@ impl SessionClient {
             .map(|task| task.is_finished())
             .unwrap_or(false)
             || self
-                ._ssh_bridge
+                .ssh_bridge
                 .as_ref()
                 .map(crate::ssh_transport::SshBridgeGuard::is_finished)
+                .unwrap_or(false)
+            || self
+                .container_bridge
+                .as_ref()
+                .map(crate::container_transport::ContainerBridgeGuard::is_finished)
                 .unwrap_or(false)
     }
 
@@ -251,7 +382,13 @@ impl SessionClient {
                 task.abort();
             }
         }
-        if let Some(bridge) = self._ssh_bridge.take() {
+        if let Some(tunnel) = self.ssh_tunnel.take() {
+            drop(tunnel);
+        }
+        if let Some(bridge) = self.ssh_bridge.take() {
+            bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
+        }
+        if let Some(bridge) = self.container_bridge.take() {
             bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
         }
     }

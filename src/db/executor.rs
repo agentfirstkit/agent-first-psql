@@ -5,12 +5,14 @@ use super::session::{
     connect_session, get_session, new_session_map, remove_sessions, shutdown_all_sessions,
     CancelSlot, SessionMap,
 };
-use crate::types::{ColumnInfo, ResolvedOptions, SessionConfig};
+use crate::protocol::{log_enabled, log_event};
+use crate::types::{ColumnInfo, Output, ResolvedOptions, SessionConfig, Trace};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::pin::pin;
+use tokio::sync::mpsc;
 use tokio_postgres::types::ToSql;
 
 #[derive(Debug)]
@@ -48,6 +50,14 @@ pub struct ExecRequest<'a> {
     pub params: &'a [Value],
     pub opts: &'a ResolvedOptions,
     pub cancel_slot: Option<CancelSlot>,
+    pub transport_log: Option<TransportLogContext>,
+}
+
+#[derive(Clone)]
+pub struct TransportLogContext {
+    pub session: String,
+    pub log: Vec<String>,
+    pub writer: mpsc::Sender<Output>,
 }
 
 #[async_trait]
@@ -101,7 +111,8 @@ impl DbExecutor for PostgresExecutor {
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
         let mut client_guard = session.client.lock().await;
-        ensure_connected(&mut client_guard, req.session_cfg).await?;
+        let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
+        emit_transport_selected(&req, transport).await?;
         let Some(client) = client_guard.as_mut() else {
             return Err(ExecError::Connect(Box::new(ConnectError::new(
                 "connection unavailable",
@@ -136,7 +147,8 @@ impl DbExecutor for PostgresExecutor {
     ) -> Result<StreamOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
         let mut client_guard = session.client.lock().await;
-        ensure_connected(&mut client_guard, req.session_cfg).await?;
+        let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
+        emit_transport_selected(&req, transport).await?;
         let Some(client) = client_guard.as_mut() else {
             return Err(ExecError::Connect(Box::new(ConnectError::new(
                 "connection unavailable",
@@ -176,14 +188,86 @@ impl DbExecutor for PostgresExecutor {
 async fn ensure_connected(
     client: &mut Option<super::session::SessionClient>,
     session_cfg: &SessionConfig,
-) -> Result<(), ExecError> {
+) -> Result<Option<super::session::TransportSelection>, ExecError> {
     if client.as_ref().map(|c| c.is_closed()).unwrap_or(false) {
         *client = None;
     }
     if client.is_none() {
-        *client = Some(connect_session(session_cfg).await?);
+        let (connected, transport) = connect_session(session_cfg).await?;
+        *client = Some(connected);
+        return Ok(Some(transport));
     }
-    Ok(())
+    Ok(None)
+}
+
+async fn emit_transport_selected(
+    req: &ExecRequest<'_>,
+    selected: Option<super::session::TransportSelection>,
+) -> Result<(), ExecError> {
+    let (Some(selected), Some(ctx)) = (selected, req.transport_log.as_ref()) else {
+        return Ok(());
+    };
+    emit_libpq_env_fallback(ctx, req.session_cfg).await?;
+    if !log_enabled(&ctx.log, log_event::TRANSPORT_SELECTED) {
+        return Ok(());
+    }
+    let chain = super::session::transport_chain_summary(req.session_cfg, !ctx.log.is_empty());
+    ctx.writer
+        .send(Output::Log {
+            event: log_event::TRANSPORT_SELECTED.to_string(),
+            request_id: None,
+            session: Some(ctx.session.clone()),
+            error_code: None,
+            command_tag: None,
+            version: None,
+            config: None,
+            args: None,
+            env: None,
+            chain: Some(chain),
+            trace: Trace::only_duration(selected.duration_ms),
+        })
+        .await
+        .map_err(|_| ExecError::Internal("output channel closed".to_string()))
+}
+
+async fn emit_libpq_env_fallback(
+    ctx: &TransportLogContext,
+    cfg: &SessionConfig,
+) -> Result<(), ExecError> {
+    if !log_enabled(&ctx.log, log_event::CONNECT_LIBPQ_ENV_FALLBACK) {
+        return Ok(());
+    }
+    let used = crate::conn::libpq_env_fallbacks_in_use(cfg);
+    if used.is_empty() {
+        return Ok(());
+    }
+    let mut config = serde_json::Map::new();
+    config.insert(
+        "env_vars".to_string(),
+        Value::Array(used.iter().map(|v| Value::from(*v)).collect()),
+    );
+    config.insert(
+        "note".to_string(),
+        Value::from(
+            "libpq PG* environment variables filled connection fields not given via flags/secrets; prefer explicit --host/--user/--password-secret-env for agent runs",
+        ),
+    );
+    ctx.writer
+        .send(Output::Log {
+            event: log_event::CONNECT_LIBPQ_ENV_FALLBACK.to_string(),
+            request_id: None,
+            session: Some(ctx.session.clone()),
+            error_code: None,
+            command_tag: None,
+            version: None,
+            config: Some(Value::Object(config)),
+            args: None,
+            env: None,
+            chain: None,
+            trace: Trace::only_duration(0),
+        })
+        .await
+        .map_err(|_| ExecError::Internal("output channel closed".to_string()))
 }
 
 fn should_drop_connection<T>(result: &Result<T, ExecError>) -> bool {
@@ -397,11 +481,47 @@ fn format_column_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ContainerConfig, SshConfig};
+    use tokio::sync::mpsc;
 
     fn column(name: &str) -> ColumnInfo {
         ColumnInfo {
             name: name.to_string(),
             type_name: "int4".to_string(),
+        }
+    }
+
+    fn test_request<'a>(
+        cfg: &'a SessionConfig,
+        opts: &'a ResolvedOptions,
+        log: Vec<String>,
+        writer: mpsc::Sender<Output>,
+    ) -> ExecRequest<'a> {
+        ExecRequest {
+            session_name: "default",
+            session_cfg: cfg,
+            sql: "select 1",
+            params: &[],
+            opts,
+            cancel_slot: None,
+            transport_log: Some(TransportLogContext {
+                session: "default".to_string(),
+                log,
+                writer,
+            }),
+        }
+    }
+
+    fn default_opts() -> ResolvedOptions {
+        ResolvedOptions {
+            stream_rows: false,
+            batch_rows: 1024,
+            batch_bytes: 1 << 20,
+            statement_timeout_ms: 0,
+            lock_timeout_ms: 0,
+            read_only: true,
+            inline_max_rows: 100,
+            inline_max_bytes: 1 << 20,
         }
     }
 
@@ -428,6 +548,110 @@ mod tests {
                     && message.contains("JSON object rows")
                     && message.contains("AS aliases")
         ));
+    }
+
+    #[tokio::test]
+    async fn emit_transport_selected_skips_when_log_filter_empty() {
+        let cfg = SessionConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        };
+        let opts = default_opts();
+        let (tx, mut rx) = mpsc::channel::<Output>(4);
+        let req = test_request(&cfg, &opts, vec![], tx);
+        let selected = super::super::session::TransportSelection { duration_ms: 7 };
+        assert!(emit_transport_selected(&req, Some(selected)).await.is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "log filter empty must suppress emission"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_transport_selected_skips_when_selection_none() {
+        let cfg = SessionConfig::default();
+        let opts = default_opts();
+        let (tx, mut rx) = mpsc::channel::<Output>(4);
+        let req = test_request(&cfg, &opts, vec!["transport".to_string()], tx);
+        assert!(emit_transport_selected(&req, None).await.is_ok());
+        assert!(
+            rx.try_recv().is_err(),
+            "no selection must suppress emission"
+        );
+    }
+
+    async fn assert_transport_event(cfg: SessionConfig, chain_substring: &str, duration_ms: u64) {
+        let opts = default_opts();
+        let (tx, mut rx) = mpsc::channel::<Output>(4);
+        let req = test_request(&cfg, &opts, vec!["transport".to_string()], tx);
+        let selected = super::super::session::TransportSelection { duration_ms };
+        assert!(emit_transport_selected(&req, Some(selected)).await.is_ok());
+        let received = rx.try_recv().ok();
+        assert!(
+            matches!(received, Some(Output::Log { .. })),
+            "expected Output::Log, got {received:?}"
+        );
+        let Some(Output::Log {
+            event,
+            session,
+            chain,
+            trace,
+            ..
+        }) = received
+        else {
+            return;
+        };
+        assert_eq!(event, "transport.selected");
+        assert_eq!(session.as_deref(), Some("default"));
+        let chain = chain.unwrap_or_default();
+        assert!(
+            chain.contains(chain_substring),
+            "chain {chain:?} missing {chain_substring:?}"
+        );
+        assert_eq!(trace.duration_ms, duration_ms);
+        assert!(trace.row_count.is_none());
+        assert!(trace.payload_bytes.is_none());
+    }
+
+    #[tokio::test]
+    async fn emit_transport_selected_direct_chain_includes_postgres_endpoint() {
+        let cfg = SessionConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        };
+        assert_transport_event(cfg, "127.0.0.1:5432", 11).await;
+    }
+
+    #[tokio::test]
+    async fn emit_transport_selected_ssh_chain_includes_ssh_segment() {
+        let cfg = SessionConfig {
+            ssh: SshConfig {
+                destination: Some("root@example.com".to_string()),
+                ..Default::default()
+            },
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        };
+        assert_transport_event(cfg, "ssh:root@example.com ->", 22).await;
+    }
+
+    #[tokio::test]
+    async fn emit_transport_selected_container_chain_includes_exec_segment() {
+        let cfg = SessionConfig {
+            container: ContainerConfig {
+                target: Some("app-pod".to_string()),
+                driver: Some("kubectl".to_string()),
+                pod_container: Some("postgres".to_string()),
+                ..Default::default()
+            },
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        };
+        assert_transport_event(cfg, "kubectl exec app-pod -c postgres", 33).await;
     }
 }
 

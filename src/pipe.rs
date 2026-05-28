@@ -160,6 +160,9 @@ async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
             let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
         }
         Input::Cancel { id } => dispatch_cancel(&runtime.app, id).await,
+        Input::SessionInfo { id, session } => {
+            handler::handle_session_info(&runtime.app, id, session).await;
+        }
         Input::Ping => {
             cleanup_finished_queries(&runtime.app).await;
             let _ = runtime
@@ -209,7 +212,10 @@ async fn dispatch_query(
                     id: Some(key.clone()),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: "duplicate active query id".to_string(),
-                    hint: None,
+                    hint: Some(
+                        "pick a unique `id` per in-flight query, or cancel the prior one first"
+                            .to_string(),
+                    ),
                     retryable: false,
                     trace: Trace::only_duration(0),
                 });
@@ -291,7 +297,10 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                     id: Some(id),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: "query already finished".to_string(),
-                    hint: None,
+                    hint: Some(
+                        "cancel raced completion; the prior result/error event holds the outcome"
+                            .to_string(),
+                    ),
                     retryable: false,
                     trace: Trace::only_duration(0),
                 })
@@ -325,7 +334,10 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                 id: Some(id),
                 error_code: error_code::INVALID_REQUEST.to_string(),
                 error: "no queued or running query with this id".to_string(),
-                hint: None,
+                hint: Some(
+                    "no matching in-flight query for this id; it may have already completed or never been submitted"
+                        .to_string(),
+                ),
                 retryable: false,
                 trace: Trace::only_duration(0),
             })
@@ -531,10 +543,6 @@ pub(crate) fn has_session_override(session: &SessionConfig) -> bool {
         || session.user.is_some()
         || session.dbname.is_some()
         || session.password_secret.is_some()
-        || session.ssh.is_some()
-        || !session.ssh_options.is_empty()
-        || session.ssh_local_host.is_some()
-        || session.ssh_local_port.is_some()
-        || session.ssh_remote_socket.is_some()
-        || session.ssh_sudo_user.is_some()
+        || session.ssh.has_transport_fields()
+        || session.container.has_transport_fields()
 }

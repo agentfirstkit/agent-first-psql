@@ -48,14 +48,15 @@ Execute one SQL statement.
 | `batch_bytes` | 262144 | soft byte target per streamed batch |
 | `statement_timeout_ms` | config default | per-query statement timeout |
 | `lock_timeout_ms` | config default | per-query lock timeout |
-| `permission` | native/pipe transport default | `read`, `write`, `ssh-read`, or `ssh-write` |
+| `permission` | native/pipe transport default | `read`, `write`, `ssh-read`, `ssh-write`, `container-read`, or `container-write` |
 | `inline_max_rows` | config default | inline row cap for non-streaming |
 | `inline_max_bytes` | config default | inline payload bytes cap for non-streaming |
 
-In native CLI and pipe mode, permission defaults to `read` for direct sessions
-and `ssh-read` for sessions using afpsql SSH transport. `read` and `ssh-read`
-run in PostgreSQL read-only transactions. Direct writes require `write`; SSH
-writes require `ssh-write`.
+In native CLI and pipe mode, permission defaults to `read` for direct sessions,
+`ssh-read` for sessions using afpsql SSH transport, and `container-read` for
+sessions using afpsql container transport. Read permissions run in PostgreSQL
+read-only transactions. Direct writes require `write`; SSH writes require
+`ssh-write`; container writes require `container-write`.
 
 ### Parameter Binding Rules
 
@@ -112,6 +113,15 @@ Session connection shape supports:
 - `ssh_local_port`
 - `ssh_remote_socket`
 - `ssh_sudo_user`
+- `container`
+- `container_driver`
+- `container_runtime`
+- `container_user`
+- `container_namespace`
+- `container_context`
+- `container_compose_files`
+- `container_compose_project`
+- `container_pod_container`
 
 Supported TLS settings supplied in `dsn_secret` or `conninfo_secret` are
 honored. afpsql currently accepts `sslmode=disable/prefer/require`; unsupported
@@ -122,14 +132,34 @@ SSH transport fields start a local OpenSSH tunnel or Unix-socket bridge before
 connecting. They currently expect discrete connection fields rather than
 `dsn_secret` or `conninfo_secret`.
 
+Container transport fields start a no-TTY exec bridge through the selected
+driver (`docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a small
+stdio bridge inside the container. The PostgreSQL host/port or Unix socket is
+interpreted inside the container. Container transport can use `dsn_secret`,
+`conninfo_secret`, or discrete connection fields.
+
+Container driver scope is configured with named fields, not raw argv
+passthrough: `container_context` applies to Docker and kubectl,
+`container_namespace` applies to kubectl, and `container_compose_files` /
+`container_compose_project` apply to Compose. `container_pod_container` applies
+to kubectl multi-container pods and is emitted as `-c CTR` before `--`.
+`AFPSQL_CONTAINER_COMPOSE_FILE` may supply colon-separated Compose files when no
+`container_compose_files` are configured.
+
+When both `ssh` and `container` are set, afpsql uses SSH to run the container
+exec command on the remote host, then bridges from inside the container. In this
+combined mode, only `ssh` and `ssh_options` apply; SSH tunnel and sudo bridge
+fields are for non-container SSH transport. The permission family remains
+container (`container-read` / `container-write`).
+
 CLI translation notes:
 
 - agent-first mode uses direct agent-first flags (`--dsn-secret`, `--host`, ...)
 - `psql mode` may translate legacy flags (`-h`, `-p`, `-U`, `-d`, `-c`, `-f`)
   into these same canonical fields
-- `psql mode` does not expose afpsql permission or SSH transport extensions, and
-  preserves psql's writable default for script compatibility; use native afpsql
-  for agent-safe permissions and managed SSH transport
+- `psql mode` does not expose afpsql permission flags and preserves psql's
+  writable default for script compatibility; use native afpsql for agent-safe
+  permissions and transport-specific agent behavior
 
 ### `cancel`
 
@@ -159,6 +189,21 @@ Graceful shutdown.
 ```json
 {"code":"close"}
 ```
+
+### `session_info`
+
+Pipe-mode introspection request. Returns the named session's resolved transport,
+permission default, and runtime limits so an agent can discover what it is
+connected to without probing via failing queries.
+
+| Field | Required | Description |
+|---|---|---|
+| `code` | yes | `"session_info"` |
+| `id` | no | client correlation id |
+| `session` | no | session id; default session if omitted |
+
+Unknown session names return `code:"error"` with `error_code:"invalid_request"`
+and a hint pointing to `config`.
 
 ## Output (stdout)
 
@@ -258,6 +303,26 @@ For connection setup failures, `code` remains `"error"` and `error_code` remains
 or cannot-connect-now), `afpsql` also includes `sqlstate` plus PostgreSQL
 diagnostic fields and a SQLSTATE-specific `hint`.
 
+### `session_info`
+
+Response to a `session_info` request.
+
+| Field | Description |
+|---|---|
+| `code` | `"session_info"` |
+| `id` | optional client correlation id |
+| `session` | resolved session name |
+| `transport_kind` | `"direct"`, `"ssh"`, or `"container"` |
+| `permission_default` | transport-default permission (`"read"`, `"ssh-read"`, or `"container-read"`) |
+| `stream_rows_default` | session's default `stream_rows` value |
+| `batch_rows` | resolved `batch_rows` default |
+| `batch_bytes` | resolved `batch_bytes` default |
+| `inline_max_rows` | resolved inline row cap |
+| `inline_max_bytes` | resolved inline payload byte cap |
+| `statement_timeout_ms` | resolved statement timeout |
+| `lock_timeout_ms` | resolved lock timeout |
+| `trace` | timing and counters |
+
 ### Other output codes
 
 | `code` | Meaning |
@@ -269,11 +334,14 @@ diagnostic fields and a SQLSTATE-specific `hint`.
 
 `log` event fields:
 
-- `event` (e.g. `query.result`, `query.error`, `query.sql_error`)
+- `event` (e.g. `query.result`, `query.error`, `query.sql_error`,
+  `transport.selected`, `mode.permission_default_changed`,
+  `connect.libpq_env_fallback`)
 - `request_id` (optional)
 - `session` (optional)
 - `error_code` (optional)
 - `command_tag` (optional)
+- `chain` (optional transport summary)
 - `trace`
 
 Startup `log` events include `version`, parsed/summarized `args`, and selected
@@ -287,6 +355,20 @@ summarized as `param_count`, not logged as plaintext.
 - `all` or `*` enables all categories
 - exact match (`query.result`)
 - group prefix match (`query` -> `query.*`)
+
+`transport.selected` is emitted once when a new session connection is opened
+and the `transport` log category (or `all` / `*`) is enabled. Its `chain`
+summarizes the selected boundary, for example
+`ssh:user@server -> docker exec pg -> tcp 127.0.0.1:5432`.
+
+`mode.permission_default_changed` is emitted under the `mode` log category
+whenever `--mode psql` bypasses the native read-only default, so agents can see
+when psql-compat translation has dropped the write boundary.
+
+`connect.libpq_env_fallback` is emitted under the `connect` log category when
+libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
+`PGPASSWORD`, `PGSSLMODE`) fill connection fields that were not provided via
+flags or secrets, listing which variables were used.
 
 ## Runtime Safety Limits
 

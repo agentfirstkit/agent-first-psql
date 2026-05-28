@@ -146,6 +146,153 @@ fn test_app_with_executor(
 }
 
 #[tokio::test]
+async fn session_info_returns_resolved_defaults_for_direct_transport() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions.insert(
+        "default".to_string(),
+        SessionConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        },
+    );
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 0 }));
+    handle_session_info(
+        &app,
+        Some("info-1".to_string()),
+        Some("default".to_string()),
+    )
+    .await;
+    let msg = rx.recv().await;
+    assert!(msg.is_some(), "expected SessionInfo response");
+    assert!(
+        matches!(msg, Some(Output::SessionInfo { .. })),
+        "expected Output::SessionInfo, got {msg:?}"
+    );
+    let Some(Output::SessionInfo {
+        id,
+        session,
+        transport_kind,
+        permission_default,
+        stream_rows_default,
+        inline_max_rows,
+        inline_max_bytes,
+        batch_rows,
+        batch_bytes,
+        ..
+    }) = msg
+    else {
+        return;
+    };
+    assert_eq!(id.as_deref(), Some("info-1"));
+    assert_eq!(session, "default");
+    assert_eq!(transport_kind, "direct");
+    assert_eq!(permission_default, "read");
+    assert!(!stream_rows_default);
+    assert!(inline_max_rows > 0);
+    assert!(inline_max_bytes > 0);
+    assert!(batch_rows > 0);
+    assert!(batch_bytes > 0);
+}
+
+#[tokio::test]
+async fn session_info_reports_ssh_and_container_transports() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions.insert(
+        "via_ssh".to_string(),
+        SessionConfig {
+            ssh: SshConfig {
+                destination: Some("user@bastion".to_string()),
+                ..Default::default()
+            },
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        },
+    );
+    cfg.sessions.insert(
+        "via_container".to_string(),
+        SessionConfig {
+            container: ContainerConfig {
+                target: Some("pg".to_string()),
+                ..Default::default()
+            },
+            host: Some("127.0.0.1".to_string()),
+            port: Some(5432),
+            ..Default::default()
+        },
+    );
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 0 }));
+
+    handle_session_info(&app, None, Some("via_ssh".to_string())).await;
+    let ssh_msg = rx.recv().await;
+    assert!(
+        matches!(ssh_msg, Some(Output::SessionInfo { .. })),
+        "expected SessionInfo for ssh session, got {ssh_msg:?}"
+    );
+    let Some(Output::SessionInfo {
+        transport_kind,
+        permission_default,
+        ..
+    }) = ssh_msg
+    else {
+        return;
+    };
+    assert_eq!(transport_kind, "ssh");
+    assert_eq!(permission_default, "ssh-read");
+
+    handle_session_info(&app, None, Some("via_container".to_string())).await;
+    let container_msg = rx.recv().await;
+    assert!(
+        matches!(container_msg, Some(Output::SessionInfo { .. })),
+        "expected SessionInfo for container session, got {container_msg:?}"
+    );
+    let Some(Output::SessionInfo {
+        transport_kind,
+        permission_default,
+        ..
+    }) = container_msg
+    else {
+        return;
+    };
+    assert_eq!(transport_kind, "container");
+    assert_eq!(permission_default, "container-read");
+}
+
+#[tokio::test]
+async fn session_info_unknown_session_emits_invalid_request_with_hint() {
+    let cfg = RuntimeConfig::default();
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 0 }));
+    handle_session_info(
+        &app,
+        Some("info-x".to_string()),
+        Some("missing".to_string()),
+    )
+    .await;
+    let msg = rx.recv().await;
+    assert!(
+        matches!(msg, Some(Output::Error { .. })),
+        "expected Output::Error, got {msg:?}"
+    );
+    let Some(Output::Error {
+        id,
+        error_code,
+        error,
+        hint,
+        retryable,
+        ..
+    }) = msg
+    else {
+        return;
+    };
+    assert_eq!(id.as_deref(), Some("info-x"));
+    assert_eq!(error_code, "invalid_request");
+    assert!(error.contains("unknown session"));
+    assert!(hint.is_some_and(|h| h.contains("config")));
+    assert!(!retryable);
+}
+
+#[tokio::test]
 async fn execute_query_unknown_session_emits_connect_failed() {
     let cfg = RuntimeConfig {
         default_session: "missing".to_string(),
@@ -323,7 +470,10 @@ async fn execute_query_rejects_permission_mismatched_to_transport() {
     cfg.sessions.insert(
         "default".to_string(),
         SessionConfig {
-            ssh: Some("user@example.com".to_string()),
+            ssh: SshConfig {
+                destination: Some("user@example.com".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -398,6 +548,54 @@ async fn execute_query_rejects_ssh_permission_without_ssh_hint() {
         let hint = hint.as_deref().unwrap_or_default();
         assert!(hint.contains("does not use afpsql SSH transport"));
         assert!(hint.contains("write"));
+        assert!(!retryable);
+    }
+}
+
+#[tokio::test]
+async fn execute_query_rejects_permission_mismatched_to_container_transport() {
+    let mut cfg = RuntimeConfig::default();
+    cfg.sessions.insert(
+        "default".to_string(),
+        SessionConfig {
+            container: ContainerConfig {
+                target: Some("pg".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let (app, mut rx) = test_app_with_executor(cfg, Ok(ExecOutcome::Command { affected: 1 }));
+
+    execute_query(
+        &app,
+        Some("q1".to_string()),
+        Some("default".to_string()),
+        "select 1".to_string(),
+        vec![],
+        QueryOptions {
+            permission: Some(Permission::Write),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+
+    let msg_opt = rx.recv().await;
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
+        error_code,
+        error,
+        hint,
+        retryable,
+        ..
+    }) = msg_opt
+    {
+        assert_eq!(error_code, "invalid_request");
+        assert!(error.contains("does not allow container transport"));
+        let hint = hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("uses afpsql container transport"));
+        assert!(hint.contains("container-write"));
         assert!(!retryable);
     }
 }

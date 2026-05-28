@@ -15,6 +15,7 @@ execution, and turns many failures into prose that an agent has to guess about.
 - **Safe write boundary.** Native CLI and pipe mode default to PostgreSQL read-only transactions; writes must opt in with explicit permission.
 - **Predictable session state.** Pipe named sessions map to stable PostgreSQL backend sessions with FIFO execution, so temp tables, GUCs, and other session state behave predictably.
 - **No SQL guesswork.** Runtime behavior is derived from PostgreSQL metadata, not SQL-text heuristics.
+- **First-class SSH/container boundaries.** Use `--ssh`, `--container`, or `--ssh + --container` to keep the agent local while crossing server, container, and remote-container boundaries with structured output and transport-specific permissions.
 - **psql compatibility where it helps.** `--mode psql` translates common non-interactive psql flags for scripts, while preserving psql's writable default.
 
 The goal is reliability for agents, not being a high-throughput pooler or an
@@ -53,6 +54,7 @@ Native `afpsql` and pipe mode are read-only by default:
 
 - direct connection default: `read`
 - afpsql SSH transport default: `ssh-read`
+- afpsql container transport default: `container-read`
 
 Writes are explicit:
 
@@ -73,15 +75,25 @@ afpsql --permission ssh-write --ssh user@server --host 127.0.0.1 --port 5432 \
   --param 1=123
 ```
 
+Container transport also has its own write permission:
+
+```bash
+afpsql --permission container-write --container pg-container \
+  --dsn-secret-env DATABASE_URL \
+  --sql "update jobs set checked_at = now() where id = $1" \
+  --param 1=123
+```
+
 `--mode psql` deliberately keeps psql's writable default for script
-compatibility and does not expose afpsql permission flags or afpsql SSH
-transport extensions.
+compatibility and does not expose afpsql permission flags.
 
-## Remote access: keep the agent local and tunnel PostgreSQL explicitly
+## First-class remote and container access: keep the agent local
 
-Keep `afpsql` on the machine where the agent runs. If PostgreSQL only listens on
-the server, use afpsql's SSH transport instead of installing afpsql on that
-server or asking the agent to run human `psql` over SSH:
+Keep `afpsql` on the machine where the agent runs. SSH and container access are
+core transports, not recipes for shelling into another environment to run human
+`psql`. If PostgreSQL only listens on the server, use afpsql's SSH transport
+instead of installing afpsql on that server or asking the agent to run human
+`psql` over SSH:
 
 ```bash
 afpsql --ssh user@server --host 127.0.0.1 --port 5432 \
@@ -89,6 +101,53 @@ afpsql --ssh user@server --host 127.0.0.1 --port 5432 \
   --password-secret-env PGPASSWORD \
   --sql "select now()"
 ```
+
+If the working manual command is `docker exec CONTAINER psql ...` or an
+equivalent Podman, nerdctl, Compose, or Kubernetes exec, use container transport
+instead of container-local `psql`. The container does not need afpsql or psql;
+afpsql uses a no-TTY exec bridge through the selected driver:
+
+```bash
+afpsql --container pg-container \
+  --dsn-secret 'postgresql://app:pw@127.0.0.1:5432/appdb' \
+  --sql "select now()"
+```
+
+For container-local Unix sockets, pass the socket directory as `--host`:
+
+```bash
+afpsql --container pg-container \
+  --host /var/run/postgresql --port 5432 \
+  --user app --dbname appdb \
+  --sql "select current_user"
+```
+
+For peer-authenticated sockets, add `--container-user` to run the bridge as the
+matching container OS user.
+
+For containers on a remote SSH host, combine afpsql's existing SSH transport
+with container transport. Do not SSH in and then run a container-local `psql`;
+local `afpsql` drives both boundaries. The container exec command runs on the
+SSH host, and permissions stay in the container family:
+
+```bash
+afpsql --ssh root@server --container app-container \
+  --container-driver docker \
+  --host postgres --port 5432 \
+  --user app --dbname appdb \
+  --password-secret-env PGPASSWORD \
+  --sql "select 1"
+```
+
+Use `--container-driver podman|nerdctl|compose|kubectl` when the target uses a
+non-default exec driver. `--container-runtime` can override the executable path,
+for example `--container-runtime docker-compose` with `--container-driver
+compose` for Compose v1. Use named scope flags such as `--container-context`,
+`--container-namespace`, `--container-compose-file`, and
+`--container-compose-project` instead of raw driver option passthrough.
+
+Use `host.docker.internal` only when the Docker environment provides it (Docker
+Desktop, or Linux configured with `host-gateway`).
 
 For socket/peer-auth and sudo bridge cases, see the [Overview](docs/overview.md).
 
@@ -141,7 +200,7 @@ prompts, and meta-commands should use the original PostgreSQL `psql` binary.
 
 ## Docs
 
-- [Overview](docs/overview.md) — agent usage guide: modes, permissions, sessions, and SSH
+- [Overview](docs/overview.md) — agent usage guide: modes, permissions, sessions, SSH, and container
 - [Protocol Reference](docs/reference.md) — exact runtime fields and event schema
 - [Agent Skill](skills/agent-first-psql.md) — behavior rules for AI-assisted database access
 - [CLI](docs/cli.md) — generated command and flag reference

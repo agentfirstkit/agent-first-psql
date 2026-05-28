@@ -4,11 +4,11 @@ mod params;
 mod rows;
 mod session;
 
-#[cfg(test)]
-pub use errors::ConnectError;
+pub(crate) use errors::ConnectError;
 pub use errors::ExecError;
 pub use executor::{
     DbExecutor, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
+    TransportLogContext,
 };
 pub use session::{cancel_query, new_cancel_slot, CancelSlot};
 

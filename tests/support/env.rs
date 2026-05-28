@@ -1,11 +1,7 @@
 use std::path::Path;
 
 pub fn test_dsn() -> Option<String> {
-    std::env::var("AFPSQL_TEST_DSN_SECRET")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .ok()
-        .or_else(|| read_env_key("AFPSQL_TEST_DSN_SECRET"))
-        .or_else(|| read_env_key("DATABASE_URL"))
+    env_value("AFPSQL_TEST_DSN_SECRET").or_else(|| env_value("DATABASE_URL"))
 }
 
 #[allow(dead_code)]
@@ -16,6 +12,10 @@ pub fn required_test_dsn() -> String {
         "set AFPSQL_TEST_DSN_SECRET or DATABASE_URL, or create tests/.env.local for PostgreSQL integration tests",
     );
     dsn.unwrap_or_default()
+}
+
+pub fn env_value(key: &str) -> Option<String> {
+    std::env::var(key).ok().or_else(|| read_env_key(key))
 }
 
 fn read_env_key(key: &str) -> Option<String> {

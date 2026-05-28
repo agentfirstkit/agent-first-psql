@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,10 +13,13 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Add `afpsql skill install/status/uninstall` to ship an embedded Agent-First PSQL skill for Claude Code and Codex, so permission and session rules travel with the binary",
-    "Preserve PostgreSQL SQLSTATE plus message/detail/hint on `connect_failed`, so agents can distinguish auth, role, database, capacity, and startup failures without parsing prose",
-    "Tighten skill guidance: skip routine `afpsql --help` preflight before known query forms, and retry sandbox-blocked local connections once with approval before changing host/user/SQL",
-    "Rename the project synopsis from \"safe by default\" to \"read-only by default\" to make the write boundary explicit"
+    "Generalize docker transport into a container transport family covering docker, podman, nerdctl, compose, and kubectl, with structured scope flags (--container-context, --container-namespace, --container-compose-file, --container-compose-project, --container-pod-container) instead of raw driver argv passthrough",
+    "Support --ssh + --container as one local transport chain so agents can reach containers on remote SSH hosts without SSHing in and running container-local psql; permission family stays container",
+    "Add session_info pipe request that returns the named session's transport_kind, permission_default, stream/batch defaults, inline limits, and timeouts so agents can introspect their session instead of probing limits with failing queries",
+    "Emit mode.permission_default_changed log event when --mode psql bypasses the native read-only default, and connect.libpq_env_fallback log event when libpq PG* variables silently fill connection fields not given via flags or secrets",
+    "Harden container exec bridge handshake with a per-connection 16-byte hex nonce on the AFPSQL_BRIDGE_OK ready banner and sanitize captured bridge stderr before placing it on ConnectError.hint",
+    "Backfill actionable hint fields on the remaining Output::Error paths (cancelled, invalid_params, internal, duplicate id, finished, missing id) so every error_code dispatch has a hint",
+    "Slim skills/agent-first-psql.md to behavior/decision/recovery rules only; flag enumerations belong in afpsql --help, not the skill, with this principle recorded in docs/design.md"
   ],
   "bonds": [
     {

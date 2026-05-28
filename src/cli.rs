@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
-use crate::types::{Permission, QueryOptions, SessionConfig};
+use crate::types::{ContainerConfig, Permission, QueryOptions, SessionConfig, SshConfig};
 use agent_first_data::{cli_parse_log_filters, cli_parse_output, OutputFormat};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
@@ -20,6 +20,15 @@ const STARTUP_ENV_KEYS: &[&str] = &[
     "AFPSQL_SSH_LOCAL_PORT",
     "AFPSQL_SSH_REMOTE_SOCKET",
     "AFPSQL_SSH_SUDO_USER",
+    "AFPSQL_CONTAINER",
+    "AFPSQL_CONTAINER_DRIVER",
+    "AFPSQL_CONTAINER_RUNTIME",
+    "AFPSQL_CONTAINER_USER",
+    "AFPSQL_CONTAINER_NAMESPACE",
+    "AFPSQL_CONTAINER_CONTEXT",
+    "AFPSQL_CONTAINER_COMPOSE_FILE",
+    "AFPSQL_CONTAINER_COMPOSE_PROJECT",
+    "AFPSQL_CONTAINER_POD_CONTAINER",
     "PGHOST",
     "PGPORT",
     "PGUSER",
@@ -111,6 +120,7 @@ pub struct CliRequest {
     pub startup_env: Value,
     pub startup_requested: bool,
     pub dry_run: bool,
+    pub psql_mode: bool,
 }
 
 pub struct PsqlUnsupportedRequest {
@@ -197,8 +207,8 @@ struct SkillWriteArgs {
 #[doc = r#"Agent-First PostgreSQL client.
 
 `afpsql` gives agents a reliable PostgreSQL contract: structured stdout
-events, explicit write permissions, stable pipe sessions, and machine-readable
-failures.
+events, first-class SSH/container transports, explicit write permissions,
+stable pipe sessions, and machine-readable failures.
 
 ### Interface Policy
 
@@ -206,6 +216,7 @@ failures.
 - `--mode psql` is argument translation only; runtime output stays JSONL
 - stdout carries protocol events; stderr is not a protocol channel
 - native CLI and pipe mode default to read-only transactions; writes require permission
+- SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
 ### Query Sources and Parameters
 
@@ -218,7 +229,11 @@ failures.
 - `--dsn-secret` for a PostgreSQL URI
 - `--conninfo-secret` for libpq-style conninfo
 - or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
-- add `--ssh user@server` when PostgreSQL is reachable only from the server
+- add `--ssh user@server` when PostgreSQL is reachable only from the server boundary
+- add `--container TARGET` when PostgreSQL is reachable only from inside a container boundary
+- use named container scope flags instead of raw driver option passthrough
+- use `--container-driver docker|podman|nerdctl|compose|kubectl` for the exec syntax
+- combine `--ssh user@server --container TARGET` for containers on an SSH host
 - agent-first environment fallbacks: `AFPSQL_*`
 - PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`
 
@@ -236,6 +251,8 @@ afpsql --sql-file ./query.sql
 afpsql --sql "select * from users where id = $1" --param 1=123
 afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
 afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
+afpsql --container pg-container --dsn-secret-env DATABASE_URL --sql "select 1"
+afpsql --ssh root@server --container app --host host.container.internal --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 afpsql --mode pipe
@@ -284,7 +301,8 @@ pub struct AfdCli {
     /// Maximum inline payload bytes before returning `result_too_large`.
     #[arg(long = "inline-max-bytes", help_heading = "Query")]
     inline_max_bytes: Option<usize>,
-    /// Query permission: read, write, ssh-read, or ssh-write. Defaults to read, or ssh-read with --ssh.
+    /// Query permission: read, write, ssh-read, ssh-write, container-read, or container-write.
+    /// Defaults to read, ssh-read with --ssh, or container-read with --container.
     #[arg(long = "permission", value_parser = parse_permission_arg, help_heading = "Query")]
     permission: Option<Permission>,
     /// Preview the query without executing it
@@ -336,6 +354,37 @@ pub struct AfdCli {
     /// Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket.
     #[arg(long = "ssh-sudo-user", help_heading = "SSH Transport")]
     ssh_sudo_user: Option<String>,
+
+    /// Run a container exec stdio bridge in TARGET before connecting to PostgreSQL.
+    #[arg(long = "container", help_heading = "Container Transport")]
+    container: Option<String>,
+    /// Container exec driver: docker, podman, nerdctl, compose, or kubectl.
+    #[arg(long = "container-driver", help_heading = "Container Transport")]
+    container_driver: Option<String>,
+    /// Runtime command for the selected container driver. Defaults to the driver command.
+    #[arg(long = "container-runtime", help_heading = "Container Transport")]
+    container_runtime: Option<String>,
+    /// OS user passed to drivers that support exec user selection.
+    #[arg(long = "container-user", help_heading = "Container Transport")]
+    container_user: Option<String>,
+    /// Kubernetes namespace for kubectl exec.
+    #[arg(long = "container-namespace", help_heading = "Container Transport")]
+    container_namespace: Option<String>,
+    /// Docker or Kubernetes context for the selected driver.
+    #[arg(long = "container-context", help_heading = "Container Transport")]
+    container_context: Option<String>,
+    /// Compose file passed before compose exec. Repeat for multiple files.
+    #[arg(long = "container-compose-file", help_heading = "Container Transport")]
+    container_compose_files: Vec<String>,
+    /// Compose project name passed before compose exec.
+    #[arg(
+        long = "container-compose-project",
+        help_heading = "Container Transport"
+    )]
+    container_compose_project: Option<String>,
+    /// Kubernetes container name for multi-container pods.
+    #[arg(long = "container-pod-container", help_heading = "Container Transport")]
+    container_pod_container: Option<String>,
 
     /// Output format: json (default), yaml, or plain.
     #[arg(long, default_value = "json", global = true, help_heading = "Runtime")]
@@ -408,22 +457,51 @@ pub fn parse_args() -> Result<Mode, String> {
         user: cli.user,
         dbname: cli.dbname,
         password_secret,
-        ssh: cli.ssh.or_else(|| std::env::var("AFPSQL_SSH").ok()),
-        ssh_options: cli.ssh_options,
-        ssh_local_host: cli
-            .ssh_local_host
-            .or_else(|| std::env::var("AFPSQL_SSH_LOCAL_HOST").ok()),
-        ssh_local_port: cli.ssh_local_port.or_else(|| {
-            std::env::var("AFPSQL_SSH_LOCAL_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        }),
-        ssh_remote_socket: cli
-            .ssh_remote_socket
-            .or_else(|| std::env::var("AFPSQL_SSH_REMOTE_SOCKET").ok()),
-        ssh_sudo_user: cli
-            .ssh_sudo_user
-            .or_else(|| std::env::var("AFPSQL_SSH_SUDO_USER").ok()),
+        ssh: SshConfig {
+            destination: cli.ssh.or_else(|| std::env::var("AFPSQL_SSH").ok()),
+            options: cli.ssh_options,
+            local_host: cli
+                .ssh_local_host
+                .or_else(|| std::env::var("AFPSQL_SSH_LOCAL_HOST").ok()),
+            local_port: cli.ssh_local_port.or_else(|| {
+                std::env::var("AFPSQL_SSH_LOCAL_PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            }),
+            remote_socket: cli
+                .ssh_remote_socket
+                .or_else(|| std::env::var("AFPSQL_SSH_REMOTE_SOCKET").ok()),
+            sudo_user: cli
+                .ssh_sudo_user
+                .or_else(|| std::env::var("AFPSQL_SSH_SUDO_USER").ok()),
+        },
+        container: ContainerConfig {
+            target: cli
+                .container
+                .or_else(|| std::env::var("AFPSQL_CONTAINER").ok()),
+            driver: cli
+                .container_driver
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_DRIVER").ok()),
+            runtime: cli
+                .container_runtime
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_RUNTIME").ok()),
+            user: cli
+                .container_user
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_USER").ok()),
+            namespace: cli
+                .container_namespace
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_NAMESPACE").ok()),
+            context: cli
+                .container_context
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_CONTEXT").ok()),
+            compose_files: resolve_container_compose_files(cli.container_compose_files),
+            compose_project: cli
+                .container_compose_project
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_COMPOSE_PROJECT").ok()),
+            pod_container: cli
+                .container_pod_container
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_POD_CONTAINER").ok()),
+        },
     };
     let mode_name = match cli.mode {
         RuntimeMode::Cli => "cli",
@@ -493,6 +571,7 @@ pub fn parse_args() -> Result<Mode, String> {
         startup_env,
         startup_requested,
         dry_run: cli.dry_run,
+        psql_mode: false,
     }))
 }
 
@@ -556,12 +635,34 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         user: state.user,
         dbname: state.dbname,
         password_secret,
-        ssh: None,
-        ssh_options: vec![],
-        ssh_local_host: None,
-        ssh_local_port: None,
-        ssh_remote_socket: None,
-        ssh_sudo_user: None,
+        ssh: SshConfig::default(),
+        container: ContainerConfig {
+            target: state
+                .container
+                .or_else(|| std::env::var("AFPSQL_CONTAINER").ok()),
+            driver: state
+                .container_driver
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_DRIVER").ok()),
+            runtime: state
+                .container_runtime
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_RUNTIME").ok()),
+            user: state
+                .container_user
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_USER").ok()),
+            namespace: state
+                .container_namespace
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_NAMESPACE").ok()),
+            context: state
+                .container_context
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_CONTEXT").ok()),
+            compose_files: resolve_container_compose_files(state.container_compose_files),
+            compose_project: state
+                .container_compose_project
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_COMPOSE_PROJECT").ok()),
+            pod_container: state
+                .container_pod_container
+                .or_else(|| std::env::var("AFPSQL_CONTAINER_POD_CONTAINER").ok()),
+        },
     };
 
     let startup_sql_file = state.sql_file.clone();
@@ -577,7 +678,11 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         sql,
         params,
         options: QueryOptions {
-            permission: Some(Permission::Write),
+            permission: Some(if session.uses_container_transport() {
+                Permission::ContainerWrite
+            } else {
+                Permission::Write
+            }),
             ..Default::default()
         },
         session,
@@ -589,6 +694,7 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         startup_env: startup_env_snapshot(),
         startup_requested,
         dry_run: false,
+        psql_mode: true,
     }))
 }
 
@@ -604,6 +710,15 @@ struct PsqlModeState {
     conninfo_secret: Option<String>,
     password_secret: Option<String>,
     password_secret_env: Option<String>,
+    container: Option<String>,
+    container_driver: Option<String>,
+    container_runtime: Option<String>,
+    container_user: Option<String>,
+    container_namespace: Option<String>,
+    container_context: Option<String>,
+    container_compose_files: Vec<String>,
+    container_compose_project: Option<String>,
+    container_pod_container: Option<String>,
     params_kv: Vec<String>,
     output: OutputFormat,
     log_entries: Vec<String>,
@@ -628,6 +743,15 @@ impl Default for PsqlModeState {
             conninfo_secret: None,
             password_secret: None,
             password_secret_env: None,
+            container: None,
+            container_driver: None,
+            container_runtime: None,
+            container_user: None,
+            container_namespace: None,
+            container_context: None,
+            container_compose_files: vec![],
+            container_compose_project: None,
+            container_pod_container: None,
             params_kv: vec![],
             output: OutputFormat::Json,
             log_entries: vec![],
@@ -792,6 +916,48 @@ fn parse_psql_long_arg(
         }
         "--password-secret-env" => {
             state.password_secret_env = Some(take_long_arg_value(raw, i, "--password-secret-env")?);
+            Ok(())
+        }
+        "--container" => {
+            state.container = Some(take_long_arg_value(raw, i, "--container")?);
+            Ok(())
+        }
+        "--container-driver" => {
+            state.container_driver = Some(take_long_arg_value(raw, i, "--container-driver")?);
+            Ok(())
+        }
+        "--container-runtime" => {
+            state.container_runtime = Some(take_long_arg_value(raw, i, "--container-runtime")?);
+            Ok(())
+        }
+        "--container-user" => {
+            state.container_user = Some(take_long_arg_value(raw, i, "--container-user")?);
+            Ok(())
+        }
+        "--container-namespace" => {
+            state.container_namespace = Some(take_long_arg_value(raw, i, "--container-namespace")?);
+            Ok(())
+        }
+        "--container-context" => {
+            state.container_context = Some(take_long_arg_value(raw, i, "--container-context")?);
+            Ok(())
+        }
+        "--container-compose-file" => {
+            state.container_compose_files.push(take_long_arg_value(
+                raw,
+                i,
+                "--container-compose-file",
+            )?);
+            Ok(())
+        }
+        "--container-compose-project" => {
+            state.container_compose_project =
+                Some(take_long_arg_value(raw, i, "--container-compose-project")?);
+            Ok(())
+        }
+        "--container-pod-container" => {
+            state.container_pod_container =
+                Some(take_long_arg_value(raw, i, "--container-pod-container")?);
             Ok(())
         }
         "--output" => {
@@ -1185,9 +1351,34 @@ fn top_level_arg_consumes_value(arg: &str) -> bool {
             | "--ssh-local-port"
             | "--ssh-remote-socket"
             | "--ssh-sudo-user"
+            | "--container"
+            | "--container-driver"
+            | "--container-runtime"
+            | "--container-user"
+            | "--container-namespace"
+            | "--container-context"
+            | "--container-compose-file"
+            | "--container-compose-project"
+            | "--container-pod-container"
             | "--output"
             | "--log"
     )
+}
+
+fn resolve_container_compose_files(cli_files: Vec<String>) -> Vec<String> {
+    if !cli_files.is_empty() {
+        return cli_files;
+    }
+    std::env::var("AFPSQL_CONTAINER_COMPOSE_FILE")
+        .ok()
+        .map(|value| {
+            value
+                .split(':')
+                .filter(|part| !part.is_empty())
+                .map(std::string::ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn load_sql(sql: Option<String>, sql_file: Option<String>) -> Result<String, String> {

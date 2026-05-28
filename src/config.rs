@@ -47,23 +47,50 @@ impl RuntimeConfig {
                 if let Some(v) = s.password_secret.into_update() {
                     entry.password_secret = v;
                 }
-                if let Some(v) = s.ssh.into_update() {
-                    entry.ssh = v;
+                if let Some(v) = s.ssh.destination.into_update() {
+                    entry.ssh.destination = v;
                 }
-                if let Some(v) = s.ssh_options.into_update() {
-                    entry.ssh_options = v.unwrap_or_default();
+                if let Some(v) = s.ssh.options.into_update() {
+                    entry.ssh.options = v.unwrap_or_default();
                 }
-                if let Some(v) = s.ssh_local_host.into_update() {
-                    entry.ssh_local_host = v;
+                if let Some(v) = s.ssh.local_host.into_update() {
+                    entry.ssh.local_host = v;
                 }
-                if let Some(v) = s.ssh_local_port.into_update() {
-                    entry.ssh_local_port = v;
+                if let Some(v) = s.ssh.local_port.into_update() {
+                    entry.ssh.local_port = v;
                 }
-                if let Some(v) = s.ssh_remote_socket.into_update() {
-                    entry.ssh_remote_socket = v;
+                if let Some(v) = s.ssh.remote_socket.into_update() {
+                    entry.ssh.remote_socket = v;
                 }
-                if let Some(v) = s.ssh_sudo_user.into_update() {
-                    entry.ssh_sudo_user = v;
+                if let Some(v) = s.ssh.sudo_user.into_update() {
+                    entry.ssh.sudo_user = v;
+                }
+                if let Some(v) = s.container.target.into_update() {
+                    entry.container.target = v;
+                }
+                if let Some(v) = s.container.driver.into_update() {
+                    entry.container.driver = v;
+                }
+                if let Some(v) = s.container.runtime.into_update() {
+                    entry.container.runtime = v;
+                }
+                if let Some(v) = s.container.user.into_update() {
+                    entry.container.user = v;
+                }
+                if let Some(v) = s.container.namespace.into_update() {
+                    entry.container.namespace = v;
+                }
+                if let Some(v) = s.container.context.into_update() {
+                    entry.container.context = v;
+                }
+                if let Some(v) = s.container.compose_files.into_update() {
+                    entry.container.compose_files = v.unwrap_or_default();
+                }
+                if let Some(v) = s.container.compose_project.into_update() {
+                    entry.container.compose_project = v;
+                }
+                if let Some(v) = s.container.pod_container.into_update() {
+                    entry.container.pod_container = v;
                 }
             }
         }
@@ -83,23 +110,38 @@ impl RuntimeConfig {
         q: &QueryOptions,
         session: &SessionConfig,
     ) -> Result<ResolvedOptions, String> {
-        let uses_ssh = session.uses_ssh_transport();
-        let permission = q.permission.unwrap_or(if uses_ssh {
-            Permission::SshRead
-        } else {
-            Permission::Read
+        let transport = session.transport_kind()?;
+        let permission = q.permission.unwrap_or(match transport {
+            TransportKind::Direct => Permission::Read,
+            TransportKind::Ssh => Permission::SshRead,
+            TransportKind::Container => Permission::ContainerRead,
         });
-        if uses_ssh && !permission.allows_ssh() {
-            return Err(format!(
-                "permission `{}` does not allow SSH transport; use `ssh-read` or `ssh-write`",
-                permission.as_str()
-            ));
-        }
-        if !uses_ssh && permission.allows_ssh() {
-            return Err(format!(
-                "permission `{}` requires SSH transport; use `read` or `write` for direct connections",
-                permission.as_str()
-            ));
+        match transport {
+            TransportKind::Direct if permission.allows_ssh() => {
+                return Err(format!(
+                    "permission `{}` requires SSH transport; use `read` or `write` for direct connections",
+                    permission.as_str()
+                ));
+            }
+            TransportKind::Direct if permission.allows_container() => {
+                return Err(format!(
+                    "permission `{}` requires container transport; use `read` or `write` for direct connections",
+                    permission.as_str()
+                ));
+            }
+            TransportKind::Ssh if !permission.allows_ssh() => {
+                return Err(format!(
+                    "permission `{}` does not allow SSH transport; use `ssh-read` or `ssh-write`",
+                    permission.as_str()
+                ));
+            }
+            TransportKind::Container if !permission.allows_container() => {
+                return Err(format!(
+                    "permission `{}` does not allow container transport; use `container-read` or `container-write`",
+                    permission.as_str()
+                ));
+            }
+            _ => {}
         }
         Ok(self.resolve_options_with_permission(q, permission))
     }

@@ -13,6 +13,7 @@ mod cli;
 mod cli_runner;
 mod config;
 mod conn;
+mod container_transport;
 mod db;
 mod emit;
 mod handler;

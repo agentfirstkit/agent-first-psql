@@ -17,6 +17,7 @@ pub fn build_startup_log(
         config: None,
         args: Some(args.clone()),
         env: Some(env.clone()),
+        chain: None,
         trace: Trace::only_duration(0),
     }
 }

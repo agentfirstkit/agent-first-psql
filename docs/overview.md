@@ -20,6 +20,7 @@ Agents can depend on these semantics:
 - **SQL failures are data.** PostgreSQL errors are `sql_error` events with `SQLSTATE` and diagnostics.
 - **Runtime failures are data.** Client, transport, validation, and protocol failures are `error` events with stable `error_code`, `retryable`, and `hint` fields.
 - **Native writes are explicit.** Native CLI and pipe queries default to read-only PostgreSQL transactions.
+- **SSH/container boundaries are first-class.** `--ssh`, `--container`, and `--ssh + --container` keep the agent local while crossing server, container, and remote-container boundaries.
 - **Session ordering is deterministic.** Queries in the same pipe session run FIFO.
 - **Named sessions preserve backend state.** A named pipe session is intended to reuse the same PostgreSQL backend session until config invalidation or process shutdown.
 - **No SQL-text guessing.** `afpsql` uses PostgreSQL prepare/metadata results to decide result shape and parameter requirements.
@@ -29,9 +30,9 @@ promise of pooler-level throughput or workload balancing.
 
 ## Install it where the agent runs, not on every database server
 
-Install `afpsql` on the machine where the agent runs. The database server does
-not need afpsql installed; use SSH transport when PostgreSQL is reachable only
-from the server itself.
+Install `afpsql` on the machine where the agent runs. The database server or
+container does not need afpsql installed; use SSH or container transport when
+PostgreSQL is reachable only from that boundary.
 
 ```bash
 brew install agentfirstkit/tap/afpsql   # macOS/Linux
@@ -56,9 +57,12 @@ Suggested agent instruction:
 
 > Use local `afpsql` for non-interactive PostgreSQL work. Prefer read-only
 > queries. Ask before writes and use explicit permission. Use `afpsql --ssh
-> user@server` when PostgreSQL is only reachable from the server itself. Do not
-> SSH into a server just to run human `psql` unless I ask for that. Do not run
-> `afpsql --help` as routine preflight before known query forms.
+> user@server` when PostgreSQL is only reachable from the server itself, and
+> `afpsql --container CONTAINER` when PostgreSQL is only reachable from inside a
+> container. For containers on a remote SSH host, combine `--ssh user@server`
+> with `--container CONTAINER`. Do not SSH or run container exec commands just
+> to run human `psql` unless I ask for that. Do not run `afpsql --help` as
+> routine preflight before known query forms.
 
 ## Choose the mode by the reliability property you need
 
@@ -101,7 +105,8 @@ afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
 
 `psql` mode is only argument translation into the same structured runtime. It
 preserves psql's writable default for script compatibility and intentionally does
-not expose native afpsql permission flags or afpsql SSH transport extensions.
+not expose native afpsql permission flags. Prefer native afpsql mode for
+transport-specific agent work.
 
 Out of scope for psql mode:
 
@@ -118,10 +123,11 @@ Native CLI and pipe mode are read-only by default:
 |---|---|---|
 | direct PostgreSQL connection | `read` | `write` |
 | afpsql SSH transport | `ssh-read` | `ssh-write` |
+| afpsql container transport | `container-read` | `container-write` |
 
-`read` and `ssh-read` run the SQL inside a PostgreSQL read-only transaction.
-Writes fail with SQLSTATE `25006` unless the agent explicitly requests the right
-write permission.
+`read`, `ssh-read`, and `container-read` run the SQL inside a PostgreSQL read-only
+transaction. Writes fail with SQLSTATE `25006` unless the agent explicitly
+requests the right write permission.
 
 Direct write:
 
@@ -148,10 +154,20 @@ afpsql --permission ssh-write --ssh user@server \
   --param 1=123
 ```
 
+Container write:
+
+```bash
+afpsql --permission container-write --container pg-container \
+  --dsn-secret-env DATABASE_URL \
+  --sql "update jobs set checked_at = now() where id = $1" \
+  --param 1=123
+```
+
 Permission mismatches are rejected before execution with an `invalid_request`
 error and a corrective `hint`. For example, `--permission write --ssh ...` tells
 the agent to use `ssh-read` or `ssh-write`; `--permission ssh-write` without
-SSH tells the agent to use `read` or `write`.
+SSH tells the agent to use `read` or `write`; container sessions similarly require
+`container-read` or `container-write`.
 
 ## Parameters are data, not SQL text
 
@@ -260,6 +276,83 @@ Supported SSH options:
 SSH transport expects discrete connection fields. Prefer
 `--host/--port/--user/--dbname/--password-secret-env` over `--dsn-secret` or
 `--conninfo-secret` when `--ssh` is active.
+
+## Container transport reaches container-local PostgreSQL
+
+Use `--container TARGET` when PostgreSQL listens only from inside a container.
+This replaces `docker exec CONTAINER psql ...` and similar Podman, nerdctl,
+Compose, or Kubernetes exec calls for agent work. `afpsql` stays local, starts a
+no-TTY exec bridge through the selected driver, and runs a small stdio bridge in
+the container; the container does not need afpsql or psql.
+
+Container-local TCP:
+
+```bash
+afpsql --container pg-container \
+  --dsn-secret 'postgresql://app:pw@127.0.0.1:5432/appdb' \
+  --sql "select now()"
+```
+
+Container-local Unix socket:
+
+```bash
+afpsql --container pg-container \
+  --host /var/run/postgresql --port 5432 \
+  --user app --dbname appdb \
+  --sql "select current_user"
+```
+
+If the socket uses peer auth, add `--container-user OSUSER` so the container OS user
+matches the requested PostgreSQL role.
+
+Supported container options:
+
+- `--container TARGET` / `AFPSQL_CONTAINER`
+- `--container-driver docker|podman|nerdctl|compose|kubectl` / `AFPSQL_CONTAINER_DRIVER`
+- `--container-runtime docker` / `AFPSQL_CONTAINER_RUNTIME`
+- `--container-user postgres` / `AFPSQL_CONTAINER_USER`
+- `--container-context CTX` / `AFPSQL_CONTAINER_CONTEXT` for Docker or kubectl
+- `--container-namespace NS` / `AFPSQL_CONTAINER_NAMESPACE` for kubectl
+- repeatable `--container-compose-file PATH` for Compose, or
+  colon-separated `AFPSQL_CONTAINER_COMPOSE_FILE`
+- `--container-compose-project NAME` / `AFPSQL_CONTAINER_COMPOSE_PROJECT` for Compose
+- `--container-pod-container CTR` / `AFPSQL_CONTAINER_POD_CONTAINER` for
+  multi-container Kubernetes pods
+
+Use `--container-runtime docker-compose` with `--container-driver compose` for
+Compose v1. The default Compose driver form is Docker Compose v2
+(`docker compose exec`).
+
+For Kubernetes pods with more than one container, select the pod as
+`--container POD` and the inner container with `--container-pod-container CTR`;
+afpsql emits `kubectl exec POD -c CTR -i -- ...`.
+
+Container bridge prerequisites: the target container must provide `sh` plus one
+of `python3`, `python`, or `perl`. For distroless or scratch containers, attach
+a small sidecar with a supported interpreter or connect through PostgreSQL's host
+network path instead.
+
+The PostgreSQL host/port or socket path is interpreted inside the container.
+When `--container` is used alone, the container exec command runs locally.
+
+For containers on a remote SSH host, combine `--ssh` and `--container`. This is
+one local afpsql transport chain, not "SSH in, then run psql." It runs the
+container exec command on the SSH host, then bridges from inside the container:
+
+```bash
+afpsql --ssh root@server --container app-container \
+  --container-driver docker \
+  --host postgres --port 5432 \
+  --user app --dbname appdb \
+  --password-secret-env PGPASSWORD \
+  --sql "select 1"
+```
+
+Use `host.docker.internal` only when the remote Docker environment provides it
+(Docker Desktop, or Linux configured with `host-gateway`).
+
+The permission family is still container: reads default to `container-read`, and
+writes require `--permission container-write`.
 
 ## Connection inputs keep secrets out of shell history
 

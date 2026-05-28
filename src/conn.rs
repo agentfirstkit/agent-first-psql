@@ -111,6 +111,51 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+pub fn libpq_env_fallbacks_in_use(cfg: &SessionConfig) -> Vec<&'static str> {
+    if cfg.dsn_secret.is_some() || cfg.conninfo_secret.is_some() {
+        return Vec::new();
+    }
+    if std::env::var("AFPSQL_DSN_SECRET").is_ok() || std::env::var("AFPSQL_CONNINFO_SECRET").is_ok()
+    {
+        return Vec::new();
+    }
+    let mut used = Vec::new();
+    if cfg.host.is_none()
+        && std::env::var("AFPSQL_HOST").is_err()
+        && env_nonempty("PGHOST").is_some()
+    {
+        used.push("PGHOST");
+    }
+    if cfg.port.is_none()
+        && std::env::var("AFPSQL_PORT").is_err()
+        && env_nonempty("PGPORT").is_some()
+    {
+        used.push("PGPORT");
+    }
+    if cfg.user.is_none()
+        && std::env::var("AFPSQL_USER").is_err()
+        && env_nonempty("PGUSER").is_some()
+    {
+        used.push("PGUSER");
+    }
+    if cfg.dbname.is_none()
+        && std::env::var("AFPSQL_DBNAME").is_err()
+        && env_nonempty("PGDATABASE").is_some()
+    {
+        used.push("PGDATABASE");
+    }
+    if cfg.password_secret.is_none()
+        && std::env::var("AFPSQL_PASSWORD_SECRET").is_err()
+        && env_nonempty("PGPASSWORD").is_some()
+    {
+        used.push("PGPASSWORD");
+    }
+    if env_nonempty("PGSSLMODE").is_some() {
+        used.push("PGSSLMODE");
+    }
+    used
+}
+
 fn validate_dsn_ssl_options(dsn: &str) -> Result<(), ConnectionConfigError> {
     let Some(query) = dsn.split_once('?').map(|(_, query)| query) else {
         return Ok(());
