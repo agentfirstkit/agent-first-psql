@@ -14,50 +14,100 @@ pub(super) fn row_to_json_fallback(row: &tokio_postgres::Row) -> Value {
     Value::Object(map)
 }
 
+/// Marker emitted when a decoder for a known type fails at runtime (e.g.,
+/// unexpected binary encoding). Distinct from `<unhandled_type:T>` so an
+/// agent can tell "decoder broke" from "type lacks a decoder."
+fn decode_error(ty: &Type) -> Value {
+    Value::String(format!("<decode_error:{}>", ty.name()))
+}
+
+/// Decode a known typed column or return `<decode_error:T>` on failure.
+/// `null` only flows through when PG actually reports the column NULL.
+fn decode_typed<T, F>(row: &tokio_postgres::Row, idx: usize, ty: &Type, map: F) -> Value
+where
+    T: for<'a> tokio_postgres::types::FromSql<'a>,
+    F: FnOnce(T) -> Value,
+{
+    match row.try_get::<_, Option<T>>(idx) {
+        Ok(None) => Value::Null,
+        Ok(Some(v)) => map(v),
+        Err(_) => decode_error(ty),
+    }
+}
+
 pub(super) fn decode_row_value_fallback(row: &tokio_postgres::Row, idx: usize, ty: &Type) -> Value {
     match *ty {
-        Type::BOOL => row
-            .try_get::<_, Option<bool>>(idx)
-            .ok()
-            .flatten()
-            .map(Value::Bool)
-            .unwrap_or(Value::Null),
-        Type::INT2 => row
-            .try_get::<_, Option<i16>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| json!(v))
-            .unwrap_or(Value::Null),
-        Type::INT4 => row
-            .try_get::<_, Option<i32>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| json!(v))
-            .unwrap_or(Value::Null),
-        Type::INT8 => row
-            .try_get::<_, Option<i64>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| json!(v))
-            .unwrap_or(Value::Null),
-        Type::FLOAT4 => row
-            .try_get::<_, Option<f32>>(idx)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::Number::from_f64(v as f64).map(Value::Number))
-            .unwrap_or(Value::Null),
-        Type::FLOAT8 => row
-            .try_get::<_, Option<f64>>(idx)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::Number::from_f64(v).map(Value::Number))
-            .unwrap_or(Value::Null),
-        Type::JSON | Type::JSONB => row
-            .try_get::<_, Option<Json<Value>>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| v.0)
-            .unwrap_or(Value::Null),
+        Type::BOOL => decode_typed::<bool, _>(row, idx, ty, Value::Bool),
+        Type::INT2 => decode_typed::<i16, _>(row, idx, ty, |v| json!(v)),
+        Type::INT4 => decode_typed::<i32, _>(row, idx, ty, |v| json!(v)),
+        Type::INT8 => decode_typed::<i64, _>(row, idx, ty, |v| json!(v)),
+        Type::FLOAT4 => decode_typed::<f32, _>(row, idx, ty, |v| {
+            serde_json::Number::from_f64(v as f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
+        }),
+        Type::FLOAT8 => decode_typed::<f64, _>(row, idx, ty, |v| {
+            serde_json::Number::from_f64(v)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
+        }),
+        Type::JSON | Type::JSONB => decode_typed::<Json<Value>, _>(row, idx, ty, |v| v.0),
+        Type::BYTEA => decode_typed::<Vec<u8>, _>(row, idx, ty, |bytes| {
+            // Encode as the standard PostgreSQL `\\x` hex string so a round
+            // trip through psql or another client preserves the bytes.
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("\\x");
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            Value::String(s)
+        }),
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY | Type::NAME_ARRAY => {
+            decode_typed::<Vec<Option<String>>, _>(row, idx, ty, |items| {
+                Value::Array(
+                    items
+                        .into_iter()
+                        .map(|v| match v {
+                            Some(s) => Value::String(s),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                )
+            })
+        }
+        Type::INT2_ARRAY => decode_typed::<Vec<Option<i16>>, _>(row, idx, ty, |items| {
+            Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(n) => json!(n),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            )
+        }),
+        Type::INT4_ARRAY => decode_typed::<Vec<Option<i32>>, _>(row, idx, ty, |items| {
+            Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(n) => json!(n),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            )
+        }),
+        Type::INT8_ARRAY => decode_typed::<Vec<Option<i64>>, _>(row, idx, ty, |items| {
+            Value::Array(
+                items
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(n) => json!(n),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            )
+        }),
         _ => {
             if let Ok(Some(s)) = row.try_get::<_, Option<String>>(idx) {
                 return Value::String(s);

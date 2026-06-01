@@ -94,6 +94,24 @@ Different sessions are isolated.
 {"code":"query","id":"q1","session":"work","sql":"select current_database() as db"}
 ```
 
+Pipe mode also accepts `begin`/`commit`/`rollback` for explicit multi-statement
+transactions. While a transaction is open, queries bypass the implicit
+`BEGIN..COMMIT` wrap; per-query failures are isolated by a savepoint so a single
+bad statement does not abort the whole tx. See `docs/reference.md` for the input
+shape.
+
+### Schema discovery and plan inspection
+
+Run `afpsql inspect <databases|schemas|tables|views|table NAME>` instead of
+writing `information_schema` / `pg_catalog` queries by hand. Wrap any query in
+`--explain` (`EXPLAIN (FORMAT JSON)`) or `--explain-analyze` (also runs the
+statement) to receive the plan tree as a normal `code:"result"` row.
+
+Pre-flight a query with `--dry-run`: afpsql opens a connection, runs `PREPARE`
+inside a transaction that is rolled back, and emits a `dry_run` event carrying
+the inferred `param_types` and output `columns` — no rows are scanned and no
+side effects occur.
+
 ### psql compatibility: scripts only
 
 Use `--mode psql` or the managed wrapper for non-interactive scripts that already
@@ -198,10 +216,15 @@ positional parameters. Non-numeric interpolation variables are not supported.
 
 Common output events:
 
-- `result` — small row result or command result
+- `result` — small row result, command result, or transaction control
+  acknowledgement (`command_tag` of `BEGIN`/`COMMIT`/`ROLLBACK`). Carries
+  `truncated:true` plus `truncated_at_rows`/`truncated_at_bytes` when the
+  inline cap was hit.
 - `result_start` / `result_rows` / `result_end` — streamed row result
 - `sql_error` — PostgreSQL error with `sqlstate`
 - `error` — validation, connection, permission, protocol, or transport error
+- `dry_run` — preview response for `--dry-run`; carries `param_types` and
+  `columns` inferred from a rolled-back PREPARE
 - `config`, `pong`, `close`, `log` — runtime protocol events
 
 Connection-stage PostgreSQL rejections use `code:"error"` with
@@ -217,8 +240,12 @@ Use streaming when the agent expects a large result set:
 afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
 ```
 
-If streaming is off and inline limits are exceeded, `afpsql` returns
-`error_code:"result_too_large"` rather than dumping an unbounded payload.
+If streaming is off and inline limits are exceeded, `afpsql` soft-truncates
+the result: the agent receives a `code:"result"` event with the first N rows
+and `truncated:true` (plus the cap that fired). The underlying SQL still
+executed in full; only the projection returned to the agent is capped.
+Either narrow the query with `WHERE`/`LIMIT` or switch to `--stream-rows`
+to see everything.
 
 ## SSH transport makes the remote boundary explicit
 

@@ -7,6 +7,10 @@ pub enum ExecError {
         hint: Option<String>,
     },
     InvalidParams(String),
+    /// Reserved variant: the inline path now soft-truncates instead of
+    /// erroring, but this variant is preserved so future callers (e.g. a
+    /// dedicated row-limit gate) can opt back into the hard-fail shape.
+    #[allow(dead_code)]
     ResultTooLarge {
         row_count: usize,
         payload_bytes: usize,

@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."
 license = "MIT"

@@ -135,19 +135,27 @@ Input commands:
 - `ping`
 - `close`
 - `session_info`
+- `begin`, `commit`, `rollback` (pipe-mode explicit transactions; subsequent
+  `query` events on the same session run inside the open transaction with
+  per-query savepoint isolation)
 
 Output events:
 
-- `result`
+- `result` (includes optional `truncated`, `truncated_at_rows`,
+  `truncated_at_bytes` when the inline cap fired; tx control events reuse
+  `result` with `command_tag` of `BEGIN`/`COMMIT`/`ROLLBACK`)
 - `result_start`
 - `result_rows`
 - `result_end`
 - `sql_error`
 - `error`
+- `dry_run` (preview-only response to `--dry-run`; carries `param_types`
+  and `columns` inferred from a rolled-back PREPARE)
 - `config`
 - `pong`
 - `close`
-- `session_info`
+- `session_info` (includes resolved `database`/`user`/`host`/`port`/
+  `server_version` from a probe SELECT when reachable)
 - `log`
 
 Every recoverable runtime condition should be represented by one of these stdout
@@ -193,8 +201,12 @@ When streaming is enabled:
 3. emit repeated `result_rows` batches
 4. emit `result_end` with totals in `trace`
 
-If streaming is off and limits are exceeded, return
-`error_code:"result_too_large"` and roll back the transaction.
+If streaming is off and limits are exceeded, the inline collector stops
+accepting rows at the cap and the `result` event carries `truncated:true`
+plus `truncated_at_rows` or `truncated_at_bytes`. The underlying statement
+still ran in full: for `UPDATE ... RETURNING`, the writes happened and the
+RETURNING projection is what got capped. Agents that need the full set
+should narrow the query or switch to `--stream-rows`.
 
 ## Error taxonomy: SQLSTATE or actionable runtime code
 

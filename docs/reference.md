@@ -205,6 +205,42 @@ connected to without probing via failing queries.
 Unknown session names return `code:"error"` with `error_code:"invalid_request"`
 and a hint pointing to `config`.
 
+### `begin` / `commit` / `rollback`
+
+Pipe-mode explicit transactions. Without these, every `query` is wrapped in
+its own implicit `BEGIN..COMMIT`, so multi-statement atomicity requires
+jamming everything into one SQL string. After `begin`, subsequent `query`
+events on the same session run inside the open transaction until a matching
+`commit` or `rollback`.
+
+```json
+{"code":"begin","id":"b1","session":"default","read_only":false,"permission":"write"}
+{"code":"commit","id":"c1","session":"default"}
+{"code":"rollback","id":"rb1","session":"default"}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `code` | yes | `"begin"`, `"commit"`, or `"rollback"` |
+| `id` | no | client correlation id, echoed on the response |
+| `session` | no | session id; default session if omitted |
+| `read_only` | no, `begin` only | when `true`, send `BEGIN READ ONLY` |
+| `permission` | no, `begin` only | required when `read_only:false` on a session whose default permission is read; `write` / `ssh-write` / `container-write` |
+
+The response is a `code:"result"` event with `command_tag` set to `"BEGIN"`,
+`"COMMIT"`, or `"ROLLBACK"`. Failures (e.g. `begin` while already in a tx,
+`commit` with no open tx, or PostgreSQL errors) surface as `error` or
+`sql_error`.
+
+Per-query failures inside an explicit transaction are wrapped in a savepoint
+and rolled back individually, so the user's outer transaction is NOT
+aborted by a single bad query — the agent can retry or move on without
+losing prior progress. Send `rollback` to discard the whole transaction or
+`commit` to persist the work done so far.
+
+Tx control runs through the same session FIFO as `query`, so the order an
+agent writes events to stdin is the order PostgreSQL sees them.
+
 ## Output (stdout)
 
 ### `result`
@@ -219,8 +255,16 @@ Small result returned inline.
 | `command_tag` | Normalized command tag (`ROWS N` / `EXECUTE N`) |
 | `columns` | column metadata array |
 | `rows` | result rows |
-| `row_count` | row count |
+| `row_count` | row count actually emitted (the prefix size when `truncated`) |
+| `truncated` | optional; `true` when `rows` is a prefix of the full result |
+| `truncated_at_rows` | optional; inline row cap that fired |
+| `truncated_at_bytes` | optional; inline byte cap that fired |
 | `trace` | timing and counters |
+
+When `truncated: true`, the underlying SQL still executed in full. For
+`UPDATE ... RETURNING`, this means the writes happened and the RETURNING
+projection delivered to the agent is the first N rows. To collect the
+full result, narrow the query with `WHERE` or switch to `--stream-rows`.
 
 ### `result_start`
 
@@ -255,6 +299,27 @@ End of streamed result.
 | `session` | session used |
 | `command_tag` | Normalized command tag (`ROWS N` / `EXECUTE N`) |
 | `trace` | includes `duration_ms`, `row_count`, `payload_bytes` |
+
+### `dry_run`
+
+Emitted instead of executing the SQL when `--dry-run` is passed. The server
+prepares the statement inside a transaction that is rolled back, so this also
+validates table/column existence and placeholder counts without side effects.
+
+| Field | Description |
+|---|---|
+| `code` | `"dry_run"` |
+| `id` | optional client correlation id |
+| `sql` | the SQL that would have been executed |
+| `params` | the params that would have been bound, in JSON-encoded form |
+| `session` | session that would have been used |
+| `param_types` | inferred PostgreSQL types for `$1`, `$2`, ... in placeholder order |
+| `columns` | output column metadata (empty for non-SELECT statements) |
+| `trace` | timing and counters |
+
+If preparation fails, `afpsql` emits `sql_error` (PostgreSQL diagnostic) or
+`error` (placeholder-count mismatch / connect failure) with the same shape as
+a normal query, and exits non-zero.
 
 ### `sql_error`
 
@@ -321,7 +386,18 @@ Response to a `session_info` request.
 | `inline_max_bytes` | resolved inline payload byte cap |
 | `statement_timeout_ms` | resolved statement timeout |
 | `lock_timeout_ms` | resolved lock timeout |
+| `database` | optional PostgreSQL database name (from probe or config) |
+| `user` | optional PostgreSQL role (from probe or config) |
+| `host` | optional server host (from probe or config) |
+| `port` | optional server port (from probe or config) |
+| `server_version` | optional PostgreSQL server version (from probe) |
 | `trace` | timing and counters |
+
+If the probe SELECT succeeds during `session_info`, `database`/`user`/`host`/
+`port`/`server_version` reflect what the PostgreSQL server itself reports.
+If the probe fails (typically because connection setup itself fails), the
+fields fall back to the resolved session config and `server_version` is omitted.
+Probe failures do not cause `session_info` to error.
 
 ### Other output codes
 

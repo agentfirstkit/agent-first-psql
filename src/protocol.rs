@@ -19,6 +19,9 @@ pub mod log_event {
 pub mod command_tag {
     pub const EXECUTE: &str = "EXECUTE";
     pub const SELECT: &str = "SELECT";
+    pub const BEGIN: &str = "BEGIN";
+    pub const COMMIT: &str = "COMMIT";
+    pub const ROLLBACK: &str = "ROLLBACK";
 
     pub fn execute(affected: usize) -> String {
         format!("EXECUTE {affected}")

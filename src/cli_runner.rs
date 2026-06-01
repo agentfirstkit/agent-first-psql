@@ -1,3 +1,4 @@
+use crate::db::ExecRequest;
 use crate::handler;
 use crate::handler::App;
 use crate::limits::OUTPUT_CHANNEL_CAPACITY;
@@ -37,18 +38,6 @@ pub async fn run(req: crate::cli::CliRequest) {
         }
     };
 
-    if dry_run {
-        let dry = Output::DryRun {
-            id: None,
-            sql: sql.clone(),
-            params: params.iter().map(|v| v.to_string()).collect(),
-            session: Some("default".to_string()),
-            trace: Trace::only_duration(0),
-        };
-        sink.emit(&dry);
-        return;
-    }
-
     let config = RuntimeConfig::default();
     let (tx, mut rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
     let app = Arc::new(App::new(config, tx));
@@ -59,6 +48,52 @@ pub async fn run(req: crate::cli::CliRequest) {
         if !log.is_empty() {
             cfg.log = log.clone();
         }
+    }
+
+    if dry_run {
+        let start = std::time::Instant::now();
+        let cfg = app.config.read().await.clone();
+        let session_cfg = cfg.sessions.get("default").cloned().unwrap_or_default();
+        let resolved_opts = cfg
+            .resolve_options_for_session(&options, &session_cfg)
+            .unwrap_or_else(|_| cfg.resolve_options(&options));
+        let outcome = app
+            .executor
+            .prepare_only(ExecRequest {
+                session_name: "default",
+                session_cfg: &session_cfg,
+                sql: &sql,
+                params: &params,
+                opts: &resolved_opts,
+                cancel_slot: None,
+                transport_log: None,
+            })
+            .await;
+        let mut had_error = false;
+        match outcome {
+            Ok(info) => {
+                let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+                sink.emit(&Output::DryRun {
+                    id: None,
+                    sql: sql.clone(),
+                    params: params.iter().map(|v| v.to_string()).collect(),
+                    session: Some("default".to_string()),
+                    param_types: info.param_types,
+                    columns: info.columns,
+                    trace,
+                });
+            }
+            Err(err) => {
+                had_error = true;
+                handler::emit_exec_error(&app, None, "default", err, start).await;
+            }
+        }
+        app.executor.shutdown().await;
+        drop(app);
+        while let Some(event) = rx.recv().await {
+            sink.emit(&event);
+        }
+        std::process::exit(if had_error { 1 } else { 0 });
     }
 
     if startup_requested {
@@ -87,10 +122,7 @@ pub async fn run(req: crate::cli::CliRequest) {
 
     let mut had_error = false;
     while let Some(event) = rx.recv().await {
-        if matches!(
-            event,
-            Output::Error { .. } | Output::ConnectError { .. } | Output::SqlError { .. }
-        ) {
+        if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
             had_error = true;
         }
         sink.emit(&event);

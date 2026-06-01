@@ -117,8 +117,29 @@ struct PipeRuntime {
 }
 
 struct SessionWorker {
-    tx: mpsc::Sender<QueuedQuery>,
+    tx: mpsc::Sender<SessionOp>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// One operation queued for a session's worker. Tx control (`begin`/
+/// `commit`/`rollback`) flows through the same FIFO as `query` so that
+/// the agent's input order is the order PostgreSQL sees, even though
+/// queries normally run on a separate task.
+enum SessionOp {
+    Query(QueuedQuery),
+    Begin {
+        id: Option<String>,
+        session: String,
+        read_only: bool,
+    },
+    Commit {
+        id: Option<String>,
+        session: String,
+    },
+    Rollback {
+        id: Option<String>,
+        session: String,
+    },
 }
 
 struct QueuedQuery {
@@ -177,9 +198,238 @@ async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
                 })
                 .await;
         }
+        Input::Begin {
+            id,
+            session,
+            read_only,
+            permission,
+        } => dispatch_begin(runtime, id, session, read_only, permission).await,
+        Input::Commit { id, session } => dispatch_commit(runtime, id, session).await,
+        Input::Rollback { id, session } => dispatch_rollback(runtime, id, session).await,
         Input::Close => return true,
     }
     false
+}
+
+async fn dispatch_begin(
+    runtime: &Arc<PipeRuntime>,
+    id: Option<String>,
+    session: Option<String>,
+    read_only: bool,
+    permission: Option<crate::types::Permission>,
+) {
+    let app = &runtime.app;
+    let cfg = app.config.read().await.clone();
+    let resolved_session = crate::conn::resolve_session_name(&cfg, session.as_deref());
+    let Some(session_cfg) = cfg.sessions.get(&resolved_session).cloned() else {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::CONNECT_FAILED.to_string(),
+                error: format!("unknown session: {resolved_session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: Some(
+                    "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
+                ),
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+        return;
+    };
+
+    // A read-write begin needs a write permission matching the session's
+    // transport. Read-only begin always passes (it's strictly less than the
+    // session default).
+    if !read_only {
+        let probe = QueryOptions {
+            permission,
+            ..Default::default()
+        };
+        if let Err(message) = cfg.resolve_options_for_session(&probe, &session_cfg) {
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id,
+                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
+                    hint: Some(
+                        "pass `permission` matching this session's transport (write / ssh-write / container-write), or set read_only:true"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                    trace: Trace::only_duration(0),
+                })
+                .await;
+            return;
+        }
+    }
+
+    let tx = get_session_worker(runtime, &resolved_session).await;
+    if tx
+        .send(SessionOp::Begin {
+            id: id.clone(),
+            session: resolved_session,
+            read_only,
+        })
+        .await
+        .is_err()
+    {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: "session worker is unavailable".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: Some("retry; the session worker will be restarted".to_string()),
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+    }
+}
+
+async fn dispatch_commit(runtime: &Arc<PipeRuntime>, id: Option<String>, session: Option<String>) {
+    enqueue_tx_finish(runtime, id, session, true).await;
+}
+
+async fn dispatch_rollback(
+    runtime: &Arc<PipeRuntime>,
+    id: Option<String>,
+    session: Option<String>,
+) {
+    enqueue_tx_finish(runtime, id, session, false).await;
+}
+
+async fn enqueue_tx_finish(
+    runtime: &Arc<PipeRuntime>,
+    id: Option<String>,
+    session: Option<String>,
+    commit: bool,
+) {
+    let app = &runtime.app;
+    let cfg = app.config.read().await.clone();
+    let resolved_session = crate::conn::resolve_session_name(&cfg, session.as_deref());
+    if !cfg.sessions.contains_key(&resolved_session) {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::CONNECT_FAILED.to_string(),
+                error: format!("unknown session: {resolved_session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: None,
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+        return;
+    }
+    let tx = get_session_worker(runtime, &resolved_session).await;
+    let op = if commit {
+        SessionOp::Commit {
+            id: id.clone(),
+            session: resolved_session,
+        }
+    } else {
+        SessionOp::Rollback {
+            id: id.clone(),
+            session: resolved_session,
+        }
+    };
+    if tx.send(op).await.is_err() {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: "session worker is unavailable".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: Some("retry; the session worker will be restarted".to_string()),
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+    }
+}
+
+async fn emit_tx_error(
+    app: &Arc<App>,
+    id: Option<String>,
+    resolved_session: &str,
+    err: crate::db::ExecError,
+    start: Instant,
+) {
+    use crate::db::ExecError;
+    let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+    let output = match err {
+        ExecError::Sql {
+            sqlstate,
+            message,
+            detail,
+            hint,
+            position,
+        } => Output::SqlError {
+            id,
+            session: Some(resolved_session.to_string()),
+            sqlstate,
+            message,
+            detail,
+            hint,
+            position,
+            trace,
+        },
+        ExecError::Connect(connect) => {
+            let c = *connect;
+            Output::Error {
+                id,
+                error_code: error_code::CONNECT_FAILED.to_string(),
+                error: c.error,
+                sqlstate: c.sqlstate,
+                message: c.message,
+                detail: c.detail,
+                hint: c.hint,
+                retryable: c.retryable,
+                trace,
+            }
+        }
+        ExecError::InvalidParams(message) => Output::Error {
+            id,
+            error_code: error_code::INVALID_REQUEST.to_string(),
+            error: message,
+            sqlstate: None,
+            message: None,
+            detail: None,
+            hint: None,
+            retryable: false,
+            trace,
+        },
+        other => Output::Error {
+            id,
+            error_code: error_code::INVALID_REQUEST.to_string(),
+            error: format!("{other:?}"),
+            sqlstate: None,
+            message: None,
+            detail: None,
+            hint: None,
+            retryable: false,
+            trace,
+        },
+    };
+    let _ = app.writer.send(output).await;
 }
 
 async fn dispatch_query(
@@ -212,6 +462,9 @@ async fn dispatch_query(
                     id: Some(key.clone()),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: "duplicate active query id".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "pick a unique `id` per in-flight query, or cancel the prior one first"
                             .to_string(),
@@ -227,6 +480,9 @@ async fn dispatch_query(
                 id: Some(key.clone()),
                 error_code: error_code::INVALID_REQUEST.to_string(),
                 error: "too many queued or running queries".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
                 hint: Some(format!(
                     "maximum queued or running queries is {MAX_ACTIVE_QUERIES}"
                 )),
@@ -266,7 +522,7 @@ async fn dispatch_query(
         cancel_slot,
         state,
     };
-    if tx.send(queued).await.is_err() {
+    if tx.send(SessionOp::Query(queued)).await.is_err() {
         let _ = app.in_flight.lock().await.remove(&key);
         let _ = app
             .writer
@@ -274,6 +530,9 @@ async fn dispatch_query(
                 id: Some(key),
                 error_code: error_code::INVALID_REQUEST.to_string(),
                 error: "session worker is unavailable".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
                 hint: Some("retry the query; the session worker will be restarted".to_string()),
                 retryable: true,
                 trace: Trace::only_duration(0),
@@ -289,7 +548,11 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
     };
 
     if let Some(query) = query {
-        if query.state.phase() == QueryPhase::Finished {
+        // Try to claim the terminal emit slot. If the handler already won
+        // (result/sql_error has been sent), report `already finished` and
+        // do not emit a second terminal event.
+        let won_emit = query.cancel_slot.claim_terminal_emit();
+        if !won_emit || query.state.phase() == QueryPhase::Finished {
             let _ = app.in_flight.lock().await.remove(&id);
             let _ = app
                 .writer
@@ -297,6 +560,9 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                     id: Some(id),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: "query already finished".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "cancel raced completion; the prior result/error event holds the outcome"
                             .to_string(),
@@ -321,6 +587,9 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                     id: Some(id),
                     error_code: error_code::CANCELLED.to_string(),
                     error: "query cancelled".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint,
                     retryable: false,
                     trace: Trace::only_duration(0),
@@ -334,6 +603,9 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                 id: Some(id),
                 error_code: error_code::INVALID_REQUEST.to_string(),
                 error: "no queued or running query with this id".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
                 hint: Some(
                     "no matching in-flight query for this id; it may have already completed or never been submitted"
                         .to_string(),
@@ -345,10 +617,7 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
     }
 }
 
-async fn get_session_worker(
-    runtime: &Arc<PipeRuntime>,
-    session: &str,
-) -> mpsc::Sender<QueuedQuery> {
+async fn get_session_worker(runtime: &Arc<PipeRuntime>, session: &str) -> mpsc::Sender<SessionOp> {
     let mut workers = runtime.workers.lock().await;
     if workers
         .get(session)
@@ -376,29 +645,152 @@ async fn get_session_worker(
     tx
 }
 
-async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<QueuedQuery>) {
-    while let Some(query) = rx.recv().await {
-        if query.cancel_slot.is_cancelled() || !query.state.try_start() {
-            query.state.set_phase(QueryPhase::Cancelled);
-            continue;
-        }
+async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<SessionOp>) {
+    while let Some(op) = rx.recv().await {
+        match op {
+            SessionOp::Query(query) => {
+                if query.cancel_slot.is_cancelled() || !query.state.try_start() {
+                    query.state.set_phase(QueryPhase::Cancelled);
+                    continue;
+                }
 
-        handler::execute_query(
-            &app,
-            Some(query.id),
-            Some(query.session),
-            query.sql,
-            query.params,
-            query.options,
-            Some(query.cancel_slot.clone()),
-        )
-        .await;
+                handler::execute_query(
+                    &app,
+                    Some(query.id),
+                    Some(query.session),
+                    query.sql,
+                    query.params,
+                    query.options,
+                    Some(query.cancel_slot.clone()),
+                )
+                .await;
 
-        if query.cancel_slot.is_cancelled() || query.state.phase() == QueryPhase::Cancelled {
-            query.state.set_phase(QueryPhase::Cancelled);
-        } else {
-            query.state.set_phase(QueryPhase::Finished);
+                if query.cancel_slot.is_cancelled() || query.state.phase() == QueryPhase::Cancelled
+                {
+                    query.state.set_phase(QueryPhase::Cancelled);
+                } else {
+                    query.state.set_phase(QueryPhase::Finished);
+                }
+            }
+            SessionOp::Begin {
+                id,
+                session,
+                read_only,
+            } => exec_tx_begin_on_worker(&app, id, session, read_only).await,
+            SessionOp::Commit { id, session } => {
+                exec_tx_finish_on_worker(&app, id, session, true).await
+            }
+            SessionOp::Rollback { id, session } => {
+                exec_tx_finish_on_worker(&app, id, session, false).await
+            }
         }
+    }
+}
+
+async fn exec_tx_begin_on_worker(
+    app: &Arc<App>,
+    id: Option<String>,
+    session: String,
+    read_only: bool,
+) {
+    let cfg = app.config.read().await.clone();
+    let Some(session_cfg) = cfg.sessions.get(&session).cloned() else {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::CONNECT_FAILED.to_string(),
+                error: format!("unknown session: {session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: None,
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+        return;
+    };
+    let start = Instant::now();
+    match app
+        .executor
+        .tx_begin(&session, &session_cfg, read_only)
+        .await
+    {
+        Ok(()) => {
+            let _ = app
+                .writer
+                .send(Output::Result {
+                    id,
+                    session: Some(session),
+                    command_tag: crate::protocol::command_tag::BEGIN.to_string(),
+                    columns: vec![],
+                    rows: vec![],
+                    row_count: 0,
+                    truncated: false,
+                    truncated_at_rows: None,
+                    truncated_at_bytes: None,
+                    trace: Trace::only_duration(start.elapsed().as_millis() as u64),
+                })
+                .await;
+        }
+        Err(err) => emit_tx_error(app, id, &session, err, start).await,
+    }
+}
+
+async fn exec_tx_finish_on_worker(
+    app: &Arc<App>,
+    id: Option<String>,
+    session: String,
+    commit: bool,
+) {
+    let cfg = app.config.read().await.clone();
+    let Some(session_cfg) = cfg.sessions.get(&session).cloned() else {
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id,
+                error_code: error_code::CONNECT_FAILED.to_string(),
+                error: format!("unknown session: {session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: None,
+                retryable: true,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+        return;
+    };
+    let start = Instant::now();
+    let result = if commit {
+        app.executor.tx_commit(&session, &session_cfg).await
+    } else {
+        app.executor.tx_rollback(&session, &session_cfg).await
+    };
+    match result {
+        Ok(()) => {
+            let _ = app
+                .writer
+                .send(Output::Result {
+                    id,
+                    session: Some(session),
+                    command_tag: if commit {
+                        crate::protocol::command_tag::COMMIT.to_string()
+                    } else {
+                        crate::protocol::command_tag::ROLLBACK.to_string()
+                    },
+                    columns: vec![],
+                    rows: vec![],
+                    row_count: 0,
+                    truncated: false,
+                    truncated_at_rows: None,
+                    truncated_at_bytes: None,
+                    trace: Trace::only_duration(start.elapsed().as_millis() as u64),
+                })
+                .await;
+        }
+        Err(err) => emit_tx_error(app, id, &session, err, start).await,
     }
 }
 
@@ -496,6 +888,9 @@ pub(crate) fn validate_query_request(
             id: Some(id.to_string()),
             error_code: error_code::INVALID_REQUEST.to_string(),
             error: "sql exceeds maximum size".to_string(),
+            sqlstate: None,
+            message: None,
+            detail: None,
             hint: Some(format!("maximum SQL size is {MAX_SQL_BYTES} bytes")),
             retryable: false,
             trace: Trace::only_duration(0),
@@ -506,6 +901,9 @@ pub(crate) fn validate_query_request(
             id: Some(id.to_string()),
             error_code: error_code::INVALID_REQUEST.to_string(),
             error: "too many params".to_string(),
+            sqlstate: None,
+            message: None,
+            detail: None,
             hint: Some(format!("maximum params is {MAX_PARAMS}")),
             retryable: false,
             trace: Trace::only_duration(0),
@@ -528,6 +926,9 @@ async fn send_protocol_error(
             id,
             error_code: error_code.to_string(),
             error: error.to_string(),
+            sqlstate: None,
+            message: None,
+            detail: None,
             hint: hint.map(std::string::ToString::to_string),
             retryable,
             trace: Trace::only_duration(0),

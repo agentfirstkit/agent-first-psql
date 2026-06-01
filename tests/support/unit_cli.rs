@@ -9,7 +9,10 @@ fn parse_params_order_and_types() {
     let p_res = parse_params(&["2=active".to_string(), "1=42".to_string()]);
     assert!(p_res.is_ok());
     if let Ok(p) = p_res {
-        assert_eq!(p[0], Value::Number(42.into()));
+        // CLI --param values are passed as strings; PostgreSQL coerces based
+        // on the prepared statement's parameter type. This preserves leading
+        // zeros, signs, and NUMERIC precision.
+        assert_eq!(p[0], Value::String("42".to_string()));
         assert_eq!(p[1], Value::String("active".to_string()));
     }
 }
@@ -74,8 +77,18 @@ fn parse_param_value_primitives() {
     assert_eq!(parse_param_value("null"), Value::Null);
     assert_eq!(parse_param_value("true"), Value::Bool(true));
     assert_eq!(parse_param_value("false"), Value::Bool(false));
-    assert_eq!(parse_param_value("42"), Value::Number(42.into()));
-    assert_eq!(parse_param_value("1.5"), serde_json::json!(1.5));
+    // Numeric-looking strings stay as strings so PG receives the literal as
+    // written. This preserves leading zeros and NUMERIC precision.
+    assert_eq!(parse_param_value("42"), Value::String("42".to_string()));
+    assert_eq!(
+        parse_param_value("00123"),
+        Value::String("00123".to_string())
+    );
+    assert_eq!(parse_param_value("1.5"), Value::String("1.5".to_string()));
+    assert_eq!(
+        parse_param_value("12345.6789012345"),
+        Value::String("12345.6789012345".to_string())
+    );
     assert_eq!(parse_param_value("NaN"), Value::String("NaN".to_string()));
     assert_eq!(parse_param_value("abc"), Value::String("abc".to_string()));
 }
@@ -632,7 +645,7 @@ fn parse_psql_mode_positional_dsn_does_not_short_circuit() {
                 Some("postgresql://localhost/postgres")
             );
             assert_eq!(req.sql, "select $1::int as n");
-            assert_eq!(req.params, vec![serde_json::json!(7)]);
+            assert_eq!(req.params, vec![serde_json::json!("7")]);
         }
     }
 }
@@ -661,7 +674,7 @@ fn parse_psql_mode_accepts_long_aliases_clusters_and_behavior_vars() {
     assert!(mode_res.is_ok());
     if let Ok(Mode::Cli(req)) = mode_res {
         assert_eq!(req.sql, "select $1::int as n");
-        assert_eq!(req.params, vec![serde_json::json!(5)]);
+        assert_eq!(req.params, vec![serde_json::json!("5")]);
         assert_eq!(req.session.host.as_deref(), Some("localhost"));
         assert_eq!(req.session.port, Some(5432));
         assert_eq!(req.session.user.as_deref(), Some("roger"));

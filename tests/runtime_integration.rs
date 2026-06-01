@@ -84,7 +84,7 @@ fn cli_invalid_param_count_returns_error() {
 }
 
 #[test]
-fn cli_result_too_large_without_streaming() {
+fn cli_inline_max_rows_soft_truncates() {
     let out = Command::new(bin())
         .arg("--dsn-secret")
         .arg(test_dsn())
@@ -95,14 +95,25 @@ fn cli_result_too_large_without_streaming() {
         .output()
         .expect("run afpsql");
 
-    assert!(!out.status.success());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "result_too_large");
+    assert_eq!(v["code"], "result");
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["truncated_at_rows"], 2);
+    assert_eq!(v["row_count"], 2);
+    assert_eq!(v["rows"].as_array().map(|a| a.len()), Some(2));
 }
 
 #[test]
-fn cli_returning_result_too_large_rolls_back() {
+fn cli_returning_truncation_completes_update_but_caps_rows() {
+    // Inline truncation now matches PostgreSQL's own cursor semantics: the
+    // UPDATE still affects every matching row, but the RETURNING projection
+    // delivered to the agent is capped. The agent learns via
+    // `truncated: true` that the result is partial.
     let table = format!("afpsql_returning_limit_{}", unique_suffix());
     for sql in [
         format!("drop table if exists {table}"),
@@ -139,10 +150,16 @@ fn cli_returning_result_too_large_rolls_back() {
         .output()
         .expect("run update returning");
 
-    assert!(!out.status.success());
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "result_too_large");
+    assert_eq!(v["code"], "result");
+    assert_eq!(v["truncated"], true);
+    assert_eq!(v["truncated_at_rows"], 1);
+    assert_eq!(v["rows"].as_array().map(|a| a.len()), Some(1));
 
     let check_sql = format!("select count(*)::int as n from {table} where touched");
     let out = Command::new(bin())
@@ -158,7 +175,7 @@ fn cli_returning_result_too_large_rolls_back() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"], 0);
+    assert_eq!(v["rows"][0]["n"], 3);
 
     let _ = Command::new(bin())
         .arg("--dsn-secret")
@@ -243,6 +260,491 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
     );
     assert!(text.contains("\"code\":\"pong\""));
     assert!(text.contains("\"code\":\"close\""));
+}
+
+#[test]
+fn cli_bytea_decodes_as_hex_string() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select '\\x48656c6c6f'::bytea as b")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["rows"][0]["b"], "\\x48656c6c6f");
+}
+
+#[test]
+fn cli_text_array_decodes_as_json_array() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select array['a','b',null]::text[] as items")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["rows"][0]["items"][0], "a");
+    assert_eq!(v["rows"][0]["items"][1], "b");
+    assert!(v["rows"][0]["items"][2].is_null());
+}
+
+#[test]
+fn cli_explain_returns_plan_json() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select 1 as one")
+        .arg("--explain")
+        .output()
+        .expect("run afpsql --explain");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["code"], "result");
+    let plan = &v["rows"][0]["QUERY PLAN"][0]["Plan"];
+    assert!(plan["Node Type"].is_string(), "plan missing node type: {v}");
+}
+
+#[test]
+fn cli_explain_analyze_reports_actual_timing() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select 1 as one")
+        .arg("--explain-analyze")
+        .output()
+        .expect("run afpsql --explain-analyze");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let plan = &v["rows"][0]["QUERY PLAN"][0]["Plan"];
+    assert!(
+        plan["Actual Total Time"].is_number(),
+        "plan missing Actual Total Time: {v}"
+    );
+}
+
+#[test]
+fn pipe_explicit_tx_commit_persists_changes() {
+    let table = format!("afpsql_pipe_tx_{}", unique_suffix());
+    let payload = serde_json::json!({"code":"begin","id":"b","permission":"write"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"create","sql":format!("create table {table}(n int)"),"options":{"permission":"write"}}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"ins","sql":format!("insert into {table} values (7)"),"options":{"permission":"write"}}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"commit","id":"c"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"check","sql":format!("select n from {table}")}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"drop","sql":format!("drop table {table}"),"options":{"permission":"write"}}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let check_line = text
+        .lines()
+        .find(|l| l.contains("\"id\":\"check\""))
+        .expect("check event");
+    let check: Value = serde_json::from_str(check_line).expect("parse check");
+    assert_eq!(check["row_count"], 1);
+    assert_eq!(check["rows"][0]["n"], 7);
+}
+
+#[test]
+fn pipe_explicit_tx_rollback_discards_changes() {
+    let table = format!("afpsql_pipe_rb_{}", unique_suffix());
+    let payload = serde_json::json!({"code":"begin","id":"b","permission":"write"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"create","sql":format!("create table {table}(n int)"),"options":{"permission":"write"}}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"rollback","id":"rb"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"check","sql":format!("select to_regclass('{table}')::text as exists")}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let check_line = text
+        .lines()
+        .find(|l| l.contains("\"id\":\"check\""))
+        .expect("check event");
+    let check: Value = serde_json::from_str(check_line).expect("parse check");
+    assert!(
+        check["rows"][0]["exists"].is_null(),
+        "table should have been rolled back: {check}"
+    );
+}
+
+#[test]
+fn pipe_explicit_tx_savepoint_isolates_failed_query() {
+    // A failed query inside an explicit tx wraps itself in a savepoint and
+    // rolls back to it, so the user's outer tx is NOT aborted and the next
+    // query still runs.
+    let payload = serde_json::json!({"code":"begin","id":"b"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"qbad","sql":"select * from this_table_truly_does_not_exist"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"query","id":"qgood","sql":"select 1 as ok"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"rollback","id":"rb"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let qgood_line = text
+        .lines()
+        .find(|l| l.contains("\"id\":\"qgood\""))
+        .expect("qgood event");
+    let qgood: Value = serde_json::from_str(qgood_line).expect("parse qgood");
+    assert_eq!(qgood["code"], "result");
+    assert_eq!(qgood["rows"][0]["ok"], 1);
+}
+
+#[test]
+fn cli_inspect_schemas_lists_public() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("schemas")
+        .output()
+        .expect("run afpsql inspect schemas");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["code"], "result");
+    let rows = v["rows"].as_array().expect("rows array");
+    let names: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r["schema_name"].as_str())
+        .collect();
+    assert!(names.contains(&"public"), "schemas: {names:?}");
+}
+
+#[test]
+fn cli_inspect_table_describes_columns() {
+    let table = format!("afpsql_inspect_{}", unique_suffix());
+    let create = format!("create table {table}(id int primary key, name text not null, age int)");
+    let drop = format!("drop table if exists {table}");
+
+    let setup = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--permission")
+        .arg("write")
+        .arg("--sql")
+        .arg(&create)
+        .output()
+        .expect("create inspect table");
+    assert!(
+        setup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("table")
+        .arg(&table)
+        .output()
+        .expect("run afpsql inspect table");
+    let _ = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--permission")
+        .arg("write")
+        .arg("--sql")
+        .arg(&drop)
+        .output();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["row_count"], 3);
+    let rows = v["rows"].as_array().expect("rows array");
+    assert_eq!(rows[0]["name"], "id");
+    assert_eq!(rows[0]["nullable"], false);
+    assert_eq!(rows[1]["name"], "name");
+    assert_eq!(rows[1]["nullable"], false);
+    assert_eq!(rows[2]["name"], "age");
+    assert_eq!(rows[2]["nullable"], true);
+}
+
+#[test]
+fn cli_inspect_tables_filters_by_schema_and_pattern() {
+    let suffix = unique_suffix();
+    let table = format!("afpsql_inspect_tbl_{suffix}");
+    let create = format!("create table {table}(id int)");
+    let drop = format!("drop table if exists {table}");
+
+    let setup = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--permission")
+        .arg("write")
+        .arg("--sql")
+        .arg(&create)
+        .output()
+        .expect("create inspect tables");
+    assert!(
+        setup.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("tables")
+        .arg("--schema")
+        .arg("public")
+        .arg("--like")
+        .arg(format!("afpsql_inspect_tbl_{suffix}%"))
+        .output()
+        .expect("run afpsql inspect tables");
+    let _ = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--permission")
+        .arg("write")
+        .arg("--sql")
+        .arg(&drop)
+        .output();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["row_count"], 1);
+    assert_eq!(v["rows"][0]["name"], table);
+}
+
+#[test]
+fn cli_dry_run_reports_param_types_and_columns() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select $1::int4 as n, $2::text as t")
+        .arg("--param")
+        .arg("1=5")
+        .arg("--param")
+        .arg("2=hi")
+        .arg("--dry-run")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["code"], "dry_run");
+    assert_eq!(v["param_types"][0], "int4");
+    assert_eq!(v["param_types"][1], "text");
+    assert_eq!(v["columns"][0]["name"], "n");
+    assert_eq!(v["columns"][1]["name"], "t");
+}
+
+#[test]
+fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select * from this_table_does_not_exist_xyz")
+        .arg("--dry-run")
+        .output()
+        .expect("run afpsql");
+    assert_eq!(out.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["code"], "sql_error");
+    assert_eq!(v["sqlstate"], "42P01");
+}
+
+#[test]
+fn cli_param_preserves_string_form_for_text_column() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select $1::text as raw")
+        .arg("--param")
+        .arg("1=00123")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["rows"][0]["raw"], "00123");
+}
+
+#[test]
+fn cli_numeric_param_preserves_precision() {
+    // Cast result to text to bypass JSON-number precision limits; the goal is
+    // to verify the bind path sent the literal to PG without f64 rounding.
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg("select ($1::numeric(40,20))::text as n")
+        .arg("--param")
+        .arg("1=12345678901234567890.123456789012345")
+        .output()
+        .expect("run afpsql");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(
+        v["rows"][0]["n"],
+        "12345678901234567890.12345678901234500000"
+    );
+}
+
+#[test]
+fn pipe_session_info_reports_connection_identity() {
+    let payload = serde_json::json!({"code":"session_info"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write stdin");
+
+    let out = child.wait_with_output().expect("wait output");
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let info_line = text
+        .lines()
+        .find(|l| l.contains("\"code\":\"session_info\""))
+        .expect("session_info event");
+    let info: Value = serde_json::from_str(info_line).expect("parse session_info");
+    assert_eq!(info["database"], "afpsql_test");
+    assert_eq!(info["user"], "afpsql_test");
+    assert!(
+        info["server_version"].is_string(),
+        "server_version missing: {info_line}"
+    );
 }
 
 #[test]
@@ -375,7 +877,22 @@ fn pipe_config_and_cancel_existing_query() {
     );
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"code\":\"config\""));
-    assert!(text.contains("\"error_code\":\"cancelled\"") || text.contains("\"code\":\"result\""));
+    // Exactly one outcome event for q1, either the SELECT result (handler
+    // won) or the cancelled error (cancel dispatcher won). Never both.
+    let outcomes_for_q1 = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["id"] == "q1")
+        .filter(|v| {
+            let code = v["code"].as_str().unwrap_or("");
+            matches!(code, "result" | "sql_error")
+                || (code == "error" && v["error_code"].as_str() == Some("cancelled"))
+        })
+        .count();
+    assert_eq!(
+        outcomes_for_q1, 1,
+        "expected one outcome for q1, got {outcomes_for_q1}; output: {text}"
+    );
     assert!(text.contains("\"code\":\"close\""));
 }
 
@@ -817,7 +1334,25 @@ fn pipe_cancel_race_and_long_query() {
     );
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"code\":\"close\""));
-    assert!(text.contains("\"error_code\":\"cancelled\"") || text.contains("\"code\":\"result\""));
+    // The CAS guarantees exactly one *outcome* event for qrace (either
+    // `result`/`sql_error` if the handler won the race, or
+    // `error_code:cancelled` if the cancel dispatcher won). The second
+    // cancel request gets a separate "no matching in-flight query"
+    // acknowledgement, which is dispatch-level — not a query outcome.
+    let outcomes_for_qrace = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["id"] == "qrace")
+        .filter(|v| {
+            let code = v["code"].as_str().unwrap_or("");
+            matches!(code, "result" | "sql_error")
+                || (code == "error" && v["error_code"].as_str() == Some("cancelled"))
+        })
+        .count();
+    assert_eq!(
+        outcomes_for_qrace, 1,
+        "expected one outcome for qrace, got {outcomes_for_qrace}; output: {text}"
+    );
 }
 
 #[test]

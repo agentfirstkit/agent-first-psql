@@ -17,10 +17,19 @@ pub struct CancelState {
     backend_pid: Mutex<Option<i32>>,
     session_cfg: Mutex<Option<SessionConfig>>,
     cancelled: AtomicBool,
+    /// Set by the first emitter (handler or cancel dispatcher) to "win" the
+    /// terminal output for a query id. Guarantees the agent sees exactly one
+    /// terminal event (`result` / `sql_error` / cancelled `error`) per id.
+    terminal_emitted: AtomicBool,
 }
 
 pub(super) struct SessionEntry {
     pub(super) client: Mutex<Option<SessionClient>>,
+    /// True while an explicit `BEGIN` is open on this session's connection
+    /// (set by `begin`, cleared by `commit`/`rollback`). When set, the
+    /// executor bypasses its implicit `BEGIN..COMMIT` wrap and runs queries
+    /// directly on the open transaction.
+    pub(super) explicit_tx: AtomicBool,
 }
 
 pub(super) struct SessionClient {
@@ -50,6 +59,7 @@ pub fn new_cancel_slot() -> CancelSlot {
         backend_pid: Mutex::new(None),
         session_cfg: Mutex::new(None),
         cancelled: AtomicBool::new(false),
+        terminal_emitted: AtomicBool::new(false),
     })
 }
 
@@ -94,6 +104,17 @@ impl CancelState {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Atomic claim for the terminal emission for this query id. Returns
+    /// `true` exactly once across all concurrent callers (handler emitting
+    /// result/sql_error, cancel dispatcher emitting cancelled error). The
+    /// "loser" must skip its planned emission so the agent sees one
+    /// terminal event per id, never two.
+    pub fn claim_terminal_emit(&self) -> bool {
+        self.terminal_emitted
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
     pub(super) async fn set_context(
         &self,
         token: tokio_postgres::CancelToken,
@@ -110,6 +131,16 @@ pub(super) fn new_session_map() -> SessionMap {
     RwLock::new(HashMap::new())
 }
 
+impl SessionEntry {
+    pub(super) fn explicit_tx_active(&self) -> bool {
+        self.explicit_tx.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn set_explicit_tx(&self, active: bool) {
+        self.explicit_tx.store(active, Ordering::SeqCst);
+    }
+}
+
 pub(super) async fn get_session(sessions: &SessionMap, session_name: &str) -> Arc<SessionEntry> {
     if let Some(entry) = sessions.read().await.get(session_name) {
         return entry.clone();
@@ -121,6 +152,7 @@ pub(super) async fn get_session(sessions: &SessionMap, session_name: &str) -> Ar
         .or_insert_with(|| {
             Arc::new(SessionEntry {
                 client: Mutex::new(None),
+                explicit_tx: AtomicBool::new(false),
             })
         })
         .clone()

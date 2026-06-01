@@ -48,6 +48,9 @@ mod tests {
                 "duration_ms": 42
             })],
             row_count: 1,
+            truncated: false,
+            truncated_at_rows: None,
+            truncated_at_bytes: None,
             trace: Trace::only_duration(7),
         };
         let rendered = crate::output_fmt::render_output(&out, OutputFormat::Yaml);

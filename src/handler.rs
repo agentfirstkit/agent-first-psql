@@ -125,6 +125,9 @@ pub async fn execute_query(
                 id: id.clone(),
                 error_code: error_code::CONNECT_FAILED.to_string(),
                 error: format!("unknown session: {resolved_session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
                 hint: Some(
                     "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
                 ),
@@ -156,6 +159,9 @@ pub async fn execute_query(
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(hint),
                     retryable: false,
                     trace: trace.clone(),
@@ -207,6 +213,9 @@ pub async fn execute_query(
         if cancel_requested(&cancel_slot_for_suppression) {
             return;
         }
+        if !try_claim_terminal_emit(&cancel_slot_for_suppression) {
+            return;
+        }
         handle_streaming_result(app, id, resolved_session, result, sink, start).await;
         return;
     }
@@ -231,45 +240,44 @@ pub async fn execute_query(
     if cancel_requested(&cancel_slot) {
         return;
     }
+    if !try_claim_terminal_emit(&cancel_slot) {
+        return;
+    }
 
     match result {
-        Ok(ExecOutcome::Rows { columns, rows }) => {
+        Ok(ExecOutcome::Rows {
+            columns,
+            rows,
+            truncated,
+            truncated_at_rows,
+            truncated_at_bytes,
+        }) => {
             let status = emit_rows_result(
                 app,
                 id.clone(),
                 Some(resolved_session.clone()),
                 columns,
                 rows,
+                InlineTruncation {
+                    truncated,
+                    at_rows: truncated_at_rows,
+                    at_bytes: truncated_at_bytes,
+                },
                 start,
                 &resolved_opts,
             )
             .await;
-            match status {
-                RowEmitStatus::Sent { trace } => {
-                    emit_log(
-                        app,
-                        log_event::QUERY_RESULT,
-                        id.as_deref(),
-                        Some(&resolved_session),
-                        None,
-                        Some(command_tag::SELECT),
-                        &trace,
-                    )
-                    .await;
-                }
-                RowEmitStatus::TooLarge { trace } => {
-                    emit_log(
-                        app,
-                        log_event::QUERY_ERROR,
-                        id.as_deref(),
-                        Some(&resolved_session),
-                        Some(error_code::RESULT_TOO_LARGE),
-                        None,
-                        &trace,
-                    )
-                    .await;
-                }
-            }
+            let RowEmitStatus::Sent { trace } = status;
+            emit_log(
+                app,
+                log_event::QUERY_RESULT,
+                id.as_deref(),
+                Some(&resolved_session),
+                None,
+                Some(command_tag::SELECT),
+                &trace,
+            )
+            .await;
         }
         Ok(ExecOutcome::Command { affected }) => {
             emit_command_result(app, id, &resolved_session, affected, start).await;
@@ -304,6 +312,17 @@ fn permission_error_hint(options: &QueryOptions, session: &SessionConfig) -> Str
     }
 }
 
+/// Returns true if the caller wins the right to emit the terminal event
+/// (`result`/`sql_error`/`error`) for this query id. CLI mode (no
+/// cancel_slot) always wins. Pipe mode wins when the cancel dispatcher
+/// hasn't already claimed and emitted `cancelled`.
+fn try_claim_terminal_emit(cancel_slot: &Option<crate::db::CancelSlot>) -> bool {
+    cancel_slot
+        .as_ref()
+        .map(|slot| slot.claim_terminal_emit())
+        .unwrap_or(true)
+}
+
 fn cancel_requested(cancel_slot: &Option<crate::db::CancelSlot>) -> bool {
     cancel_slot
         .as_ref()
@@ -324,6 +343,9 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
                 id: id.clone(),
                 error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {resolved_session}"),
+                sqlstate: None,
+                message: None,
+                detail: None,
                 hint: Some(
                     "list active sessions with a `config` request, or pick the default session by omitting `session`"
                         .to_string(),
@@ -345,6 +367,9 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "this session's transport flags are inconsistent; update the session via a `config` request before requesting `session_info`"
                             .to_string(),
@@ -375,6 +400,9 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "the runtime config could not resolve query defaults for this session; update inline_max_rows/inline_max_bytes via `config` and retry"
                             .to_string(),
@@ -386,6 +414,9 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
             return;
         }
     };
+
+    let (database, user, host, port, server_version) =
+        probe_session_identity(app, &resolved_session, &session_cfg, &resolved_opts).await;
 
     let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
     let _ = app
@@ -402,9 +433,76 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
             inline_max_bytes: resolved_opts.inline_max_bytes,
             statement_timeout_ms: resolved_opts.statement_timeout_ms,
             lock_timeout_ms: resolved_opts.lock_timeout_ms,
+            database,
+            user,
+            host,
+            port,
+            server_version,
             trace,
         })
         .await;
+}
+
+async fn probe_session_identity(
+    app: &Arc<App>,
+    session_name: &str,
+    session_cfg: &SessionConfig,
+    resolved_opts: &ResolvedOptions,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u16>,
+    Option<String>,
+) {
+    let probe = app
+        .executor
+        .execute(ExecRequest {
+            session_name,
+            session_cfg,
+            sql: "select current_database()::text as database, \
+                  current_user::text as user, \
+                  inet_server_addr()::text as host, \
+                  inet_server_port() as port, \
+                  current_setting('server_version') as server_version",
+            params: &[],
+            opts: resolved_opts,
+            cancel_slot: None,
+            transport_log: None,
+        })
+        .await;
+
+    if let Ok(ExecOutcome::Rows { rows, .. }) = probe {
+        if let Some(row) = rows.first().and_then(|v| v.as_object()) {
+            let s = |key: &str| -> Option<String> {
+                row.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+            };
+            let port = row
+                .get("port")
+                .and_then(|v| v.as_i64())
+                .and_then(|n| u16::try_from(n).ok())
+                .or_else(|| {
+                    row.get("port")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                });
+            return (
+                s("database").or_else(|| session_cfg.dbname.clone()),
+                s("user").or_else(|| session_cfg.user.clone()),
+                s("host").or_else(|| session_cfg.host.clone()),
+                port.or(session_cfg.port),
+                s("server_version"),
+            );
+        }
+    }
+
+    (
+        session_cfg.dbname.clone(),
+        session_cfg.user.clone(),
+        session_cfg.host.clone(),
+        session_cfg.port,
+        None,
+    )
 }
 
 async fn handle_streaming_result(
@@ -477,6 +575,9 @@ async fn emit_command_result(
             columns: vec![],
             rows: vec![],
             row_count: 0,
+            truncated: false,
+            truncated_at_rows: None,
+            truncated_at_bytes: None,
             trace: trace.clone(),
         })
         .await;
@@ -492,7 +593,7 @@ async fn emit_command_result(
     .await;
 }
 
-async fn emit_exec_error(
+pub(crate) async fn emit_exec_error(
     app: &Arc<App>,
     id: Option<String>,
     resolved_session: &str,
@@ -508,6 +609,9 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::CANCELLED.to_string(),
                     error: "query cancelled".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "cancellation is final; submit a new query with a fresh id to retry"
                             .to_string(),
@@ -532,7 +636,7 @@ async fn emit_exec_error(
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
-                .send(Output::ConnectError {
+                .send(Output::Error {
                     id: id.clone(),
                     error_code: error_code::CONNECT_FAILED.to_string(),
                     error: connect.error,
@@ -563,6 +667,9 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint,
                     retryable: false,
                     trace: trace.clone(),
@@ -587,6 +694,9 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::INVALID_PARAMS.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "check that `params` count and types match the $1, $2, ... placeholders in `sql`"
                             .to_string(),
@@ -621,6 +731,9 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::RESULT_TOO_LARGE.to_string(),
                     error: "result exceeds inline limits".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(result_too_large_hint()),
                     retryable: false,
                     trace: trace.clone(),
@@ -677,6 +790,9 @@ async fn emit_exec_error(
                     id: id.clone(),
                     error_code: error_code::INVALID_REQUEST.to_string(),
                     error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
                     hint: Some(
                         "afpsql hit an internal error; retry the query, then restart the session if it persists"
                             .to_string(),
@@ -774,15 +890,25 @@ impl RowSink for OutputRowSink {
 #[derive(Clone)]
 enum RowEmitStatus {
     Sent { trace: Trace },
-    TooLarge { trace: Trace },
 }
 
+/// Carry the inline-truncation flags from the executor's row collector into
+/// `emit_rows_result` without ballooning the function's argument list.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InlineTruncation {
+    pub truncated: bool,
+    pub at_rows: Option<usize>,
+    pub at_bytes: Option<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn emit_rows_result(
     app: &Arc<App>,
     id: Option<String>,
     session: Option<String>,
     columns: Vec<ColumnInfo>,
     rows: Vec<Value>,
+    truncation: InlineTruncation,
     start: Instant,
     opts: &ResolvedOptions,
 ) -> RowEmitStatus {
@@ -858,26 +984,6 @@ async fn emit_rows_result(
         payload_bytes += serde_json::to_vec(row).map(|b| b.len()).unwrap_or(0);
     }
 
-    if rows.len() > opts.inline_max_rows || payload_bytes > opts.inline_max_bytes {
-        let trace = Trace {
-            duration_ms: start.elapsed().as_millis() as u64,
-            row_count: Some(rows.len()),
-            payload_bytes: Some(payload_bytes),
-        };
-        let _ = app
-            .writer
-            .send(Output::Error {
-                id,
-                error_code: error_code::RESULT_TOO_LARGE.to_string(),
-                error: "result exceeds inline limits".to_string(),
-                hint: Some(result_too_large_hint()),
-                retryable: false,
-                trace: trace.clone(),
-            })
-            .await;
-        return RowEmitStatus::TooLarge { trace };
-    }
-
     let row_count = rows.len();
     let trace = Trace {
         duration_ms: start.elapsed().as_millis() as u64,
@@ -893,6 +999,9 @@ async fn emit_rows_result(
             columns,
             rows,
             row_count,
+            truncated: truncation.truncated,
+            truncated_at_rows: truncation.at_rows,
+            truncated_at_bytes: truncation.at_bytes,
             trace: trace.clone(),
         })
         .await;

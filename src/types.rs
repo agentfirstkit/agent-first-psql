@@ -31,6 +31,39 @@ pub enum Input {
         #[serde(default)]
         session: Option<String>,
     },
+    /// Open an explicit transaction on the named session. Subsequent
+    /// `query` requests on that session run on the open transaction
+    /// (no implicit `BEGIN..COMMIT` wrap) until `commit` or `rollback`.
+    #[serde(rename = "begin")]
+    Begin {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+        /// When true, send `BEGIN READ ONLY`. Default is read-write so the
+        /// caller can run writes; per-query permission still gates the SQL.
+        #[serde(default)]
+        read_only: bool,
+        /// Pass `--permission write` (or matching ssh-write/container-write)
+        /// to allow `BEGIN` on a session that defaults to read-only. Without
+        /// it, an implicit-read session rejects the begin.
+        #[serde(default)]
+        permission: Option<Permission>,
+    },
+    #[serde(rename = "commit")]
+    Commit {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
+    #[serde(rename = "rollback")]
+    Rollback {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +153,16 @@ pub enum Output {
         columns: Vec<ColumnInfo>,
         rows: Vec<Value>,
         row_count: usize,
+        /// True when `rows` is a prefix of the full result — emit when the
+        /// inline row or byte cap was hit. Default-false serializes elided.
+        #[serde(skip_serializing_if = "is_false", default)]
+        truncated: bool,
+        /// Inline-row cap if that's what fired.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncated_at_rows: Option<usize>,
+        /// Inline-byte cap if that's what fired.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncated_at_bytes: Option<usize>,
         trace: Trace,
     },
     #[serde(rename = "result_start")]
@@ -166,17 +209,6 @@ pub enum Output {
         error_code: String,
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        hint: Option<String>,
-        retryable: bool,
-        trace: Trace,
-    },
-    #[serde(rename = "error")]
-    ConnectError {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        error_code: String,
-        error: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
         sqlstate: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -195,6 +227,14 @@ pub enum Output {
         params: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        /// Inferred PostgreSQL parameter types in placeholder order
+        /// (`$1`, `$2`, ...). Populated when the server-side PREPARE succeeds.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        param_types: Vec<String>,
+        /// Output columns inferred from the prepared statement
+        /// (empty for non-SELECT statements).
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        columns: Vec<ColumnInfo>,
         trace: Trace,
     },
     #[serde(rename = "config")]
@@ -217,6 +257,16 @@ pub enum Output {
         inline_max_bytes: usize,
         statement_timeout_ms: u64,
         lock_timeout_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_version: Option<String>,
         trace: Trace,
     },
     #[serde(rename = "log")]
@@ -242,6 +292,10 @@ pub enum Output {
         chain: Option<String>,
         trace: Trace,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize, Clone)]

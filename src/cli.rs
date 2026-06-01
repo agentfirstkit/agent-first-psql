@@ -141,6 +141,54 @@ enum AfdCommand {
     Psql(PsqlCommand),
     /// Manage Agent-First PSQL skills for Codex and Claude Code.
     Skill(SkillCommand),
+    /// Schema discovery: list databases, schemas, tables, views, or describe a table.
+    Inspect(InspectCommand),
+}
+
+#[derive(Args)]
+struct InspectCommand {
+    #[command(subcommand)]
+    action: InspectAction,
+}
+
+#[derive(Subcommand)]
+enum InspectAction {
+    /// List non-template databases on the connected server.
+    Databases,
+    /// List user-visible schemas.
+    Schemas,
+    /// List tables (and partitioned tables) in a schema, optionally filtered.
+    Tables(InspectTablesArgs),
+    /// List views in a schema, optionally filtered.
+    Views(InspectViewsArgs),
+    /// Describe a single table's columns, types, nullability, and defaults.
+    Table(InspectTableArgs),
+}
+
+#[derive(Args)]
+struct InspectTablesArgs {
+    /// Schema to filter on. Defaults to `public`.
+    #[arg(long = "schema", default_value = "public")]
+    schema: String,
+    /// Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard).
+    #[arg(long = "like")]
+    like: Option<String>,
+}
+
+#[derive(Args)]
+struct InspectViewsArgs {
+    /// Schema to filter on. Defaults to `public`.
+    #[arg(long = "schema", default_value = "public")]
+    schema: String,
+    /// Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard).
+    #[arg(long = "like")]
+    like: Option<String>,
+}
+
+#[derive(Args)]
+struct InspectTableArgs {
+    /// Table name. Accepts `schema.table`; defaults to `public.NAME` when unqualified.
+    name: String,
 }
 
 #[derive(Args)]
@@ -308,6 +356,18 @@ pub struct AfdCli {
     /// Preview the query without executing it
     #[arg(long, help_heading = "Query")]
     dry_run: bool,
+    /// Wrap the query in EXPLAIN (FORMAT JSON) and return the plan tree instead
+    /// of executing the user's SQL.
+    #[arg(
+        long = "explain",
+        help_heading = "Query",
+        conflicts_with = "explain_analyze"
+    )]
+    explain: bool,
+    /// Wrap the query in EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS). The underlying
+    /// SQL actually runs; writes require the matching write permission.
+    #[arg(long = "explain-analyze", help_heading = "Query")]
+    explain_analyze: bool,
 
     /// PostgreSQL DSN URI. Redacted in structured output.
     #[arg(long = "dsn-secret", help_heading = "Connection")]
@@ -511,16 +571,35 @@ pub fn parse_args() -> Result<Mode, String> {
     let startup_env = startup_env_snapshot();
 
     if let Some(command) = cli.command {
-        return Ok(match command {
-            AfdCommand::Psql(psql) => Mode::PsqlAdmin(PsqlAdminRequest {
+        return match command {
+            AfdCommand::Psql(psql) => Ok(Mode::PsqlAdmin(PsqlAdminRequest {
                 action: psql_admin_action(psql.action),
                 output,
-            }),
-            AfdCommand::Skill(skill) => Mode::SkillAdmin(SkillAdminRequest {
+            })),
+            AfdCommand::Skill(skill) => Ok(Mode::SkillAdmin(SkillAdminRequest {
                 action: skill_admin_action(skill.action),
                 output,
-            }),
-        });
+            })),
+            AfdCommand::Inspect(inspect) => {
+                let (sql, params) = build_inspect_sql(inspect.action);
+                let startup_args = startup_args(mode_name, Some(&sql), None, params.len());
+                Ok(Mode::Cli(CliRequest {
+                    sql,
+                    params,
+                    options: QueryOptions::default(),
+                    session,
+                    output,
+                    output_file: None,
+                    log_file: None,
+                    log,
+                    startup_args,
+                    startup_env,
+                    startup_requested,
+                    dry_run: false,
+                    psql_mode: false,
+                }))
+            }
+        };
     }
 
     match cli.mode {
@@ -538,8 +617,15 @@ pub fn parse_args() -> Result<Mode, String> {
     }
 
     let startup_sql_file = cli.sql_file.clone();
-    let sql = load_sql(cli.sql, cli.sql_file)?;
+    let user_sql = load_sql(cli.sql, cli.sql_file)?;
     let params = parse_params(&cli.param)?;
+    let sql = if cli.explain {
+        wrap_explain_sql(&user_sql, false)
+    } else if cli.explain_analyze {
+        wrap_explain_sql(&user_sql, true)
+    } else {
+        user_sql
+    };
     let startup_args = startup_args(
         mode_name,
         Some(&sql),
@@ -1641,15 +1727,89 @@ fn parse_param_value(v: &str) -> Value {
     if v == "false" {
         return Value::Bool(false);
     }
-    if let Ok(i) = v.parse::<i64>() {
-        return Value::Number(i.into());
+    // Strings are passed verbatim to PostgreSQL via the text bind path so
+    // that values like "00123" or "1.0" preserve their original form. The
+    // server coerces them based on the prepared statement's parameter type.
+    Value::String(v.to_string())
+}
+
+fn wrap_explain_sql(user_sql: &str, analyze: bool) -> String {
+    let body = user_sql.trim_end_matches([';', ' ', '\n', '\t', '\r']);
+    if analyze {
+        format!("explain (analyze true, format json, buffers true) {body}")
+    } else {
+        format!("explain (format json) {body}")
     }
-    if let Ok(f) = v.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Value::Number(n);
+}
+
+fn build_inspect_sql(action: InspectAction) -> (String, Vec<Value>) {
+    match action {
+        InspectAction::Databases => (
+            "select datname as database, \
+                    pg_catalog.pg_get_userbyid(datdba) as owner, \
+                    pg_catalog.pg_encoding_to_char(encoding) as encoding \
+             from pg_catalog.pg_database \
+             where not datistemplate \
+             order by datname"
+                .to_string(),
+            vec![],
+        ),
+        InspectAction::Schemas => (
+            "select schema_name, schema_owner \
+             from information_schema.schemata \
+             where schema_name not in ('pg_catalog', 'information_schema') \
+               and schema_name not like 'pg_toast%' \
+               and schema_name not like 'pg_temp_%' \
+             order by schema_name"
+                .to_string(),
+            vec![],
+        ),
+        InspectAction::Tables(args) => {
+            let mut sql = String::from(
+                "select table_schema as schema, table_name as name, table_type as kind \
+                 from information_schema.tables \
+                 where table_schema = $1",
+            );
+            let mut params = vec![Value::String(args.schema)];
+            if let Some(pattern) = args.like {
+                sql.push_str(" and table_name like $2");
+                params.push(Value::String(pattern));
+            }
+            sql.push_str(" order by table_name");
+            (sql, params)
+        }
+        InspectAction::Views(args) => {
+            let mut sql = String::from(
+                "select table_schema as schema, table_name as name \
+                 from information_schema.views \
+                 where table_schema = $1",
+            );
+            let mut params = vec![Value::String(args.schema)];
+            if let Some(pattern) = args.like {
+                sql.push_str(" and table_name like $2");
+                params.push(Value::String(pattern));
+            }
+            sql.push_str(" order by table_name");
+            (sql, params)
+        }
+        InspectAction::Table(args) => {
+            let (schema, name) = match args.name.split_once('.') {
+                Some((s, n)) => (s.to_string(), n.to_string()),
+                None => ("public".to_string(), args.name),
+            };
+            (
+                "select column_name as name, data_type as type, \
+                        is_nullable = 'YES' as nullable, \
+                        column_default as default, \
+                        ordinal_position as position \
+                 from information_schema.columns \
+                 where table_schema = $1 and table_name = $2 \
+                 order by ordinal_position"
+                    .to_string(),
+                vec![Value::String(schema), Value::String(name)],
+            )
         }
     }
-    Value::String(v.to_string())
 }
 
 #[cfg(test)]

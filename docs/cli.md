@@ -19,6 +19,12 @@ This document contains the help content for the `afpsql` command-line program.
 * [`afpsql skill status`↴](#afpsql-skill-status)
 * [`afpsql skill install`↴](#afpsql-skill-install)
 * [`afpsql skill uninstall`↴](#afpsql-skill-uninstall)
+* [`afpsql inspect`↴](#afpsql-inspect)
+* [`afpsql inspect databases`↴](#afpsql-inspect-databases)
+* [`afpsql inspect schemas`↴](#afpsql-inspect-schemas)
+* [`afpsql inspect tables`↴](#afpsql-inspect-tables)
+* [`afpsql inspect views`↴](#afpsql-inspect-views)
+* [`afpsql inspect table`↴](#afpsql-inspect-table)
 
 ## `afpsql`
 
@@ -92,6 +98,7 @@ afpsql skill install
 
 * `psql` — Manage the local psql wrapper for afpsql --mode psql
 * `skill` — Manage Agent-First PSQL skills for Codex and Claude Code
+* `inspect` — Schema discovery: list databases, schemas, tables, views, or describe a table
 
 ###### **Options:**
 
@@ -107,6 +114,8 @@ afpsql skill install
 * `--inline-max-bytes <INLINE_MAX_BYTES>` — Maximum inline payload bytes before returning `result_too_large`
 * `--permission <PERMISSION>` — Query permission: read, write, ssh-read, ssh-write, container-read, or container-write. Defaults to read, ssh-read with --ssh, or container-read with --container
 * `--dry-run` — Preview the query without executing it
+* `--explain` — Wrap the query in EXPLAIN (FORMAT JSON) and return the plan tree instead of executing the user's SQL
+* `--explain-analyze` — Wrap the query in EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS). The underlying SQL actually runs; writes require the matching write permission
 * `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
 * `--dsn-secret-env <DSN_SECRET_ENV>` — Read PostgreSQL DSN URI from an environment variable
 * `--conninfo-secret <CONNINFO_SECRET>` — libpq-style conninfo string. Redacted in structured output
@@ -309,3 +318,77 @@ Remove an afpsql-managed Agent-First PSQL skill
 
 * `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
 * `--force` — Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
+
+
+
+## `afpsql inspect`
+
+Schema discovery: list databases, schemas, tables, views, or describe a table
+
+**Usage:** `afpsql inspect <COMMAND>`
+
+###### **Subcommands:**
+
+* `databases` — List non-template databases on the connected server
+* `schemas` — List user-visible schemas
+* `tables` — List tables (and partitioned tables) in a schema, optionally filtered
+* `views` — List views in a schema, optionally filtered
+* `table` — Describe a single table's columns, types, nullability, and defaults
+
+
+
+## `afpsql inspect databases`
+
+List non-template databases on the connected server
+
+**Usage:** `afpsql inspect databases`
+
+
+
+## `afpsql inspect schemas`
+
+List user-visible schemas
+
+**Usage:** `afpsql inspect schemas`
+
+
+
+## `afpsql inspect tables`
+
+List tables (and partitioned tables) in a schema, optionally filtered
+
+**Usage:** `afpsql inspect tables [OPTIONS]`
+
+###### **Options:**
+
+* `--schema <SCHEMA>` — Schema to filter on. Defaults to `public`
+
+  Default value: `public`
+* `--like <LIKE>` — Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard)
+
+
+
+## `afpsql inspect views`
+
+List views in a schema, optionally filtered
+
+**Usage:** `afpsql inspect views [OPTIONS]`
+
+###### **Options:**
+
+* `--schema <SCHEMA>` — Schema to filter on. Defaults to `public`
+
+  Default value: `public`
+* `--like <LIKE>` — Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard)
+
+
+
+## `afpsql inspect table`
+
+Describe a single table's columns, types, nullability, and defaults
+
+**Usage:** `afpsql inspect table <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Table name. Accepts `schema.table`; defaults to `public.NAME` when unqualified

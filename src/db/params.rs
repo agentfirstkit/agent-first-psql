@@ -1,6 +1,6 @@
 use super::errors::ExecError;
 use serde_json::Value;
-use tokio_postgres::types::{Json, ToSql, Type};
+use tokio_postgres::types::{Format, Json, ToSql, Type};
 
 pub(super) enum QueryParam {
     Null(AnyNull),
@@ -11,7 +11,34 @@ pub(super) enum QueryParam {
     Float32(f32),
     Float(f64),
     Text(String),
+    /// Bound to NUMERIC (and any other type) via the text wire format so the
+    /// server parses the literal at its native precision.
+    Numeric(NumericText),
     Json(Json<Value>),
+}
+
+#[derive(Debug)]
+pub(super) struct NumericText(String);
+
+impl ToSql for NumericText {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<tokio_postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(tokio_postgres::types::IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+
+    tokio_postgres::types::to_sql_checked!();
 }
 
 #[derive(Debug)]
@@ -51,7 +78,10 @@ pub(super) fn build_params(
             _ if *ty == Type::INT8 => QueryParam::Int64(parse_i64(v, idx + 1)?),
             _ if *ty == Type::FLOAT4 => QueryParam::Float32(parse_f32(v, idx + 1)?),
             _ if *ty == Type::FLOAT8 => QueryParam::Float(parse_f64(v, idx + 1)?),
-            _ if *ty == Type::NUMERIC => QueryParam::Float(parse_f64(v, idx + 1)?),
+            // NUMERIC has arbitrary precision; bind it via the text wire format
+            // so the server parses the literal at its native precision rather
+            // than routing through f64.
+            _ if *ty == Type::NUMERIC => QueryParam::Numeric(NumericText(parse_text(v))),
             _ if *ty == Type::JSON || *ty == Type::JSONB => QueryParam::Json(Json(v.clone())),
             _ => QueryParam::Text(parse_text(v)),
         };
@@ -72,6 +102,7 @@ pub(super) fn build_param_refs(params: &[QueryParam]) -> Vec<&(dyn ToSql + Sync)
             QueryParam::Float32(v) => v as &(dyn ToSql + Sync),
             QueryParam::Float(v) => v as &(dyn ToSql + Sync),
             QueryParam::Text(v) => v as &(dyn ToSql + Sync),
+            QueryParam::Numeric(v) => v as &(dyn ToSql + Sync),
             QueryParam::Json(v) => v as &(dyn ToSql + Sync),
         })
         .collect()

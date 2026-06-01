@@ -20,10 +20,25 @@ pub enum ExecOutcome {
     Rows {
         columns: Vec<ColumnInfo>,
         rows: Vec<Value>,
+        /// When true, the inline row/byte limit was hit and `rows` only
+        /// contains the prefix that fit. The underlying statement still
+        /// executed in full — for `UPDATE ... RETURNING`, the writes
+        /// happened even though their RETURNING projection was capped.
+        truncated: bool,
+        /// Inline-row limit if that's what fired (otherwise None).
+        truncated_at_rows: Option<usize>,
+        /// Inline-byte limit if that's what fired (otherwise None).
+        truncated_at_bytes: Option<usize>,
     },
     Command {
         affected: usize,
     },
+}
+
+#[derive(Debug)]
+pub struct DryRunOutcome {
+    pub param_types: Vec<String>,
+    pub columns: Vec<ColumnInfo>,
 }
 
 #[derive(Debug)]
@@ -64,13 +79,53 @@ pub struct TransportLogContext {
 pub trait DbExecutor: Send + Sync {
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError>;
 
+    /// Validate `sql` and the param shape without running the statement. The
+    /// server prepares the statement inside a transaction that is rolled back,
+    /// returning the inferred parameter types and column metadata.
+    async fn prepare_only(&self, req: ExecRequest<'_>) -> Result<DryRunOutcome, ExecError>;
+
+    /// Open an explicit transaction on the named session. Subsequent
+    /// `execute`/`execute_streaming` calls on that session bypass the
+    /// implicit per-query `BEGIN..COMMIT` wrap until `tx_commit` or
+    /// `tx_rollback` is called.
+    async fn tx_begin(
+        &self,
+        _session_name: &str,
+        _session_cfg: &SessionConfig,
+        _read_only: bool,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Internal(
+            "explicit transactions not implemented for this executor".to_string(),
+        ))
+    }
+
+    async fn tx_commit(
+        &self,
+        _session_name: &str,
+        _session_cfg: &SessionConfig,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Internal(
+            "explicit transactions not implemented for this executor".to_string(),
+        ))
+    }
+
+    async fn tx_rollback(
+        &self,
+        _session_name: &str,
+        _session_cfg: &SessionConfig,
+    ) -> Result<(), ExecError> {
+        Err(ExecError::Internal(
+            "explicit transactions not implemented for this executor".to_string(),
+        ))
+    }
+
     async fn execute_streaming(
         &self,
         req: ExecRequest<'_>,
         sink: &mut (dyn RowSink + Send),
     ) -> Result<StreamOutcome, ExecError> {
         match self.execute(req).await? {
-            ExecOutcome::Rows { columns, rows } => {
+            ExecOutcome::Rows { columns, rows, .. } => {
                 sink.start(columns).await?;
                 let mut row_count = 0usize;
                 let mut payload_bytes = 0usize;
@@ -110,6 +165,7 @@ impl PostgresExecutor {
 impl DbExecutor for PostgresExecutor {
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
+        let in_explicit_tx = session.explicit_tx_active();
         let mut client_guard = session.client.lock().await;
         let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
         emit_transport_selected(&req, transport).await?;
@@ -133,9 +189,15 @@ impl DbExecutor for PostgresExecutor {
         if cancel_requested(&req.cancel_slot) {
             return Err(ExecError::Cancelled);
         }
-        let result = execute_with_client(pg_client, &req).await;
+        let result = if in_explicit_tx {
+            execute_in_open_tx(pg_client, &req).await
+        } else {
+            execute_with_client(pg_client, &req).await
+        };
         if should_drop_connection(&result) {
             *client_guard = None;
+            // Connection dropped means the in-PG explicit tx is also gone.
+            session.set_explicit_tx(false);
         }
         result
     }
@@ -145,6 +207,141 @@ impl DbExecutor for PostgresExecutor {
         req: ExecRequest<'_>,
         sink: &mut (dyn RowSink + Send),
     ) -> Result<StreamOutcome, ExecError> {
+        let session = get_session(&self.sessions, req.session_name).await;
+        let in_explicit_tx = session.explicit_tx_active();
+        let mut client_guard = session.client.lock().await;
+        let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
+        emit_transport_selected(&req, transport).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        install_cancel_context(
+            &req.cancel_slot,
+            pg_client.cancel_token(),
+            client.backend_pid,
+            req.session_cfg,
+        )
+        .await;
+        if cancel_requested(&req.cancel_slot) {
+            return Err(ExecError::Cancelled);
+        }
+        let result = if in_explicit_tx {
+            execute_streaming_in_open_tx(pg_client, &req, sink).await
+        } else {
+            execute_streaming_with_client(pg_client, &req, sink).await
+        };
+        if should_drop_connection(&result) {
+            *client_guard = None;
+            session.set_explicit_tx(false);
+        }
+        result
+    }
+
+    async fn tx_begin(
+        &self,
+        session_name: &str,
+        session_cfg: &SessionConfig,
+        read_only: bool,
+    ) -> Result<(), ExecError> {
+        let session = get_session(&self.sessions, session_name).await;
+        if session.explicit_tx_active() {
+            return Err(ExecError::InvalidParams(
+                "session is already in an explicit transaction; commit or rollback first"
+                    .to_string(),
+            ));
+        }
+        let mut client_guard = session.client.lock().await;
+        ensure_connected(&mut client_guard, session_cfg).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let sql = if read_only {
+            "BEGIN READ ONLY"
+        } else {
+            "BEGIN"
+        };
+        pg_client.batch_execute(sql).await.map_err(map_pg_error)?;
+        session.set_explicit_tx(true);
+        Ok(())
+    }
+
+    async fn tx_commit(
+        &self,
+        session_name: &str,
+        session_cfg: &SessionConfig,
+    ) -> Result<(), ExecError> {
+        let session = get_session(&self.sessions, session_name).await;
+        if !session.explicit_tx_active() {
+            return Err(ExecError::InvalidParams(
+                "no explicit transaction is open on this session; send `begin` first".to_string(),
+            ));
+        }
+        let mut client_guard = session.client.lock().await;
+        ensure_connected(&mut client_guard, session_cfg).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let result = pg_client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(map_pg_error);
+        session.set_explicit_tx(false);
+        result
+    }
+
+    async fn tx_rollback(
+        &self,
+        session_name: &str,
+        session_cfg: &SessionConfig,
+    ) -> Result<(), ExecError> {
+        let session = get_session(&self.sessions, session_name).await;
+        if !session.explicit_tx_active() {
+            return Err(ExecError::InvalidParams(
+                "no explicit transaction is open on this session; send `begin` first".to_string(),
+            ));
+        }
+        let mut client_guard = session.client.lock().await;
+        ensure_connected(&mut client_guard, session_cfg).await?;
+        let Some(client) = client_guard.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let Some(pg_client) = client.client.as_mut() else {
+            return Err(ExecError::Connect(Box::new(ConnectError::new(
+                "connection unavailable",
+            ))));
+        };
+        let result = pg_client
+            .batch_execute("ROLLBACK")
+            .await
+            .map_err(map_pg_error);
+        session.set_explicit_tx(false);
+        result
+    }
+
+    async fn prepare_only(&self, req: ExecRequest<'_>) -> Result<DryRunOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
         let mut client_guard = session.client.lock().await;
         let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
@@ -159,18 +356,8 @@ impl DbExecutor for PostgresExecutor {
                 "connection unavailable",
             ))));
         };
-        install_cancel_context(
-            &req.cancel_slot,
-            pg_client.cancel_token(),
-            client.backend_pid,
-            req.session_cfg,
-        )
-        .await;
-        if cancel_requested(&req.cancel_slot) {
-            return Err(ExecError::Cancelled);
-        }
-        let result = execute_streaming_with_client(pg_client, &req, sink).await;
-        if should_drop_connection(&result) {
+        let result = prepare_only_with_client(pg_client, &req).await;
+        if should_drop_connection_dry_run(&result) {
             *client_guard = None;
         }
         result
@@ -277,6 +464,39 @@ fn should_drop_connection<T>(result: &Result<T, ExecError>) -> bool {
     )
 }
 
+fn should_drop_connection_dry_run(result: &Result<DryRunOutcome, ExecError>) -> bool {
+    matches!(
+        result,
+        Err(ExecError::Connect(_)) | Err(ExecError::Internal(_))
+    )
+}
+
+async fn prepare_only_with_client(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+) -> Result<DryRunOutcome, ExecError> {
+    let mut tx = start_transaction(client, true).await?;
+    let result = prepare_only_in_transaction(&mut tx, req).await;
+    // Always rollback — dry-run never commits.
+    let _ = tx.rollback().await;
+    result
+}
+
+async fn prepare_only_in_transaction(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    req: &ExecRequest<'_>,
+) -> Result<DryRunOutcome, ExecError> {
+    let stmt = tx.prepare(req.sql).await.map_err(map_pg_error)?;
+    let columns = statement_columns(&stmt);
+    validate_unique_column_names(&columns)?;
+    validate_param_count(stmt.params().len(), req.params.len())?;
+    let param_types = stmt.params().iter().map(|t| t.name().to_string()).collect();
+    Ok(DryRunOutcome {
+        param_types,
+        columns,
+    })
+}
+
 fn cancel_requested(cancel_slot: &Option<CancelSlot>) -> bool {
     cancel_slot
         .as_ref()
@@ -291,6 +511,177 @@ async fn execute_with_client(
     let mut tx = start_transaction(client, req.opts.read_only).await?;
     let result = execute_in_transaction(&mut tx, req).await;
     finish_transaction(tx, result).await
+}
+
+/// Run a query against a client that is already inside an explicit
+/// transaction. The query is wrapped in a savepoint so a failure does not
+/// abort the user's outer transaction — the agent can retry or recover
+/// without losing prior progress.
+async fn execute_in_open_tx(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+) -> Result<ExecOutcome, ExecError> {
+    client
+        .batch_execute("SAVEPOINT afpsql_explicit")
+        .await
+        .map_err(map_pg_error)?;
+    let result = execute_in_open_tx_inner(client, req).await;
+    match &result {
+        Ok(_) => {
+            client
+                .batch_execute("RELEASE SAVEPOINT afpsql_explicit")
+                .await
+                .map_err(map_pg_error)?;
+        }
+        Err(_) => {
+            let _ = client
+                .batch_execute("ROLLBACK TO SAVEPOINT afpsql_explicit")
+                .await;
+            let _ = client
+                .batch_execute("RELEASE SAVEPOINT afpsql_explicit")
+                .await;
+        }
+    }
+    result
+}
+
+async fn execute_in_open_tx_inner(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+) -> Result<ExecOutcome, ExecError> {
+    apply_query_settings_client(client, req.opts).await?;
+    let stmt = client.prepare(req.sql).await.map_err(map_pg_error)?;
+    let columns = statement_columns(&stmt);
+    validate_unique_column_names(&columns)?;
+    validate_param_count(stmt.params().len(), req.params.len())?;
+    let query_params = build_params(req.params, stmt.params())?;
+    let bind_refs = build_param_refs(&query_params);
+
+    if columns.is_empty() {
+        let affected = client
+            .execute(&stmt, &bind_refs)
+            .await
+            .map_err(map_pg_error)? as usize;
+        return Ok(ExecOutcome::Command { affected });
+    }
+
+    let mut collector =
+        InlineRowCollector::new(columns, req.opts.inline_max_rows, req.opts.inline_max_bytes);
+    let stream = client
+        .query_raw(&stmt, bind_refs)
+        .await
+        .map_err(map_pg_error)?;
+    let mut rows = pin!(stream);
+    while let Some(row) = rows.try_next().await.map_err(map_pg_error)? {
+        let value = row_to_json_fallback(&row);
+        let row_bytes = row_json_size(&value);
+        let _ = collector.push(value, row_bytes)?;
+        if collector.is_truncated() {
+            break;
+        }
+    }
+    Ok(ExecOutcome::Rows {
+        truncated: collector.is_truncated(),
+        truncated_at_rows: collector.truncated_at_rows,
+        truncated_at_bytes: collector.truncated_at_bytes,
+        columns: collector.columns,
+        rows: collector.rows,
+    })
+}
+
+async fn execute_streaming_in_open_tx(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+    sink: &mut (dyn RowSink + Send),
+) -> Result<StreamOutcome, ExecError> {
+    client
+        .batch_execute("SAVEPOINT afpsql_explicit")
+        .await
+        .map_err(map_pg_error)?;
+    let result = execute_streaming_in_open_tx_inner(client, req, sink).await;
+    match &result {
+        Ok(_) => {
+            client
+                .batch_execute("RELEASE SAVEPOINT afpsql_explicit")
+                .await
+                .map_err(map_pg_error)?;
+        }
+        Err(_) => {
+            let _ = client
+                .batch_execute("ROLLBACK TO SAVEPOINT afpsql_explicit")
+                .await;
+            let _ = client
+                .batch_execute("RELEASE SAVEPOINT afpsql_explicit")
+                .await;
+        }
+    }
+    result
+}
+
+async fn execute_streaming_in_open_tx_inner(
+    client: &mut tokio_postgres::Client,
+    req: &ExecRequest<'_>,
+    sink: &mut (dyn RowSink + Send),
+) -> Result<StreamOutcome, ExecError> {
+    apply_query_settings_client(client, req.opts).await?;
+    let stmt = client.prepare(req.sql).await.map_err(map_pg_error)?;
+    let columns = statement_columns(&stmt);
+    validate_unique_column_names(&columns)?;
+    validate_param_count(stmt.params().len(), req.params.len())?;
+    let query_params = build_params(req.params, stmt.params())?;
+    let bind_refs = build_param_refs(&query_params);
+
+    if columns.is_empty() {
+        let affected = client
+            .execute(&stmt, &bind_refs)
+            .await
+            .map_err(map_pg_error)? as usize;
+        return Ok(StreamOutcome::Command { affected });
+    }
+
+    sink.start(columns).await?;
+    let stream = client
+        .query_raw(&stmt, bind_refs)
+        .await
+        .map_err(map_pg_error)?;
+    let mut rows = pin!(stream);
+    let mut row_count = 0usize;
+    let mut payload_bytes = 0usize;
+    while let Some(row) = rows.try_next().await.map_err(map_pg_error)? {
+        let value = row_to_json_fallback(&row);
+        let row_bytes = row_json_size(&value);
+        payload_bytes += row_bytes;
+        row_count += 1;
+        sink.row(value, row_bytes).await?;
+    }
+    Ok(StreamOutcome::Rows {
+        row_count,
+        payload_bytes,
+    })
+}
+
+async fn apply_query_settings_client(
+    client: &mut tokio_postgres::Client,
+    opts: &ResolvedOptions,
+) -> Result<(), ExecError> {
+    let statement_timeout = format!("{}ms", opts.statement_timeout_ms);
+    client
+        .execute(
+            "select set_config('statement_timeout', $1, true)",
+            &[&statement_timeout],
+        )
+        .await
+        .map_err(map_pg_error)?;
+
+    let lock_timeout = format!("{}ms", opts.lock_timeout_ms);
+    client
+        .execute(
+            "select set_config('lock_timeout', $1, true)",
+            &[&lock_timeout],
+        )
+        .await
+        .map_err(map_pg_error)?;
+    Ok(())
 }
 
 async fn execute_in_transaction(
@@ -319,6 +710,9 @@ async fn execute_in_transaction(
         .await?;
 
         return Ok(ExecOutcome::Rows {
+            truncated: collector.is_truncated(),
+            truncated_at_rows: collector.truncated_at_rows,
+            truncated_at_bytes: collector.truncated_at_bytes,
             columns: collector.columns,
             rows: collector.rows,
         });
@@ -664,6 +1058,8 @@ struct InlineRowCollector {
     payload_bytes: usize,
     max_rows: usize,
     max_bytes: usize,
+    truncated_at_rows: Option<usize>,
+    truncated_at_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -671,6 +1067,8 @@ struct InlineRowCollectorMark {
     rows_len: usize,
     row_count: usize,
     payload_bytes: usize,
+    truncated_at_rows: Option<usize>,
+    truncated_at_bytes: Option<usize>,
 }
 
 impl InlineRowCollector {
@@ -682,23 +1080,38 @@ impl InlineRowCollector {
             payload_bytes: 0,
             max_rows,
             max_bytes,
+            truncated_at_rows: None,
+            truncated_at_bytes: None,
         }
     }
 
-    fn push(&mut self, row: Value, row_bytes: usize) -> Result<(), ExecError> {
+    fn is_truncated(&self) -> bool {
+        self.truncated_at_rows.is_some() || self.truncated_at_bytes.is_some()
+    }
+
+    /// Try to append a row. Returns `Ok(true)` if the row was accepted;
+    /// `Ok(false)` if the inline limit fired and the collector now refuses
+    /// further rows. Never errors — callers should treat `Ok(false)` as a
+    /// signal to stop fetching from the portal.
+    fn push(&mut self, row: Value, row_bytes: usize) -> Result<bool, ExecError> {
+        if self.is_truncated() {
+            return Ok(false);
+        }
         let next_row_count = self.row_count.saturating_add(1);
         let next_payload_bytes = self.payload_bytes.saturating_add(row_bytes);
-        if next_row_count > self.max_rows || next_payload_bytes > self.max_bytes {
-            return Err(ExecError::ResultTooLarge {
-                row_count: next_row_count,
-                payload_bytes: next_payload_bytes,
-            });
+        if next_row_count > self.max_rows {
+            self.truncated_at_rows = Some(self.max_rows);
+            return Ok(false);
+        }
+        if next_payload_bytes > self.max_bytes {
+            self.truncated_at_bytes = Some(self.max_bytes);
+            return Ok(false);
         }
 
         self.row_count = next_row_count;
         self.payload_bytes = next_payload_bytes;
         self.rows.push(row);
-        Ok(())
+        Ok(true)
     }
 
     fn mark(&self) -> InlineRowCollectorMark {
@@ -706,6 +1119,8 @@ impl InlineRowCollector {
             rows_len: self.rows.len(),
             row_count: self.row_count,
             payload_bytes: self.payload_bytes,
+            truncated_at_rows: self.truncated_at_rows,
+            truncated_at_bytes: self.truncated_at_bytes,
         }
     }
 
@@ -713,6 +1128,8 @@ impl InlineRowCollector {
         self.rows.truncate(mark.rows_len);
         self.row_count = mark.row_count;
         self.payload_bytes = mark.payload_bytes;
+        self.truncated_at_rows = mark.truncated_at_rows;
+        self.truncated_at_bytes = mark.truncated_at_bytes;
     }
 }
 
@@ -821,24 +1238,18 @@ async fn drain_portal_batch(
         .await
         .map_err(map_pg_error)?;
     let mut rows = pin!(stream);
-    let mut limit_error = None;
 
     while let Some(row) = rows.try_next().await.map_err(map_pg_error)? {
-        if limit_error.is_some() {
-            continue;
-        }
         let value = row_to_json_value(&row, wrapped_json);
         let row_bytes = row_json_size(&value);
-        if let Err(err) = collector.push(value, row_bytes) {
-            limit_error = Some(err);
-        }
+        // collector.push returns Ok(false) once the inline cap is hit; we
+        // keep draining the current portal batch so PG's protocol stays in
+        // a clean state, but stop accepting new rows.
+        let _ = collector.push(value, row_bytes)?;
     }
 
     let portal_exhausted = rows.rows_affected().is_some();
-    if let Some(err) = limit_error {
-        return Err(err);
-    }
-    Ok(portal_exhausted)
+    Ok(portal_exhausted || collector.is_truncated())
 }
 
 struct StreamStats {

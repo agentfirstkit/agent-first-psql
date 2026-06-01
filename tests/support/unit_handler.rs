@@ -36,6 +36,7 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
         Some("default".to_string()),
         columns.clone(),
         vec![],
+        InlineTruncation::default(),
         std::time::Instant::now(),
         &opts,
     )
@@ -79,6 +80,7 @@ async fn emit_rows_result_paths() {
             serde_json::json!({"n":2}),
             serde_json::json!({"n":3}),
         ],
+        InlineTruncation::default(),
         std::time::Instant::now(),
         &stream_opts,
     )
@@ -86,6 +88,9 @@ async fn emit_rows_result_paths() {
     assert!(matches!(status, RowEmitStatus::Sent { .. }));
     while rx.try_recv().is_ok() {}
 
+    // Soft-truncation case: emit_rows_result now passes the collector's
+    // `truncated`/`truncated_at_rows` straight through; the inline cap is
+    // enforced upstream in the row collector, not here.
     let inline_opts = ResolvedOptions {
         stream_rows: false,
         batch_rows: 100,
@@ -104,12 +109,30 @@ async fn emit_rows_result_paths() {
             name: "n".to_string(),
             type_name: "int4".to_string(),
         }],
-        vec![serde_json::json!({"n":1}), serde_json::json!({"n":2})],
+        vec![serde_json::json!({"n":1})],
+        InlineTruncation {
+            truncated: true,
+            at_rows: Some(1),
+            at_bytes: None,
+        },
         std::time::Instant::now(),
         &inline_opts,
     )
     .await;
-    assert!(matches!(status, RowEmitStatus::TooLarge { .. }));
+    assert!(matches!(status, RowEmitStatus::Sent { .. }));
+    let event = rx.recv().await;
+    let Some(Output::Result {
+        truncated,
+        truncated_at_rows,
+        rows,
+        ..
+    }) = event
+    else {
+        unreachable!("expected Output::Result")
+    };
+    assert!(truncated);
+    assert_eq!(truncated_at_rows, Some(1));
+    assert_eq!(rows.len(), 1);
 }
 
 struct MockExecutor {
@@ -124,6 +147,16 @@ impl DbExecutor for MockExecutor {
             .await
             .take()
             .unwrap_or(Ok(ExecOutcome::Command { affected: 0 }))
+    }
+
+    async fn prepare_only(
+        &self,
+        _req: ExecRequest<'_>,
+    ) -> Result<crate::db::DryRunOutcome, ExecError> {
+        Ok(crate::db::DryRunOutcome {
+            param_types: vec![],
+            columns: vec![],
+        })
     }
 }
 
@@ -332,6 +365,9 @@ async fn execute_query_maps_executor_outcomes() {
                 type_name: "int4".to_string(),
             }],
             rows: vec![serde_json::json!({"n":1})],
+            truncated: false,
+            truncated_at_rows: None,
+            truncated_at_bytes: None,
         }),
         Ok(ExecOutcome::Command { affected: 2 }),
         Err(ExecError::Connect(Box::new(ConnectError::new("down")))),
@@ -398,8 +434,8 @@ async fn execute_query_emits_structured_connect_error_details() {
     .await;
 
     let msg_opt = rx.recv().await;
-    assert!(matches!(msg_opt, Some(Output::ConnectError { .. })));
-    if let Some(Output::ConnectError {
+    assert!(matches!(msg_opt, Some(Output::Error { .. })));
+    if let Some(Output::Error {
         error_code,
         sqlstate,
         message,

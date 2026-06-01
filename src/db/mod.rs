@@ -6,6 +6,8 @@ mod session;
 
 pub(crate) use errors::ConnectError;
 pub use errors::ExecError;
+#[cfg(test)]
+pub(crate) use executor::DryRunOutcome;
 pub use executor::{
     DbExecutor, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
     TransportLogContext,
