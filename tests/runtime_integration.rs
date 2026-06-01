@@ -739,8 +739,9 @@ fn pipe_session_info_reports_connection_identity() {
         .find(|l| l.contains("\"code\":\"session_info\""))
         .expect("session_info event");
     let info: Value = serde_json::from_str(info_line).expect("parse session_info");
-    assert_eq!(info["database"], "afpsql_test");
-    assert_eq!(info["user"], "afpsql_test");
+    let (expected_user, expected_db) = test_env::dsn_identity(&test_dsn());
+    assert_eq!(info["database"], expected_db.as_str());
+    assert_eq!(info["user"], expected_user.as_str());
     assert!(
         info["server_version"].is_string(),
         "server_version missing: {info_line}"

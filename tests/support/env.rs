@@ -14,6 +14,20 @@ pub fn required_test_dsn() -> String {
     dsn.unwrap_or_default()
 }
 
+/// Extract `(user, dbname)` from a libpq URL DSN such as
+/// `postgresql://user:pw@host:port/dbname?params`, so tests can assert the
+/// connection identity reported back without hardcoding an environment-specific
+/// name (local `.env.local` uses `afpsql_test`, CI uses `test`).
+#[allow(dead_code)]
+pub fn dsn_identity(dsn: &str) -> (String, String) {
+    let after_scheme = dsn.split_once("://").map_or(dsn, |(_, rest)| rest);
+    let (authority, path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let userinfo = authority.rsplit_once('@').map_or("", |(ui, _)| ui);
+    let user = userinfo.split(':').next().unwrap_or("").to_string();
+    let dbname = path.split_once('?').map_or(path, |(db, _)| db).to_string();
+    (user, dbname)
+}
+
 pub fn env_value(key: &str) -> Option<String> {
     std::env::var(key).ok().or_else(|| read_env_key(key))
 }
