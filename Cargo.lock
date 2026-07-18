@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "agent-first-psql"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "agent-first-data",
  "async-trait",

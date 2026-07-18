@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 default-run = "afpsql"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."

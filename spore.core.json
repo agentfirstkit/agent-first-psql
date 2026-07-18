@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,9 +13,7 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Add --dsn-secret-config/--conninfo-secret-config/--password-secret-config to read a connection secret from a JSON, TOML, YAML, or dotenv config file in-process.",
-    "Redact every session secret from runtime config output regardless of whether its source was direct, environment, or config.",
-    "Redefine afpsql-readonly as a PostgreSQL write guard rather than a host sandbox, restoring SQL files, config sources, SSH options, and skill management while keeping read enforcement."
+    "Ship the Windows prebuilt binary and Scoop package by guarding the release smoke test's Unix-only stream-redirect check on Windows, completing the 0.7.0 packaging across all platforms."
   ],
   "bonds": [
     {

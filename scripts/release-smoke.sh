@@ -47,31 +47,42 @@ expect_runtime_failure "custom container runtime" --container invalid --containe
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
-redirect_path="$tmp_dir/output"
 sql_path="$tmp_dir/query.sql"
-printf '%s' 'preserve-me' >"$redirect_path"
 printf '%s\n' 'select 1' >"$sql_path"
-set +e
-"$READONLY" --stdout-file "$redirect_path" --sql "select 1"
-redirect_status=$?
-set -e
-if [ "$redirect_status" -eq 0 ] || ! grep -q 'connect_failed' "$redirect_path"; then
-  echo "readonly redirect did not receive the runtime error" >&2
-  exit 1
-fi
 
-# A redirect flag positioned where a value-skipping arg walk would treat it as
-# the SQL value is still installed by the independent stream-redirect scanner.
-# Ordinary readonly deliberately grants this same host capability as afpsql.
-smuggled_path="$tmp_dir/smuggled"
-set +e
-"$READONLY" --sql "--stdout-file=$smuggled_path"
-smuggled_status=$?
-set -e
-if [ "$smuggled_status" -eq 0 ] || [ ! -e "$smuggled_path" ]; then
-  echo "ordinary readonly redirect scanner behavior changed" >&2
-  exit 1
-fi
+# Stream redirection (`--stdout-file`) is a Unix-only capability; on Windows
+# afpsql rejects it outright ("stream redirection is only supported on Unix
+# platforms"), so the redirect smoke checks below only apply on Unix.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+MINGW* | MSYS* | CYGWIN* | *NT*)
+  echo "skipping Unix-only stream-redirect checks on this platform"
+  ;;
+*)
+  redirect_path="$tmp_dir/output"
+  printf '%s' 'preserve-me' >"$redirect_path"
+  set +e
+  "$READONLY" --stdout-file "$redirect_path" --sql "select 1"
+  redirect_status=$?
+  set -e
+  if [ "$redirect_status" -eq 0 ] || ! grep -q 'connect_failed' "$redirect_path"; then
+    echo "readonly redirect did not receive the runtime error" >&2
+    exit 1
+  fi
+
+  # A redirect flag positioned where a value-skipping arg walk would treat it as
+  # the SQL value is still installed by the independent stream-redirect scanner.
+  # Ordinary readonly deliberately grants this same host capability as afpsql.
+  smuggled_path="$tmp_dir/smuggled"
+  set +e
+  "$READONLY" --sql "--stdout-file=$smuggled_path"
+  smuggled_status=$?
+  set -e
+  if [ "$smuggled_status" -eq 0 ] || [ ! -e "$smuggled_path" ]; then
+    echo "ordinary readonly redirect scanner behavior changed" >&2
+    exit 1
+  fi
+  ;;
+esac
 
 expect_runtime_failure "local SQL file" --sql-file "$sql_path"
 
