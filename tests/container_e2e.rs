@@ -158,7 +158,7 @@ fn docker_container_transport_select_one() {
         "stdout: {}",
         String::from_utf8_lossy(&write.stdout)
     );
-    assert_readonly_rejection(
+    assert_readonly_reaches_runtime(
         [
             "--container",
             &bridge_name,
@@ -171,7 +171,7 @@ fn docker_container_transport_select_one() {
     );
 
     if let Some(ssh_destination) = test_env::env_value("AFPSQL_E2E_SSH") {
-        assert_readonly_rejection(
+        assert_readonly_reaches_runtime(
             [
                 "--ssh",
                 &ssh_destination,
@@ -253,16 +253,21 @@ fn docker_container_transport_select_one() {
     }
 }
 
-fn assert_readonly_rejection<const N: usize>(args: [&str; N], context: &str) {
+fn assert_readonly_reaches_runtime<const N: usize>(args: [&str; N], context: &str) {
+    // The ordinary readonly profile is a database write-guard, not a host
+    // sandbox: it allows host and transport capabilities (custom container
+    // runtimes, SSH options) and only refuses database writes. So these flags are
+    // accepted and the failure surfaces from the runtime itself, not as a policy
+    // rejection (`invalid_request`).
     let output = Command::new(env!("CARGO_BIN_EXE_afpsql-readonly"))
         .args(args)
         .output()
-        .expect("run readonly rejection case");
+        .expect("run readonly runtime case");
     assert!(!output.status.success(), "{context} unexpectedly succeeded");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains(r#""code":"invalid_request""#),
-        "{context} stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
+        stdout.contains(r#""kind":"error""#) && !stdout.contains(r#""code":"invalid_request""#),
+        "{context} was rejected by policy instead of reaching the runtime: {stdout}"
     );
 }
 
