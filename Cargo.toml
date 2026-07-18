@@ -2,6 +2,7 @@
 name = "agent-first-psql"
 version = "0.7.0"
 edition = "2024"
+default-run = "afpsql"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."
 license = "MIT"
 repository = "https://github.com/agentfirstkit/agent-first-psql"
