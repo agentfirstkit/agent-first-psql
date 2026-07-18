@@ -30,6 +30,10 @@ fn run(mut cmd: Command) -> (i32, String, String) {
     )
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn psql_mode_all_translation_paths() {
     let path = std::env::temp_dir().join(format!("afpsql_cov_{}.sql", std::process::id()));
@@ -49,7 +53,8 @@ fn psql_mode_all_translation_paths() {
     let (code, stdout, _stderr) = run(cmd);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"], 9);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["result"]["rows"][0]["n"], 9);
 
     let mut bad = Command::new(bin());
     bad.arg("--mode").arg("psql").arg("--bad");
@@ -60,6 +65,10 @@ fn psql_mode_all_translation_paths() {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_config_full_patch_and_close() {
     let payload = serde_json::json!({
@@ -108,6 +117,10 @@ fn pipe_config_full_patch_and_close() {
     assert!(text.contains("\"default_session\":\"s1\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn conn_via_env_fallback() {
     let mut cmd = Command::new(bin());
@@ -117,9 +130,14 @@ fn conn_via_env_fallback() {
     let (code, stdout, _stderr) = run(cmd);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"], 1);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["result"]["rows"][0]["n"], 1);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn has_session_override_each_field_in_pipe_mode() {
     for args in [
@@ -156,6 +174,10 @@ fn has_session_override_each_field_in_pipe_mode() {
     }
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_emits_structured_stdout_log_events_when_enabled() {
     let mut cmd = Command::new(bin());
@@ -167,14 +189,18 @@ fn cli_emits_structured_stdout_log_events_when_enabled() {
         .arg("select 1 as n");
     let (code, stdout, stderr) = run(cmd);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"code\":\"result\""));
-    assert!(stdout.contains("\"code\":\"log\""));
+    assert!(stdout.contains("\"kind\":\"result\""));
+    assert!(stdout.contains("\"kind\":\"log\""));
     assert!(stdout.contains("\"event\":\"query.result\""));
     assert!(!stdout.contains("\"event\":\"startup\""));
     assert!(stdout.contains("\"duration_ms\""));
     assert!(stderr.trim().is_empty());
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn handler_param_types_and_empty_rows() {
     let mut cmd = Command::new(bin());
@@ -195,7 +221,8 @@ fn handler_param_types_and_empty_rows() {
     let (code, stdout, _stderr) = run(cmd);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(v["code"], "result");
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "result");
 
     let mut empty = Command::new(bin());
     empty
@@ -206,6 +233,12 @@ fn handler_param_types_and_empty_rows() {
     let (code, stdout, _stderr) = run(empty);
     assert_eq!(code, 0);
     let v: Value = serde_json::from_str(&stdout).expect("json output");
-    assert_eq!(v["columns"].as_array().map(|a| a.len()).unwrap_or(0), 1);
-    assert_eq!(v["columns"][0]["name"], "n");
+    assert_eq!(
+        v["result"]["columns"]
+            .as_array()
+            .map(|columns| columns.len())
+            .unwrap_or(0),
+        1
+    );
+    assert_eq!(v["result"]["columns"][0]["name"], "n");
 }

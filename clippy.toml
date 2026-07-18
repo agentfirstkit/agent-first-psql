@@ -1,20 +1,18 @@
-# Canonical clippy config for every Rust spore in this kit.
+# Canonical Clippy config for every Rust spore in this repository.
 #
-# Source of truth — `sync-spore-meta.py` mirrors this file into:
-#   spores/agent-first-data/rust/clippy.toml   (multi-language: rust subdir)
-#   spores/agent-first-http/clippy.toml
-#   spores/agent-first-mail/clippy.toml
-#   spores/agent-first-pay/clippy.toml
-#   spores/agent-first-psql/clippy.toml
-#   spores/agent-first-ui/clippy.toml          (workspace root)
-#
-# Edit this file, then `python3 scripts/sync-spore-meta.py <spore> --no-github`
-# (release pipeline runs the propagation automatically).
+# Default policy mirrored into each Rust project's clippy.toml. Repository
+# tooling may select a project-specific full replacement.
+
+# Production code uses the matching `deny` lint levels in each Cargo.toml.
+# Tests may use these failure helpers when they make assertions clearer.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
 
 disallowed-macros = [
-  { path = "std::eprintln", reason = "AFDATA protocol/log events must use stdout only; stderr is not a protocol channel." },
+  { path = "std::eprintln", reason = "Agent-First Data convention requires structured events on stdout only; stderr is not a protocol channel." },
 ]
 
 disallowed-methods = [
-  { path = "std::io::stderr", reason = "AFDATA protocol/log events must use stdout only; stderr is not a protocol channel." },
+  { path = "std::io::stderr", reason = "Agent-First Data convention requires structured events on stdout only; stderr is not a protocol channel." },
 ]

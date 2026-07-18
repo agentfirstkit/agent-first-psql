@@ -1,6 +1,27 @@
+use agent_first_data::LogFilters;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+
+/// Serialize `LogFilters` as its plain string array for `Output::Config` and
+/// re-normalize on the (currently unused) deserialize path via afdata's parser,
+/// so afpsql never keeps a second log-filter representation.
+mod log_filters_serde {
+    use agent_first_data::{LogFilters, cli_parse_log_filters};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        filters: &LogFilters,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        filters.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LogFilters, D::Error> {
+        let raw = Vec::<String>::deserialize(deserializer)?;
+        Ok(cli_parse_log_filters(&raw))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "code", deny_unknown_fields)]
@@ -66,7 +87,7 @@ pub enum Input {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Permission {
     #[serde(rename = "read")]
     Read,
@@ -337,32 +358,67 @@ pub struct CloseTrace {
     pub requests_total: u64,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub dsn_secret: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub conninfo_secret: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub dbname: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub password_secret: Option<String>,
-    #[serde(flatten)]
     pub ssh: SshConfig,
-    #[serde(flatten)]
     pub container: ContainerConfig,
+}
+
+#[derive(Serialize)]
+struct SafeSessionConfig<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dsn_secret: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conninfo_secret: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dbname: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password_secret: Option<&'static str>,
+    #[serde(flatten)]
+    ssh: &'a SshConfig,
+    #[serde(flatten)]
+    container: &'a ContainerConfig,
+}
+
+impl Serialize for SessionConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        SafeSessionConfig {
+            dsn_secret: self.dsn_secret.as_ref().map(|_| "***"),
+            conninfo_secret: self.conninfo_secret.as_ref().map(|_| "***"),
+            host: self.host.as_deref(),
+            port: self.port,
+            user: self.user.as_deref(),
+            dbname: self.dbname.as_deref(),
+            password_secret: self.password_secret.as_ref().map(|_| "***"),
+            ssh: &self.ssh,
+            container: &self.container,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SshConfig {
     #[serde(rename = "ssh", skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    #[serde(rename = "ssh_via", default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<String>,
     #[serde(rename = "ssh_options", default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
     #[serde(rename = "ssh_local_host", skip_serializing_if = "Option::is_none")]
@@ -378,6 +434,7 @@ pub struct SshConfig {
 impl SshConfig {
     pub fn has_transport_fields(&self) -> bool {
         self.destination.is_some()
+            || !self.via.is_empty()
             || !self.options.is_empty()
             || self.local_host.is_some()
             || self.local_port.is_some()
@@ -388,6 +445,7 @@ impl SshConfig {
     pub fn has_tunnel_or_bridge_options(&self) -> bool {
         self.local_host.is_some()
             || self.local_port.is_some()
+            || !self.via.is_empty()
             || self.remote_socket.is_some()
             || self.sudo_user.is_some()
     }
@@ -462,6 +520,8 @@ struct SessionConfigFlat {
     #[serde(default)]
     ssh: Option<String>,
     #[serde(default)]
+    ssh_via: Vec<String>,
+    #[serde(default)]
     ssh_options: Vec<String>,
     #[serde(default)]
     ssh_local_host: Option<String>,
@@ -503,6 +563,7 @@ impl From<SessionConfigFlat> for SessionConfig {
             password_secret: flat.password_secret,
             ssh: SshConfig {
                 destination: flat.ssh,
+                via: flat.ssh_via,
                 options: flat.ssh_options,
                 local_host: flat.ssh_local_host,
                 local_port: flat.ssh_local_port,
@@ -582,8 +643,8 @@ pub struct RuntimeConfig {
     pub inline_max_bytes: usize,
     pub statement_timeout_ms: u64,
     pub lock_timeout_ms: u64,
-    #[serde(default)]
-    pub log: Vec<String>,
+    #[serde(default, with = "log_filters_serde")]
+    pub log: LogFilters,
 }
 
 impl Default for RuntimeConfig {
@@ -597,7 +658,7 @@ impl Default for RuntimeConfig {
             inline_max_bytes: 1_048_576,
             statement_timeout_ms: 30_000,
             lock_timeout_ms: 5_000,
-            log: vec![],
+            log: LogFilters::default(),
         }
     }
 }
@@ -664,6 +725,7 @@ pub struct SessionConfigPatch {
 #[derive(Debug, Default)]
 pub struct SshConfigPatch {
     pub destination: PatchField<String>,
+    pub via: PatchField<Vec<String>>,
     pub options: PatchField<Vec<String>>,
     pub local_host: PatchField<String>,
     pub local_port: PatchField<u16>,
@@ -703,6 +765,8 @@ struct SessionConfigPatchFlat {
     password_secret: PatchField<String>,
     #[serde(default)]
     ssh: PatchField<String>,
+    #[serde(default)]
+    ssh_via: PatchField<Vec<String>>,
     #[serde(default)]
     ssh_options: PatchField<Vec<String>>,
     #[serde(default)]
@@ -745,6 +809,7 @@ impl From<SessionConfigPatchFlat> for SessionConfigPatch {
             password_secret: flat.password_secret,
             ssh: SshConfigPatch {
                 destination: flat.ssh,
+                via: flat.ssh_via,
                 options: flat.ssh_options,
                 local_host: flat.ssh_local_host,
                 local_port: flat.ssh_local_port,

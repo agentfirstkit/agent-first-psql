@@ -12,20 +12,41 @@ read-only by default, safe for scripts, or reachable only across SSH/container
 boundaries. Prefer `afpsql` over parsing human `psql` tables, SSHing in to run
 `psql`, or `docker exec`/`kubectl exec` with human output.
 
-For flag-level detail, run `afpsql --help` or `afpsql --help-markdown`. This
+For flag-level detail, run `afpsql --help` or `afpsql --help --recursive --output markdown`. This
 skill covers behavior, decisions, and recovery only.
 
 ## Core Rules
 
-- Treat stdout as the protocol: parse Agent-First Data events such as
-  `code:"result"`, `code:"sql_error"`, and `code:"error"`.
+- Treat stdout as the protocol: parse strict Agent-First Data envelopes by
+  top-level `kind`. Business result codes stay at `result.code`; failures use
+  `error.code`, `error.message`, and `error.retryable`.
+- When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
+  It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
+  transaction-control SQL, and psql translation. It still permits SQL/config
+  files, arbitrary explicit secret-env names, SSH options, custom container
+  runtimes, redirects, and skill management; it is not a host sandbox.
+- For adversarial isolation, pair `afpsql-readonly` with a dedicated PostgreSQL
+  reader role. A host wildcard still authorizes caller-selected database and
+  SSH/container targets, network connections, every row that role can read,
+  local file/environment reads, and process-spawning transport options. Approve
+  a wildcard only when that full scope matches host policy. Use an
+  administrator-locked profile when target and transport inputs must be fixed.
 - Default to read-only. Native CLI and pipe mode require explicit write
   permissions: `write`, `ssh-write`, or `container-write`.
 - Use `--ssh`, `--container`, or `--ssh + --container` as afpsql transports;
   keep afpsql local unless the user explicitly asks for server-side tools.
+- For SSH jump hosts, keep using afpsql transport. If every hop is reachable
+  from the local OpenSSH client, use `--ssh-option ProxyJump=bastion`. If a
+  later hop is reachable only from an earlier host, repeat `--ssh-via` in chain
+  order and put the final database host in `--ssh`; e.g.
+  `--ssh-via ubuntu@jump1 --ssh-via ubuntu@jump2 --ssh ubuntu@db`.
 - Use `$1..$N` placeholders plus `--param N=value` / JSON `params`; do not
   interpolate user data into SQL text. `--param` values pass to PostgreSQL
   as text — string forms like `"00123"` and `NUMERIC` precision survive.
+- In shell commands, quote SQL containing `$1..$N` placeholders with single
+  quotes, or use `--sql-file` / pipe mode JSON. Do not put such SQL in double
+  quotes: shells expand `$1` and `$2` before `afpsql` sees the SQL, often into
+  empty strings that cause PostgreSQL syntax errors.
 - Use pipe mode and named sessions when transaction/session state, FIFO query
   ordering, cancellation, or streaming matters.
 - In pipe mode, send `{"code":"session_info","session":"NAME"}` once before
@@ -35,6 +56,16 @@ skill covers behavior, decisions, and recovery only.
   limits or identity with failing queries.
 - Keep PostgreSQL secret env names conventional (`PGPASSWORD`, `DATABASE_URL`);
   do not invent names such as `PGPASSWORD_SECRET`.
+- When an application already stores a connection string or password in JSON,
+  TOML, YAML, or dotenv, prefer `--dsn-secret-config FILE DOT_PATH`,
+  `--conninfo-secret-config FILE DOT_PATH`, or
+  `--password-secret-config FILE DOT_PATH`. Do not assemble Ruby/jq/yq command
+  substitutions or shell out to another tool: afpsql reads the value once
+  in-process through Agent-First Data's document layer, and config sources
+  are mutually exclusive with direct/env flags for a slot.
+- `afpsql-readonly` accepts config secret sources, but doing so reads the exact
+  local file selected by the caller. Its guarantee remains database read-family
+  permission, not absence of local file, process, or network side effects.
 - In sandboxed agents, if a known-good local TCP read returns immediate
   `connect_failed`, rerun once with approval if available before changing SQL or
   connection details.
@@ -44,34 +75,53 @@ skill covers behavior, decisions, and recovery only.
 Prefer `afpsql inspect` over hand-writing `information_schema` /
 `pg_catalog` queries:
 
-- `afpsql inspect databases` — non-template databases on the server.
-- `afpsql inspect schemas` — user-visible schemas.
-- `afpsql inspect tables [--schema X] [--like P]` — tables in a schema.
-- `afpsql inspect views [--schema X] [--like P]` — views in a schema.
-- `afpsql inspect table NAME` — column list, types, nullability, defaults
-  (accepts `schema.table`; defaults to `public`).
+- `afpsql inspect databases` — databases on the server with size, encoding,
+  collate/ctype, and connection facts (`--all` also lists template databases).
+- `afpsql inspect database` — summary of the connected database: schema, table,
+  view, materialized-view, and sequence counts plus total size.
+- `afpsql inspect schemas` — user-visible schemas with object counts and size.
+- `afpsql inspect schema [--schema X] [--like P]` — full metadata export for one
+  schema: relations, columns, constraints, indexes, triggers, sequences,
+  extensions, views/materialized views, and non-extension functions.
+- `afpsql inspect snapshot [--schema X] [--like P]` — stable full-schema snapshot
+  shape for downstream tooling or agent-side comparison.
+- `afpsql inspect tables [--schema X] [--like P]` — tables in a schema with owner,
+  estimated row count, and size.
+- `afpsql inspect views [--schema X] [--like P]` — views (regular and materialized)
+  in a schema with owner.
+- `afpsql inspect indexes [--schema X] [--table T] [--stats]` — indexes with
+  definitions, size, validity flags, and optional PostgreSQL built-in
+  `pg_stat_user_indexes` counters. `--stats` does not require an extension, but
+  counters follow PostgreSQL stats reset/window semantics.
+- `afpsql inspect table NAME` — column list with precise types, nullability,
+  defaults, primary-key flag, and comments (accepts `schema.table`; defaults to
+  `public`).
+- `afpsql inspect table NAME --full` — table-focused metadata export including
+  relation, columns, constraints, indexes, triggers, and sequence/default
+  relationships.
 
 For query plans, wrap with `--explain` (`EXPLAIN (FORMAT JSON)`) or
 `--explain-analyze` (also runs the statement; writes still need write
-permission). The plan JSON arrives in a normal `code:"result"` row.
+permission). The plan JSON arrives in a normal `kind:"result"` event under
+`result.rows`.
 
 ## Validating Before Executing
 
 `afpsql --dry-run --sql '...' --param 1=... [--param 2=...]` opens a
 connection, runs `PREPARE` inside a transaction that is rolled back, and
-emits a `code:"dry_run"` event with the inferred `param_types`, output
+emits a `kind:"result"` event whose `result.code` is `dry_run`, with the inferred `param_types`, output
 `columns`, and any prepare error. Use this to catch placeholder
 mismatches, missing tables, and type confusion before letting a query
 actually run.
 
 ## Branching on Failures
 
-- `code:"sql_error"` — PostgreSQL rejected the SQL. Branch on `sqlstate`
+- `kind:"error"` with `error.code:"sql_error"` — PostgreSQL rejected the SQL. Branch on `error.sqlstate`
   for typed handling (`25006` read-only tx, `42P01` missing relation,
   `23505` unique violation, etc.). Do not scrape `message` text when a
   SQLSTATE is present.
-- `code:"error"` — non-SQL failure (connect, cancel, invalid request,
-  config). Branch on `error_code` first: `connect_failed`, `cancelled`,
+- Other `kind:"error"` events are non-SQL failures (connect, cancel, invalid request,
+  config). Branch on `error.code` first: `connect_failed`, `cancelled`,
   `invalid_request`, `invalid_params`. Connect failures may also carry
   `sqlstate`/`message`/`detail` populated from the server-side rejection.
 - Honor `retryable: true/false`. Only retry when `true`, and only after
@@ -82,9 +132,9 @@ actually run.
 
 ## Results that Don't Fit Inline
 
-If a `code:"result"` event carries `truncated:true`, the underlying
-statement still ran in full, but the returned `rows` is only a prefix
-(see `truncated_at_rows` / `truncated_at_bytes`). For `UPDATE ...
+If a `kind:"result"` event carries `result.truncated:true`, the underlying
+statement still ran in full, but `result.rows` is only a prefix
+(see `result.truncated_at_rows` / `result.truncated_at_bytes`). For `UPDATE ...
 RETURNING` this means the writes happened; only the RETURNING projection
 was capped. Either narrow the query (`WHERE` / `LIMIT`) or rerun with
 `--stream-rows` to receive the full set in batches.
@@ -115,11 +165,25 @@ work, open an explicit transaction:
 
 - SSH transport expects discrete connection fields; avoid `--dsn-secret` and
   `--conninfo-secret` with `--ssh`.
+- `--ssh-via` is repeatable and means "local SSHs to this hop, that hop SSHs to
+  the next hop, and the final `--ssh` host runs the PostgreSQL bridge." The
+  PostgreSQL `--host/--port` are interpreted on the final host, so
+  `--host localhost --port 5432` means final-host localhost, not workstation
+  localhost. The final host needs `python3`, `python`, or `perl` for the bridge.
+- `--ssh-option` is OpenSSH `-o` passthrough and is repeatable; use it for
+  bastion/jump-host setups such as `ProxyJump=bastion` when local OpenSSH can
+  authenticate to the final host through the jump. Use `--ssh-via` instead
+  when hop-to-hop credentials live on the intermediate hosts.
 - SSH sudo bridge is a last-resort fallback for socket/peer setups. Prefer a
   password-authenticated database role or peer mapping when possible.
 - Container transport runs a no-TTY stdio bridge. The target container needs
   `sh` plus one of `python3`, `python`, or `perl`, but does not need afpsql or
   `psql` installed.
+- Connecting to a containerized PostgreSQL without a known password: prefer peer
+  auth over the container's Unix socket with
+  `--container-user <db-os-user> --host /var/run/postgresql`. The `--container-user`
+  must match the database role (commonly `postgres`). TCP (`--host 127.0.0.1`)
+  requires a password.
 - libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
   `PGPASSWORD`, `PGSSLMODE`) silently fill connection fields not given via
   flags or secrets. Prefer explicit flags for agent runs, and pass `--log connect`
@@ -151,6 +215,10 @@ afpsql psql install             # optional: psql-compatible wrapper
   PostgreSQL listener, and whether a Unix socket is required.
 - Bridge prerequisite errors: install `python3`, `python`, or `perl` in the
   target/sidecar, or connect through a host network path instead.
+- Multi-hop SSH with hop-local credentials: repeat `--ssh-via` in order, for
+  example `--ssh-via ubuntu@me_automanage --ssh ubuntu@zhiya --host localhost`.
+  Do not replace this with nested manual `ssh ... psql`; keep afpsql local so
+  stdout remains structured and SSH stderr is captured in the error event.
 - SSH `connection refused`: check the remote host/port or Unix socket path, not
   the local workstation's PostgreSQL service.
 - `password authentication failed`: TCP auth rules are in effect; use the correct

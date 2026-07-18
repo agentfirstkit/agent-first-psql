@@ -9,13 +9,17 @@ use crate::logutil::build_startup_log;
 use crate::protocol::error_code;
 use crate::types::*;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 
-pub async fn run(init: crate::cli::PipeInit) {
+pub async fn run(
+    init: crate::cli::PipeInit,
+    capability: crate::Capability,
+    locked_readonly_profile: bool,
+) {
     let crate::cli::PipeInit {
         output,
         session,
@@ -36,13 +40,17 @@ pub async fn run(init: crate::cli::PipeInit) {
     }
     if startup_requested {
         let event = build_startup_log(None, &startup_args, &startup_env);
-        emit_output(&event, output);
+        if emit_output(&event, output).is_err() {
+            std::process::exit(4);
+        }
     }
 
     let (tx, rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
-    tokio::spawn(crate::writer::writer_task(rx, output));
+    let writer = tokio::spawn(crate::writer::writer_task(rx, output));
 
-    let app = Arc::new(App::new(config, tx));
+    let app = Arc::new(App::new(config, tx, capability));
+    app.locked_readonly_profile
+        .store(locked_readonly_profile, Ordering::Relaxed);
     let runtime = Arc::new(PipeRuntime::new(app));
 
     let stdin = tokio::io::stdin();
@@ -107,8 +115,11 @@ pub async fn run(init: crate::cli::PipeInit) {
     wait_for_workers_shutdown(&runtime).await;
     runtime.app.executor.shutdown().await;
     send_close_event(&runtime.app).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(runtime);
+    match writer.await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => std::process::exit(4),
+    }
 }
 
 struct PipeRuntime {
@@ -171,12 +182,42 @@ async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
             options,
         } => dispatch_query(runtime, id, session, sql, params, options).await,
         Input::Config(patch) => {
+            if runtime.app.capability == crate::Capability::ReadOnly
+                && runtime.app.locked_readonly_profile.load(Ordering::Relaxed)
+                && patch.sessions.is_some()
+            {
+                send_protocol_error(
+                    &runtime.app,
+                    None,
+                    error_code::INVALID_REQUEST,
+                    "pipe session config cannot override an administrator-locked afpsql-readonly profile",
+                    Some(crate::readonly_local_capability_hint()),
+                    false,
+                )
+                .await;
+                return false;
+            }
             let sessions = sessions_to_invalidate(&patch);
-            let cfg_snapshot = {
-                let mut cfg = runtime.app.config.write().await;
-                cfg.apply_update(patch);
-                cfg.clone()
-            };
+            let mut cfg_snapshot = runtime.app.config.read().await.clone();
+            cfg_snapshot.apply_update(patch);
+            if runtime.app.capability == crate::Capability::ReadOnly
+                && let Some(error) = cfg_snapshot
+                    .sessions
+                    .values()
+                    .find_map(|session| crate::readonly_policy::validate_session(session).err())
+            {
+                send_protocol_error(
+                    &runtime.app,
+                    None,
+                    error_code::INVALID_REQUEST,
+                    &error,
+                    Some(crate::readonly_local_capability_hint()),
+                    false,
+                )
+                .await;
+                return false;
+            }
+            *runtime.app.config.write().await = cfg_snapshot.clone();
             runtime.app.executor.invalidate_sessions(&sessions).await;
             let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
         }
@@ -219,6 +260,20 @@ async fn dispatch_begin(
     permission: Option<crate::types::Permission>,
 ) {
     let app = &runtime.app;
+    if app.capability == crate::Capability::ReadOnly
+        && (!read_only || permission.is_some_and(|value| !value.is_read_only()))
+    {
+        send_protocol_error(
+            app,
+            id,
+            error_code::INVALID_REQUEST,
+            "read-write transactions are unavailable in afpsql-readonly",
+            Some(crate::readonly_hint()),
+            false,
+        )
+        .await;
+        return;
+    }
     let cfg = app.config.read().await.clone();
     let resolved_session = crate::conn::resolve_session_name(&cfg, session.as_deref());
     let Some(session_cfg) = cfg.sessions.get(&resolved_session).cloned() else {
@@ -240,6 +295,23 @@ async fn dispatch_begin(
             .await;
         return;
     };
+    if app.capability == crate::Capability::ReadOnly
+        && let Err(error) = crate::readonly_policy::validate_session_with_trust(
+            &session_cfg,
+            app.locked_readonly_profile.load(Ordering::Relaxed),
+        )
+    {
+        send_protocol_error(
+            app,
+            id,
+            error_code::INVALID_REQUEST,
+            &error,
+            Some(crate::readonly_local_capability_hint()),
+            false,
+        )
+        .await;
+        return;
+    }
 
     // A read-write begin needs a write permission matching the session's
     // transport. Read-only begin always passes (it's strictly less than the
@@ -619,14 +691,10 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
 
 async fn get_session_worker(runtime: &Arc<PipeRuntime>, session: &str) -> mpsc::Sender<SessionOp> {
     let mut workers = runtime.workers.lock().await;
-    if workers
-        .get(session)
-        .map(|worker| !worker.handle.is_finished())
-        .unwrap_or(false)
+    if let Some(worker) = workers.get(session)
+        && !worker.handle.is_finished()
     {
-        if let Some(worker) = workers.get(session) {
-            return worker.tx.clone();
-        }
+        return worker.tx.clone();
     }
 
     workers.remove(session);

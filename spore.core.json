@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,21 +13,14 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Add `afpsql inspect` for schema discovery — list databases, schemas, tables, and columns without hand-writing catalog queries",
-    "Add --dry-run to prepare and validate a statement server-side without executing it",
-    "Add --explain and --explain-analyze to wrap a query in its execution plan",
-    "Add pipe-mode begin/commit/rollback requests for explicit multi-statement transactions on a session",
-    "Soft-truncate oversized inline result sets instead of erroring out, so large reads degrade gracefully",
-    "Eliminate the cancel race with an atomic terminal-emit claim so a cancelled query can never double-emit a terminal frame",
-    "Harden value decoding — surface decode errors instead of silently emitting null, and correctly handle bytea and array types",
-    "Preserve the --param string form and bind NUMERIC values without precision loss",
-    "Unify the error code dispatch and report connection identity in session_info responses",
-    "Upgrade to rustc 1.96 and refresh workspace dependencies"
+    "Add --dsn-secret-config/--conninfo-secret-config/--password-secret-config to read a connection secret from a JSON, TOML, YAML, or dotenv config file in-process.",
+    "Redact every session secret from runtime config output regardless of whether its source was direct, environment, or config.",
+    "Redefine afpsql-readonly as a PostgreSQL write guard rather than a host sandbox, restoring SQL files, config sources, SSH options, and skill management while keeping read enforcement."
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.DLwVyPLJRtv7KwfXD25E7zkpveZVykRgo2RQJkHp9zZZ",
+      "uri": "cmn://agentfirstkit.com/b3.2UfL97LEY4kqWw5XMWjxAhCgwEJMhX5ALduspBg2e5zc",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

@@ -1,34 +1,8 @@
-<!-- Generated. Do not edit by hand. -->
+<!-- Generated. Do not edit by hand. Regenerate: afpsql --help --recursive --output markdown -->
 
 # afpsql CLI Reference
 
-> Regenerate with `afpsql --help-markdown`.
-
-# Command-Line Help for `afpsql`
-
-This document contains the help content for the `afpsql` command-line program.
-
-**Command Overview:**
-
-* [`afpsql`↴](#afpsql)
-* [`afpsql psql`↴](#afpsql-psql)
-* [`afpsql psql status`↴](#afpsql-psql-status)
-* [`afpsql psql install`↴](#afpsql-psql-install)
-* [`afpsql psql uninstall`↴](#afpsql-psql-uninstall)
-* [`afpsql skill`↴](#afpsql-skill)
-* [`afpsql skill status`↴](#afpsql-skill-status)
-* [`afpsql skill install`↴](#afpsql-skill-install)
-* [`afpsql skill uninstall`↴](#afpsql-skill-uninstall)
-* [`afpsql inspect`↴](#afpsql-inspect)
-* [`afpsql inspect databases`↴](#afpsql-inspect-databases)
-* [`afpsql inspect schemas`↴](#afpsql-inspect-schemas)
-* [`afpsql inspect tables`↴](#afpsql-inspect-tables)
-* [`afpsql inspect views`↴](#afpsql-inspect-views)
-* [`afpsql inspect table`↴](#afpsql-inspect-table)
-
-## `afpsql`
-
-Agent-First PostgreSQL client.
+# afpsql - A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.
 
 `afpsql` gives agents a reliable PostgreSQL contract: structured stdout
 events, first-class SSH/container transports, explicit write permissions,
@@ -42,6 +16,12 @@ stable pipe sessions, and machine-readable failures.
 - native CLI and pipe mode default to read-only transactions; writes require permission
 - SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
+### Modes
+
+- default (native CLI): one SQL action per process — a single agent step
+- `--mode pipe`: a long-lived JSONL session with `id` correlation and named sessions for multi-step work
+- `--mode psql`: run existing `psql` scripts unchanged — flags are translated, runtime output stays JSONL
+
 ### Query Sources and Parameters
 
 - use `--sql` for inline SQL or `--sql-file` for a file
@@ -53,6 +33,8 @@ stable pipe sessions, and machine-readable failures.
 - `--dsn-secret` for a PostgreSQL URI
 - `--conninfo-secret` for libpq-style conninfo
 - or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
+- every `*-secret` flag has a `*-secret-env` partner that reads the value from a named environment variable
+- every secret slot also has a `*-secret-config FILE DOT_PATH` source for JSON, TOML, YAML, or dotenv
 - add `--ssh user@server` when PostgreSQL is reachable only from the server boundary
 - add `--container TARGET` when PostgreSQL is reachable only from inside a container boundary
 - use named container scope flags instead of raw driver option passthrough
@@ -72,8 +54,9 @@ stable pipe sessions, and machine-readable failures.
 ```text
 afpsql --sql "select now() as now_rfc3339"
 afpsql --sql-file ./query.sql
-afpsql --sql "select * from users where id = $1" --param 1=123
+afpsql --sql 'select * from users where id = $1' --param 1=123
 afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
+afpsql --dsn-secret-config config.yaml database.url --sql "select 1"
 afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --container pg-container --dsn-secret-env DATABASE_URL --sql "select 1"
 afpsql --ssh root@server --container app --host host.container.internal --port 5432 --user app --dbname appdb --sql "select 1"
@@ -92,303 +75,520 @@ afpsql skill install
 - `1`: SQL error or runtime error
 - `2`: invalid CLI arguments
 
-**Usage:** `afpsql [OPTIONS] [COMMAND]`
+```text
+Usage: afpsql [OPTIONS] [COMMAND]
 
-###### **Subcommands:**
+Commands:
+  psql     Manage the local psql wrapper for afpsql --mode psql
+  skill    Manage Agent-First PSQL skills for Codex, Claude Code, opencode, and Hermes
+  inspect  Schema discovery: inspect databases, schemas, tables, indexes, or snapshots
+  help     Print this message or the help of the given subcommand(s)
 
-* `psql` — Manage the local psql wrapper for afpsql --mode psql
-* `skill` — Manage Agent-First PSQL skills for Codex and Claude Code
-* `inspect` — Schema discovery: list databases, schemas, tables, views, or describe a table
+Options:
+  -h, --help
+          Print help. Add --recursive to expand every nested subcommand; add --output json|yaml|markdown to render this help in another format.
 
-###### **Options:**
+  -V, --version
+          Print version
 
-* `--sql <SQL>` — Inline SQL string to execute
-* `--sql-file <SQL_FILE>` — Read SQL from a file
-* `--param <PARAM>` — Positional bind parameter in `N=value` form. Repeat for additional parameters
-* `--stream-rows` — Stream large result sets as `result_rows` batches instead of a single inline result
-* `--batch-rows <BATCH_ROWS>` — Maximum rows per streamed batch
-* `--batch-bytes <BATCH_BYTES>` — Soft byte target per streamed batch
-* `--statement-timeout-ms <STATEMENT_TIMEOUT_MS>` — Per-query statement timeout in milliseconds
-* `--lock-timeout-ms <LOCK_TIMEOUT_MS>` — Per-query lock timeout in milliseconds
-* `--inline-max-rows <INLINE_MAX_ROWS>` — Maximum inline rows before returning `result_too_large`
-* `--inline-max-bytes <INLINE_MAX_BYTES>` — Maximum inline payload bytes before returning `result_too_large`
-* `--permission <PERMISSION>` — Query permission: read, write, ssh-read, ssh-write, container-read, or container-write. Defaults to read, ssh-read with --ssh, or container-read with --container
-* `--dry-run` — Preview the query without executing it
-* `--explain` — Wrap the query in EXPLAIN (FORMAT JSON) and return the plan tree instead of executing the user's SQL
-* `--explain-analyze` — Wrap the query in EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS). The underlying SQL actually runs; writes require the matching write permission
-* `--dsn-secret <DSN_SECRET>` — PostgreSQL DSN URI. Redacted in structured output
-* `--dsn-secret-env <DSN_SECRET_ENV>` — Read PostgreSQL DSN URI from an environment variable
-* `--conninfo-secret <CONNINFO_SECRET>` — libpq-style conninfo string. Redacted in structured output
-* `--host <HOST>` — PostgreSQL host
-* `--port <PORT>` — PostgreSQL port
-* `--user <USER>` — PostgreSQL user name
-* `--dbname <DBNAME>` — PostgreSQL database name
-* `--password-secret <PASSWORD_SECRET>` — PostgreSQL password. Redacted in structured output
-* `--password-secret-env <PASSWORD_SECRET_ENV>` — Read PostgreSQL password from an environment variable
-* `--ssh <SSH>` — Open an SSH transport to USER@HOST before connecting to PostgreSQL
-* `--ssh-option <SSH_OPTIONS>` — Additional OpenSSH -o option. Repeat for multiple options
-* `--ssh-local-host <SSH_LOCAL_HOST>` — Local bind host for the SSH tunnel
-* `--ssh-local-port <SSH_LOCAL_PORT>` — Local bind port for the SSH tunnel. Defaults to an ephemeral port
-* `--ssh-remote-socket <SSH_REMOTE_SOCKET>` — Explicit remote PostgreSQL Unix socket path for SSH forwarding
-* `--ssh-sudo-user <SSH_SUDO_USER>` — Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket
-* `--container <CONTAINER>` — Run a container exec stdio bridge in TARGET before connecting to PostgreSQL
-* `--container-driver <CONTAINER_DRIVER>` — Container exec driver: docker, podman, nerdctl, compose, or kubectl
-* `--container-runtime <CONTAINER_RUNTIME>` — Runtime command for the selected container driver. Defaults to the driver command
-* `--container-user <CONTAINER_USER>` — OS user passed to drivers that support exec user selection
-* `--container-namespace <CONTAINER_NAMESPACE>` — Kubernetes namespace for kubectl exec
-* `--container-context <CONTAINER_CONTEXT>` — Docker or Kubernetes context for the selected driver
-* `--container-compose-file <CONTAINER_COMPOSE_FILES>` — Compose file passed before compose exec. Repeat for multiple files
-* `--container-compose-project <CONTAINER_COMPOSE_PROJECT>` — Compose project name passed before compose exec
-* `--container-pod-container <CONTAINER_POD_CONTAINER>` — Kubernetes container name for multi-container pods
-* `--output <OUTPUT>` — Output format: json (default), yaml, or plain
+Query:
+      --sql <SQL>
+          Inline SQL string to execute
 
-  Default value: `json`
-* `--log <LOG>` — Diagnostic log categories
-* `--mode <MODE>` — Runtime mode: canonical cli, pipe, or `psql` translation mode
+      --sql-file <SQL_FILE>
+          Read SQL from a file
 
-  Default value: `cli`
+      --param <PARAM>
+          Positional bind parameter in `N=value` form. Repeat for additional parameters
 
-  Possible values: `cli`, `pipe`, `psql`
+      --stream-rows
+          Stream large result sets as `result_rows` batches instead of a single inline result
 
+      --batch-rows <BATCH_ROWS>
+          Maximum rows per streamed batch
 
+      --batch-bytes <BATCH_BYTES>
+          Soft byte target per streamed batch
 
+      --statement-timeout-ms <STATEMENT_TIMEOUT_MS>
+          Per-query statement timeout in milliseconds
 
-## `afpsql psql`
+      --lock-timeout-ms <LOCK_TIMEOUT_MS>
+          Per-query lock timeout in milliseconds
 
-Manage the local psql wrapper for afpsql --mode psql
+      --inline-max-rows <INLINE_MAX_ROWS>
+          Maximum inline rows before returning `result_too_large`
 
-**Usage:** `afpsql psql <COMMAND>`
+      --inline-max-bytes <INLINE_MAX_BYTES>
+          Maximum inline payload bytes before returning `result_too_large`
 
-###### **Subcommands:**
+      --permission <PERMISSION>
+          Query permission. Defaults to read, ssh-read with --ssh, or container-read with --container
 
-* `status` — Show whether the afpsql-managed psql wrapper is installed and active
-* `install` — Install an afpsql-managed psql wrapper
-* `uninstall` — Remove an afpsql-managed psql wrapper
+          [possible values: read, write, ssh-read, ssh-write, container-read, container-write]
 
+      --dry-run
+          Preview the query without executing it
 
+      --explain
+          Wrap the query in EXPLAIN (FORMAT JSON) and return the plan tree instead of executing the user's SQL
 
-## `afpsql psql status`
+      --explain-analyze
+          Wrap the query in EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS). The underlying SQL actually runs; writes require the matching write permission
 
-Show whether the afpsql-managed psql wrapper is installed and active
+Connection:
+      --dsn-secret <DSN_SECRET>
+          PostgreSQL DSN URI. Redacted in structured output
 
-**Usage:** `afpsql psql status [OPTIONS]`
+      --dsn-secret-env <DSN_SECRET_ENV>
+          Read PostgreSQL DSN URI from an environment variable
 
-###### **Options:**
+      --dsn-secret-config <FILE> <DOT_PATH>
+          Read PostgreSQL DSN URI from FILE at DOT_PATH
 
-* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+      --conninfo-secret <CONNINFO_SECRET>
+          libpq-style conninfo string. Redacted in structured output
 
+      --conninfo-secret-env <CONNINFO_SECRET_ENV>
+          Read libpq-style conninfo string from an environment variable
 
+      --conninfo-secret-config <FILE> <DOT_PATH>
+          Read libpq-style conninfo from FILE at DOT_PATH
 
-## `afpsql psql install`
+      --host <HOST>
+          PostgreSQL host
 
-Install an afpsql-managed psql wrapper
+      --port <PORT>
+          PostgreSQL port
 
-**Usage:** `afpsql psql install [OPTIONS]`
+      --user <USER>
+          PostgreSQL user name
 
-###### **Options:**
+      --dbname <DBNAME>
+          PostgreSQL database name
 
-* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+      --password-secret <PASSWORD_SECRET>
+          PostgreSQL password. Redacted in structured output
 
+      --password-secret-env <PASSWORD_SECRET_ENV>
+          Read PostgreSQL password from an environment variable
 
+      --password-secret-config <FILE> <DOT_PATH>
+          Read PostgreSQL password from FILE at DOT_PATH
 
-## `afpsql psql uninstall`
+SSH Transport:
+      --ssh <SSH>
+          Open an SSH transport to USER@HOST before connecting to PostgreSQL
 
-Remove an afpsql-managed psql wrapper
+      --ssh-via <SSH_VIA>
+          SSH hop to reach before the final --ssh destination. Repeat for multiple hops
 
-**Usage:** `afpsql psql uninstall [OPTIONS]`
+      --ssh-option <SSH_OPTIONS>
+          Additional OpenSSH -o option. Repeat for multiple options
 
-###### **Options:**
+      --ssh-local-host <SSH_LOCAL_HOST>
+          Local bind host for the SSH tunnel
 
-* `--bin-dir <BIN_DIR>` — Directory that contains the psql wrapper. Defaults to the afpsql executable directory
+      --ssh-local-port <SSH_LOCAL_PORT>
+          Local bind port for the SSH tunnel. Defaults to an ephemeral port
 
+      --ssh-remote-socket <SSH_REMOTE_SOCKET>
+          Explicit remote PostgreSQL Unix socket path for SSH forwarding
 
+      --ssh-sudo-user <SSH_SUDO_USER>
+          Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket
 
-## `afpsql skill`
+Container Transport:
+      --container <CONTAINER>
+          Run a container exec stdio bridge in TARGET before connecting to PostgreSQL
 
-Manage Agent-First PSQL skills for Codex and Claude Code
+      --container-driver <CONTAINER_DRIVER>
+          Container exec driver: docker, podman, nerdctl, compose, or kubectl
 
-**Usage:** `afpsql skill <COMMAND>`
+      --container-runtime <CONTAINER_RUNTIME>
+          Runtime command for the selected container driver. Defaults to the driver command
 
-###### **Subcommands:**
+      --container-user <CONTAINER_USER>
+          OS user passed to drivers that support exec user selection
 
-* `status` — Show whether the Agent-First PSQL skill is installed and valid
-* `install` — Install the Agent-First PSQL skill
-* `uninstall` — Remove an afpsql-managed Agent-First PSQL skill
+      --container-namespace <CONTAINER_NAMESPACE>
+          Kubernetes namespace for kubectl exec
 
+      --container-context <CONTAINER_CONTEXT>
+          Docker or Kubernetes context for the selected driver
 
+      --container-compose-file <CONTAINER_COMPOSE_FILES>
+          Compose file passed before compose exec. Repeat for multiple files
 
-## `afpsql skill status`
+      --container-compose-project <CONTAINER_COMPOSE_PROJECT>
+          Compose project name passed before compose exec
 
-Show whether the Agent-First PSQL skill is installed and valid
+      --container-pod-container <CONTAINER_POD_CONTAINER>
+          Kubernetes container name for multi-container pods
 
-**Usage:** `afpsql skill status [OPTIONS]`
+Runtime:
+  -o, --output <OUTPUT>
+          Output format: json (default), yaml, or plain
 
-###### **Options:**
+          [default: json]
 
-* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+      --stdout-file <PATH>
+          Redirect stdout bytes to this file
 
-  Default value: `all`
+      --stderr-file <PATH>
+          Redirect stderr bytes to this file
 
-  Possible values:
-  - `all`:
-    Manage both Codex and Claude Code personal skills
-  - `codex`:
-    Manage the Codex local skill under $CODEX_HOME/skills
-  - `claude-code`:
-    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+      --log <LOG>
+          Diagnostic log categories (comma-separated). Categories: startup, connect, query, transport, mode; or an exact event name like `query.error`; or `all` for everything
 
-* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+      --mode <MODE>
+          Runtime mode: canonical cli, pipe, or `psql` translation mode
 
-  Default value: `personal`
+          [default: cli]
+          [possible values: cli, pipe, psql]
+```
 
-  Possible values:
-  - `personal`:
-    Install under the user-level skills directory
-  - `project`:
-    Install under the current project's skills directory
+## afpsql psql - Manage the local psql wrapper for afpsql --mode psql
 
-* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
+```text
+Usage: psql <COMMAND>
 
+Commands:
+  status     Show whether the afpsql-managed psql wrapper is installed and active
+  install    Install an afpsql-managed psql wrapper
+  uninstall  Remove an afpsql-managed psql wrapper
+  help       Print this message or the help of the given subcommand(s)
 
+Options:
+  -h, --help
+          Print help
+```
 
-## `afpsql skill install`
+### afpsql psql status - Show whether the afpsql-managed psql wrapper is installed and active
 
-Install the Agent-First PSQL skill
+```text
+Usage: status [OPTIONS]
 
-**Usage:** `afpsql skill install [OPTIONS]`
+Options:
+      --bin-dir <BIN_DIR>
+          Directory that contains the psql wrapper. Defaults to the afpsql executable directory
 
-###### **Options:**
+  -h, --help
+          Print help
+```
 
-* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+### afpsql psql install - Install an afpsql-managed psql wrapper
 
-  Default value: `all`
+```text
+Usage: install [OPTIONS]
 
-  Possible values:
-  - `all`:
-    Manage both Codex and Claude Code personal skills
-  - `codex`:
-    Manage the Codex local skill under $CODEX_HOME/skills
-  - `claude-code`:
-    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+Options:
+      --bin-dir <BIN_DIR>
+          Directory that contains the psql wrapper. Defaults to the afpsql executable directory
 
-* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+  -h, --help
+          Print help
+```
 
-  Default value: `personal`
+### afpsql psql uninstall - Remove an afpsql-managed psql wrapper
 
-  Possible values:
-  - `personal`:
-    Install under the user-level skills directory
-  - `project`:
-    Install under the current project's skills directory
+```text
+Usage: uninstall [OPTIONS]
 
-* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
-* `--force` — Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
+Options:
+      --bin-dir <BIN_DIR>
+          Directory that contains the psql wrapper. Defaults to the afpsql executable directory
 
+  -h, --help
+          Print help
+```
 
+## afpsql skill - Manage Agent-First PSQL skills for Codex, Claude Code, opencode, and Hermes
 
-## `afpsql skill uninstall`
+```text
+Usage: skill <COMMAND>
 
-Remove an afpsql-managed Agent-First PSQL skill
+Commands:
+  status     Show whether the Agent-First PSQL skill is installed, valid, and up to date
+  install    Install the Agent-First PSQL skill
+  uninstall  Remove an afpsql-managed Agent-First PSQL skill
+  help       Print this message or the help of the given subcommand(s)
 
-**Usage:** `afpsql skill uninstall [OPTIONS]`
+Options:
+  -h, --help
+          Print help
+```
 
-###### **Options:**
+### afpsql skill status - Show whether the Agent-First PSQL skill is installed, valid, and up to date
 
-* `--agent <AGENT>` — Agent to manage. Defaults to all personal skill targets
+```text
+Usage: status [OPTIONS]
 
-  Default value: `all`
+Options:
+      --agent <AGENT>
+          Agent to manage. Defaults to all personal skill targets
 
-  Possible values:
-  - `all`:
-    Manage both Codex and Claude Code personal skills
-  - `codex`:
-    Manage the Codex local skill under $CODEX_HOME/skills
-  - `claude-code`:
-    Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+          Possible values:
+          - all:         Manage every agent that supports the requested scope
+          - codex:       Manage the Codex local skill under $CODEX_HOME/skills
+          - claude-code: Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+          - opencode:    Manage the opencode skill under ~/.config/opencode/skills or .opencode/skills
+          - hermes:      Manage the Hermes skill under $HERMES_HOME/skills or ~/.hermes/skills
 
-* `--scope <SCOPE>` — Skill scope. Project scope is supported for Claude Code only
+          [default: all]
 
-  Default value: `personal`
+      --scope <SCOPE>
+          Skill scope
 
-  Possible values:
-  - `personal`:
-    Install under the user-level skills directory
-  - `project`:
-    Install under the current project's skills directory
+          Possible values:
+          - personal:  Install under the user-level skills directory
+          - workspace: Install under the current workspace's skills directory
 
-* `--skills-dir <SKILLS_DIR>` — Directory that contains skill folders. Requires an explicit single --agent
-* `--force` — Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
+          [default: personal]
 
+      --skills-dir <SKILLS_DIR>
+          Directory that contains skill folders. Requires an explicit single --agent
 
+  -h, --help
+          Print help (see a summary with '-h')
+```
 
-## `afpsql inspect`
+### afpsql skill install - Install the Agent-First PSQL skill
 
-Schema discovery: list databases, schemas, tables, views, or describe a table
+```text
+Usage: install [OPTIONS]
 
-**Usage:** `afpsql inspect <COMMAND>`
+Options:
+      --agent <AGENT>
+          Agent to manage. Defaults to all personal skill targets
 
-###### **Subcommands:**
+          Possible values:
+          - all:         Manage every agent that supports the requested scope
+          - codex:       Manage the Codex local skill under $CODEX_HOME/skills
+          - claude-code: Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+          - opencode:    Manage the opencode skill under ~/.config/opencode/skills or .opencode/skills
+          - hermes:      Manage the Hermes skill under $HERMES_HOME/skills or ~/.hermes/skills
 
-* `databases` — List non-template databases on the connected server
-* `schemas` — List user-visible schemas
-* `tables` — List tables (and partitioned tables) in a schema, optionally filtered
-* `views` — List views in a schema, optionally filtered
-* `table` — Describe a single table's columns, types, nullability, and defaults
+          [default: all]
 
+      --scope <SCOPE>
+          Skill scope
 
+          Possible values:
+          - personal:  Install under the user-level skills directory
+          - workspace: Install under the current workspace's skills directory
 
-## `afpsql inspect databases`
+          [default: personal]
 
-List non-template databases on the connected server
+      --skills-dir <SKILLS_DIR>
+          Directory that contains skill folders. Requires an explicit single --agent
 
-**Usage:** `afpsql inspect databases`
+      --force
+          Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
 
+  -h, --help
+          Print help (see a summary with '-h')
+```
 
+### afpsql skill uninstall - Remove an afpsql-managed Agent-First PSQL skill
 
-## `afpsql inspect schemas`
+```text
+Usage: uninstall [OPTIONS]
 
-List user-visible schemas
+Options:
+      --agent <AGENT>
+          Agent to manage. Defaults to all personal skill targets
 
-**Usage:** `afpsql inspect schemas`
+          Possible values:
+          - all:         Manage every agent that supports the requested scope
+          - codex:       Manage the Codex local skill under $CODEX_HOME/skills
+          - claude-code: Manage the Claude Code skill under ~/.claude/skills or .claude/skills
+          - opencode:    Manage the opencode skill under ~/.config/opencode/skills or .opencode/skills
+          - hermes:      Manage the Hermes skill under $HERMES_HOME/skills or ~/.hermes/skills
 
+          [default: all]
 
+      --scope <SCOPE>
+          Skill scope
 
-## `afpsql inspect tables`
+          Possible values:
+          - personal:  Install under the user-level skills directory
+          - workspace: Install under the current workspace's skills directory
 
-List tables (and partitioned tables) in a schema, optionally filtered
+          [default: personal]
 
-**Usage:** `afpsql inspect tables [OPTIONS]`
+      --skills-dir <SKILLS_DIR>
+          Directory that contains skill folders. Requires an explicit single --agent
 
-###### **Options:**
+      --force
+          Overwrite or remove an unmanaged Agent-First PSQL skill at the target path
 
-* `--schema <SCHEMA>` — Schema to filter on. Defaults to `public`
+  -h, --help
+          Print help (see a summary with '-h')
+```
 
-  Default value: `public`
-* `--like <LIKE>` — Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard)
+## afpsql inspect - Schema discovery: inspect databases, schemas, tables, indexes, or snapshots
 
+```text
+Usage: inspect <COMMAND>
 
+Commands:
+  databases  List databases on the connected server with size, encoding, and connection facts
+  database   Summarize the connected database: schema/table/view/sequence counts and size
+  schemas    List user-visible schemas
+  schema     Export full schema metadata for one schema
+  snapshot   Export a stable full-schema snapshot for machine consumption
+  tables     List tables in a schema with owner, estimated rows, and size
+  views      List views (regular and materialized) in a schema with owner
+  indexes    List indexes with definitions, size, validity, and optional usage stats
+  table      Describe a table's columns: types, nullability, defaults, primary key, comments
+  help       Print this message or the help of the given subcommand(s)
 
-## `afpsql inspect views`
+Options:
+  -h, --help
+          Print help
+```
 
-List views in a schema, optionally filtered
+### afpsql inspect databases - List databases on the connected server with size, encoding, and connection facts
 
-**Usage:** `afpsql inspect views [OPTIONS]`
+```text
+Usage: databases [OPTIONS]
 
-###### **Options:**
+Options:
+      --all
+          Include template databases (template0/template1) in the listing
 
-* `--schema <SCHEMA>` — Schema to filter on. Defaults to `public`
+  -h, --help
+          Print help
+```
 
-  Default value: `public`
-* `--like <LIKE>` — Optional `LIKE` pattern matched against `table_name` (use `%` as wildcard)
+### afpsql inspect database - Summarize the connected database: schema/table/view/sequence counts and size
 
+```text
+Usage: database
 
+Options:
+  -h, --help
+          Print help
+```
 
-## `afpsql inspect table`
+### afpsql inspect schemas - List user-visible schemas
 
-Describe a single table's columns, types, nullability, and defaults
+```text
+Usage: schemas
 
-**Usage:** `afpsql inspect table <NAME>`
+Options:
+  -h, --help
+          Print help
+```
 
-###### **Arguments:**
+### afpsql inspect schema - Export full schema metadata for one schema
 
-* `<NAME>` — Table name. Accepts `schema.table`; defaults to `public.NAME` when unqualified
+```text
+Usage: schema [OPTIONS]
+
+Options:
+      --schema <SCHEMA>
+          Schema to inspect. Defaults to `public`
+
+          [default: public]
+
+      --like <LIKE>
+          Optional `LIKE` pattern matched against relation names (use `%` as wildcard)
+
+  -h, --help
+          Print help
+```
+
+### afpsql inspect snapshot - Export a stable full-schema snapshot for machine consumption
+
+```text
+Usage: snapshot [OPTIONS]
+
+Options:
+      --schema <SCHEMA>
+          Schema to inspect. Defaults to `public`
+
+          [default: public]
+
+      --like <LIKE>
+          Optional `LIKE` pattern matched against relation names (use `%` as wildcard)
+
+  -h, --help
+          Print help
+```
+
+### afpsql inspect tables - List tables in a schema with owner, estimated rows, and size
+
+```text
+Usage: tables [OPTIONS]
+
+Options:
+      --schema <SCHEMA>
+          Schema to filter on. Defaults to `public`
+
+          [default: public]
+
+      --like <LIKE>
+          Optional `LIKE` pattern matched against the table name (use `%` as wildcard)
+
+  -h, --help
+          Print help
+```
+
+### afpsql inspect views - List views (regular and materialized) in a schema with owner
+
+```text
+Usage: views [OPTIONS]
+
+Options:
+      --schema <SCHEMA>
+          Schema to filter on. Defaults to `public`
+
+          [default: public]
+
+      --like <LIKE>
+          Optional `LIKE` pattern matched against the view name (use `%` as wildcard)
+
+  -h, --help
+          Print help
+```
+
+### afpsql inspect indexes - List indexes with definitions, size, validity, and optional usage stats
+
+```text
+Usage: indexes [OPTIONS]
+
+Options:
+      --schema <SCHEMA>
+          Schema to filter on. Defaults to `public`
+
+          [default: public]
+
+      --table <TABLE>
+          Optional table name to filter on. Accepts `schema.table` to override --schema
+
+      --stats
+          Include PostgreSQL's built-in pg_stat_user_indexes usage counters
+
+  -h, --help
+          Print help
+```
+
+### afpsql inspect table - Describe a table's columns: types, nullability, defaults, primary key, comments
+
+```text
+Usage: table [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+          Table name. Accepts `schema.table`; defaults to `public.NAME` when unqualified
+
+Options:
+      --full
+          Include relation, constraints, indexes, triggers, and sequence/default metadata
+
+  -h, --help
+          Print help
+```
+AFDATA: 0.19.1

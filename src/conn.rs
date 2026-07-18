@@ -1,7 +1,7 @@
 use crate::types::{RuntimeConfig, SessionConfig};
 use std::error::Error as _;
-use tokio_postgres::config::SslMode;
 use tokio_postgres::Config;
+use tokio_postgres::config::SslMode;
 
 const SUPPORTED_SSLMODE_HINT: &str = "afpsql supports sslmode=disable, prefer, and require. It does not implement libpq verify-ca/verify-full or client certificate options yet; use psql/libpq when certificate verification or client certificates are required.";
 
@@ -241,10 +241,9 @@ fn map_pg_config_parse_error(source: &str, err: tokio_postgres::Error) -> Connec
         if let Some(key) = cause
             .strip_prefix("unknown option `")
             .and_then(|rest| rest.strip_suffix('`'))
+            && is_unsupported_ssl_option(key)
         {
-            if is_unsupported_ssl_option(key) {
-                return unsupported_ssl_option(source, key);
-            }
+            return unsupported_ssl_option(source, key);
         }
     }
 

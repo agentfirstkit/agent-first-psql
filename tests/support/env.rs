@@ -1,4 +1,15 @@
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[allow(dead_code)]
+pub fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn test_dsn() -> Option<String> {
     env_value("AFPSQL_TEST_DSN_SECRET").or_else(|| env_value("DATABASE_URL"))

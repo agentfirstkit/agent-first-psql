@@ -12,14 +12,14 @@ pub use executor::{
     DbExecutor, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
     TransportLogContext,
 };
-pub use session::{cancel_query, new_cancel_slot, CancelSlot};
+pub use session::{CancelSlot, cancel_query, new_cancel_slot};
 
 #[cfg(test)]
 use crate::types::SessionConfig;
 #[cfg(test)]
 use params::{
-    build_param_refs, build_params, parse_bool, parse_f64, parse_i16, parse_i32, parse_i64,
-    parse_text, AnyNull,
+    AnyNull, build_param_refs, build_params, parse_bool, parse_f64, parse_i16, parse_i32,
+    parse_i64, parse_text,
 };
 #[cfg(test)]
 use serde_json::Value;

@@ -21,6 +21,10 @@ fn bin() -> PathBuf {
     debug_dir.join("afpsql")
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn afd_cli_param_binding_query() {
     let out = Command::new(bin())
@@ -41,10 +45,15 @@ fn afd_cli_param_binding_query() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["rows"][0]["n"], 42);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["rows"][0]["n"], 42);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn psql_mode_translates_v_params() {
     let out = Command::new(bin())
@@ -65,10 +74,15 @@ fn psql_mode_translates_v_params() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["rows"][0]["n"], 7);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["rows"][0]["n"], 7);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_stream_rows() {
     let payload = serde_json::json!({
@@ -112,6 +126,10 @@ fn pipe_stream_rows() {
     assert!(text.contains("\"code\":\"result_end\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_plain_output_mode() {
     let payload = serde_json::json!({
@@ -150,6 +168,10 @@ fn pipe_plain_output_mode() {
     assert!(text.contains("result") || text.contains("code"));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_yaml_output_mode() {
     let payload = serde_json::json!({
@@ -188,6 +210,10 @@ fn pipe_yaml_output_mode() {
     assert!(text.contains("code:"));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn psql_mode_positional_dsn() {
     let out = Command::new(bin())
@@ -200,10 +226,15 @@ fn psql_mode_positional_dsn() {
         .expect("run afpsql");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["rows"][0]["n"], 3);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["rows"][0]["n"], 3);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn psql_mode_positional_dsn_before_sql_flag() {
     let out = Command::new(bin())
@@ -216,10 +247,15 @@ fn psql_mode_positional_dsn_before_sql_flag() {
         .expect("run afpsql");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["rows"][0]["n"], 4);
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["rows"][0]["n"], 4);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_rejects_duplicate_active_query_id() {
     let payload = serde_json::json!({
@@ -260,6 +296,17 @@ fn pipe_rejects_duplicate_active_query_id() {
     let out = child.wait_with_output().expect("wait output");
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).expect("utf8");
-    assert!(text.contains("\"error_code\":\"invalid_request\""));
+    let events = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("json event"))
+        .collect::<Vec<_>>();
+    for event in &events {
+        agent_first_data::validate_protocol_event(event, true).expect("strict AFDATA event");
+    }
+    assert!(
+        events.iter().any(|event| {
+            event["kind"] == "error" && event["error"]["code"] == "invalid_request"
+        })
+    );
     assert!(text.contains("duplicate active query id"));
 }

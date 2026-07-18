@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,8 @@ fn docker_container_transport_select_one() {
             &network,
             "--network-alias",
             POSTGRES_ALIAS,
+            "-p",
+            "127.0.0.1::5432",
             "-e",
             "POSTGRES_USER=test",
             "-e",
@@ -74,8 +78,10 @@ fn docker_container_transport_select_one() {
         "bridge container must provide sh plus python3, python, or perl"
     );
 
-    let afpsql = env!("CARGO_BIN_EXE_afpsql");
-    let output_result = Command::new(afpsql)
+    let published_postgres_port = docker_mapped_port(&postgres_name, "5432/tcp");
+
+    let readonly = env!("CARGO_BIN_EXE_afpsql-readonly");
+    let output_result = Command::new(readonly)
         .args([
             "--container",
             &bridge_name,
@@ -97,7 +103,7 @@ fn docker_container_transport_select_one() {
         .output();
     assert!(
         output_result.is_ok(),
-        "run afpsql failed: {:?}",
+        "run afpsql-readonly failed: {:?}",
         output_result.as_ref().err()
     );
     let output = match output_result {
@@ -107,13 +113,189 @@ fn docker_container_transport_select_one() {
 
     assert!(
         output.status.success(),
-        "afpsql failed\nstdout: {}\nstderr: {}",
+        "afpsql-readonly failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(r#""code":"result""#), "{stdout}");
+    assert!(stdout.contains(r#""kind":"result""#), "{stdout}");
     assert!(stdout.contains(r#""row_count":1"#), "{stdout}");
+
+    let write_result = Command::new(readonly)
+        .args([
+            "--container",
+            &bridge_name,
+            "--container-driver",
+            "docker",
+            "--host",
+            POSTGRES_ALIAS,
+            "--port",
+            "5432",
+            "--user",
+            "test",
+            "--dbname",
+            "test",
+            "--password-secret",
+            "test",
+            "--permission",
+            "container-write",
+            "--sql",
+            "select 1",
+        ])
+        .output();
+    assert!(
+        write_result.is_ok(),
+        "run readonly container write failed: {:?}",
+        write_result.as_ref().err()
+    );
+    let write = match write_result {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    assert!(!write.status.success());
+    assert!(
+        String::from_utf8_lossy(&write.stdout).contains(r#""code":"invalid_request""#),
+        "stdout: {}",
+        String::from_utf8_lossy(&write.stdout)
+    );
+    assert_readonly_rejection(
+        [
+            "--container",
+            &bridge_name,
+            "--container-runtime",
+            "false",
+            "--sql",
+            "select 1",
+        ],
+        "custom container runtime",
+    );
+
+    if let Some(ssh_destination) = test_env::env_value("AFPSQL_E2E_SSH") {
+        assert_readonly_rejection(
+            [
+                "--ssh",
+                &ssh_destination,
+                "--ssh-option",
+                "ProxyCommand=false",
+                "--sql",
+                "select 1",
+            ],
+            "ProxyCommand",
+        );
+        assert_readonly_success(
+            [
+                "--ssh",
+                &ssh_destination,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &published_postgres_port,
+                "--user",
+                "test",
+                "--dbname",
+                "test",
+                "--password-secret",
+                "test",
+                "--sql",
+                "select 2 as n",
+            ],
+            "SSH readonly",
+        );
+
+        if let Some(proxy_jump) = test_env::env_value("AFPSQL_E2E_SSH_PROXY_JUMP") {
+            let proxy_jump_option = format!("ProxyJump={proxy_jump}");
+            assert_readonly_success(
+                [
+                    "--ssh",
+                    &ssh_destination,
+                    "--ssh-option",
+                    &proxy_jump_option,
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &published_postgres_port,
+                    "--user",
+                    "test",
+                    "--dbname",
+                    "test",
+                    "--password-secret",
+                    "test",
+                    "--sql",
+                    "select 3 as n",
+                ],
+                "ProxyJump readonly",
+            );
+        }
+
+        assert_readonly_success(
+            [
+                "--ssh",
+                &ssh_destination,
+                "--container",
+                &bridge_name,
+                "--container-driver",
+                "docker",
+                "--host",
+                POSTGRES_ALIAS,
+                "--port",
+                "5432",
+                "--user",
+                "test",
+                "--dbname",
+                "test",
+                "--password-secret",
+                "test",
+                "--sql",
+                "select 4 as n",
+            ],
+            "SSH plus container readonly",
+        );
+    }
+}
+
+fn assert_readonly_rejection<const N: usize>(args: [&str; N], context: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_afpsql-readonly"))
+        .args(args)
+        .output()
+        .expect("run readonly rejection case");
+    assert!(!output.status.success(), "{context} unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""code":"invalid_request""#),
+        "{context} stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn assert_readonly_success<const N: usize>(args: [&str; N], context: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_afpsql-readonly"))
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("{context} failed to start: {error}"));
+    assert!(
+        output.status.success(),
+        "{context} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(r#""kind":"result""#),
+        "{context} stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn docker_mapped_port(container: &str, port: &str) -> String {
+    let output = Command::new("docker")
+        .args(["port", container, port])
+        .output()
+        .expect("query Docker mapped port");
+    assert!(output.status.success());
+    let mapping = String::from_utf8(output.stdout).expect("Docker port output is UTF-8");
+    mapping
+        .trim()
+        .rsplit_once(':')
+        .map(|(_, port)| port.to_string())
+        .expect("Docker port mapping contains a port")
 }
 
 fn docker_success<const N: usize>(args: [&str; N], context: &str) {

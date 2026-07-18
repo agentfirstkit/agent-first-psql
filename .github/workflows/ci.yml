@@ -47,6 +47,12 @@ jobs:
             target
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install afdata skill validator
+        run: cargo install agent-first-data --locked --features skill
+
+      - name: Validate Agent Skill
+        run: afdata skill validate skills/agent-first-psql
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -81,6 +87,20 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Configure SSH transport fixture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          cat "$HOME/.ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          sudo systemctl start ssh
+          ssh-keyscan -H localhost 127.0.0.1 >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          echo "AFPSQL_E2E_SSH=$USER@localhost" >> "$GITHUB_ENV"
+          echo "AFPSQL_E2E_SSH_PROXY_JUMP=$USER@127.0.0.1" >> "$GITHUB_ENV"
 
       - name: Docker container transport
         run: |

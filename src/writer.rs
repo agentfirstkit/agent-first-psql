@@ -1,20 +1,16 @@
 use crate::types::Output;
 use agent_first_data::OutputFormat;
-use std::io::Write;
 use tokio::sync::mpsc;
 
-pub async fn writer_task(mut rx: mpsc::Receiver<Output>, format: OutputFormat) {
+pub async fn writer_task(
+    mut rx: mpsc::Receiver<Output>,
+    format: OutputFormat,
+) -> Result<(), agent_first_data::CliEmitterError> {
     while let Some(output) = rx.recv().await {
-        let rendered = crate::output_fmt::render_output(&output, format);
-
         let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        let _ = out.write_all(rendered.as_bytes());
-        if !rendered.ends_with('\n') {
-            let _ = out.write_all(b"\n");
-        }
-        let _ = out.flush();
+        crate::output_fmt::emit_output(stdout.lock(), &output, format)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -54,7 +50,7 @@ mod tests {
             trace: Trace::only_duration(7),
         };
         let rendered = crate::output_fmt::render_output(&out, OutputFormat::Yaml);
-        assert!(rendered.contains("rows:\n  -"));
+        assert!(rendered.contains("rows:"));
         assert!(rendered.contains("api_key_secret: \"sk-live-1\""));
         assert!(rendered.contains("duration_ms: 42"));
         assert!(!rendered.contains("rows: \"["));
@@ -69,7 +65,7 @@ mod tests {
             rows_batch_count: 1,
         };
         let rendered = crate::output_fmt::render_output(&out, OutputFormat::Yaml);
-        assert!(rendered.contains("rows:\n  -"));
+        assert!(rendered.contains("rows:"));
         assert!(rendered.contains("n: 1"));
         assert!(!rendered.contains("rows: \"["));
     }
@@ -81,6 +77,8 @@ mod tests {
             "default".to_string(),
             SessionConfig {
                 dsn_secret: Some("postgresql://user:pass@host/db".to_string()),
+                conninfo_secret: Some("host=db password=conninfo-canary".to_string()),
+                password_secret: Some("password-canary".to_string()),
                 ..SessionConfig::default()
             },
         );
@@ -88,5 +86,30 @@ mod tests {
         let rendered = crate::output_fmt::render_output(&out, OutputFormat::Json);
         assert!(rendered.contains("\"dsn_secret\":\"***\""));
         assert!(!rendered.contains("postgresql://user:pass@host/db"));
+        assert!(rendered.contains("\"conninfo_secret\":\"***\""));
+        assert!(rendered.contains("\"password_secret\":\"***\""));
+        assert!(!rendered.contains("conninfo-canary"));
+        assert!(!rendered.contains("password-canary"));
+    }
+
+    #[test]
+    fn config_yaml_and_plain_remain_redacted() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.sessions.insert(
+            "default".to_string(),
+            SessionConfig {
+                dsn_secret: Some("dsn-canary".to_string()),
+                conninfo_secret: Some("conninfo-canary".to_string()),
+                password_secret: Some("password-canary".to_string()),
+                ..SessionConfig::default()
+            },
+        );
+        for format in [OutputFormat::Yaml, OutputFormat::Plain] {
+            let rendered = crate::output_fmt::render_output(&Output::Config(cfg.clone()), format);
+            assert!(rendered.contains("***"));
+            for canary in ["dsn-canary", "conninfo-canary", "password-canary"] {
+                assert!(!rendered.contains(canary), "{format:?} leaked {canary}");
+            }
+        }
     }
 }

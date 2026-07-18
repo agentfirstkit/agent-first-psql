@@ -3,25 +3,25 @@ use crate::handler;
 use crate::handler::App;
 use crate::limits::OUTPUT_CHANNEL_CAPACITY;
 use crate::logutil::build_startup_log;
-use crate::output_fmt;
-use crate::protocol::{log_enabled, log_event};
+use crate::protocol::log_event;
 use crate::types::{Output, QueryOptions, RuntimeConfig, Trace};
 use agent_first_data::OutputFormat;
-use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 
-pub async fn run(req: crate::cli::CliRequest) {
+pub async fn run(
+    req: crate::cli::CliRequest,
+    capability: crate::Capability,
+    locked_readonly_profile: bool,
+) {
     let crate::cli::CliRequest {
         sql,
         params,
         options,
         session,
         output: output_format,
-        output_file,
-        log_file,
         log,
         startup_args,
         startup_env,
@@ -30,17 +30,14 @@ pub async fn run(req: crate::cli::CliRequest) {
         psql_mode,
     } = req;
 
-    let mut sink = match CliOutputSink::new(output_format, output_file, log_file) {
-        Ok(sink) => sink,
-        Err(err) => {
-            crate::emit::emit_cli_error(&err, None, OutputFormat::Json);
-            std::process::exit(2);
-        }
-    };
+    let stdout = std::io::stdout();
+    let mut sink = CliOutputSink::new(stdout.lock(), output_format);
 
     let config = RuntimeConfig::default();
     let (tx, mut rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
-    let app = Arc::new(App::new(config, tx));
+    let app = Arc::new(App::new(config, tx, capability));
+    app.locked_readonly_profile
+        .store(locked_readonly_profile, Ordering::Relaxed);
 
     {
         let mut cfg = app.config.write().await;
@@ -51,12 +48,40 @@ pub async fn run(req: crate::cli::CliRequest) {
     }
 
     if dry_run {
-        let start = std::time::Instant::now();
         let cfg = app.config.read().await.clone();
         let session_cfg = cfg.sessions.get("default").cloned().unwrap_or_default();
-        let resolved_opts = cfg
-            .resolve_options_for_session(&options, &session_cfg)
-            .unwrap_or_else(|_| cfg.resolve_options(&options));
+        let resolved_opts = match cfg.resolve_options_for_session(&options, &session_cfg) {
+            Ok(options) => options,
+            Err(error) => {
+                if crate::emit::emit_cli_error(&error, None, output_format).is_err() {
+                    std::process::exit(4);
+                }
+                std::process::exit(2);
+            }
+        };
+        if capability == crate::Capability::ReadOnly
+            && let Err(error) = crate::readonly_policy::validate_sql(&sql)
+        {
+            if crate::emit::emit_cli_error(&error, Some(crate::readonly_hint()), output_format)
+                .is_err()
+            {
+                std::process::exit(4);
+            }
+            std::process::exit(2);
+        }
+        if capability == crate::Capability::ReadOnly && !resolved_opts.read_only {
+            if crate::emit::emit_cli_error(
+                "write permission is unavailable in afpsql-readonly",
+                Some(crate::readonly_hint()),
+                output_format,
+            )
+            .is_err()
+            {
+                std::process::exit(4);
+            }
+            std::process::exit(2);
+        }
+        let start = std::time::Instant::now();
         let outcome = app
             .executor
             .prepare_only(ExecRequest {
@@ -73,15 +98,20 @@ pub async fn run(req: crate::cli::CliRequest) {
         match outcome {
             Ok(info) => {
                 let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
-                sink.emit(&Output::DryRun {
-                    id: None,
-                    sql: sql.clone(),
-                    params: params.iter().map(|v| v.to_string()).collect(),
-                    session: Some("default".to_string()),
-                    param_types: info.param_types,
-                    columns: info.columns,
-                    trace,
-                });
+                if sink
+                    .emit(&Output::DryRun {
+                        id: None,
+                        sql: sql.clone(),
+                        params: params.iter().map(|v| v.to_string()).collect(),
+                        session: Some("default".to_string()),
+                        param_types: info.param_types,
+                        columns: info.columns,
+                        trace,
+                    })
+                    .is_err()
+                {
+                    std::process::exit(4);
+                }
             }
             Err(err) => {
                 had_error = true;
@@ -91,18 +121,25 @@ pub async fn run(req: crate::cli::CliRequest) {
         app.executor.shutdown().await;
         drop(app);
         while let Some(event) = rx.recv().await {
-            sink.emit(&event);
+            if sink.emit(&event).is_err() {
+                std::process::exit(4);
+            }
         }
         std::process::exit(if had_error { 1 } else { 0 });
     }
 
     if startup_requested {
         let event = build_startup_log(Some("default"), &startup_args, &startup_env);
-        sink.emit(&event);
+        if sink.emit(&event).is_err() {
+            std::process::exit(4);
+        }
     }
 
-    if psql_mode && log_enabled(&log, log_event::MODE_PERMISSION_DEFAULT_CHANGED) {
-        sink.emit(&psql_mode_permission_event(&options));
+    if psql_mode
+        && log.enabled(log_event::MODE_PERMISSION_DEFAULT_CHANGED)
+        && sink.emit(&psql_mode_permission_event(&options)).is_err()
+    {
+        std::process::exit(4);
     }
 
     app.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -125,41 +162,26 @@ pub async fn run(req: crate::cli::CliRequest) {
         if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
             had_error = true;
         }
-        sink.emit(&event);
+        if sink.emit(&event).is_err() {
+            std::process::exit(4);
+        }
     }
 
     std::process::exit(if had_error { 1 } else { 0 });
 }
 
-struct CliOutputSink {
+struct CliOutputSink<W: Write> {
+    writer: W,
     format: OutputFormat,
-    output_file: Option<File>,
-    log_file: Option<File>,
 }
 
-impl CliOutputSink {
-    fn new(
-        format: OutputFormat,
-        output_file: Option<String>,
-        log_file: Option<String>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            format,
-            output_file: open_output_file(output_file.as_deref(), "-o/--output")?,
-            log_file: open_output_file(log_file.as_deref(), "-L/--log-file")?,
-        })
+impl<W: Write> CliOutputSink<W> {
+    fn new(writer: W, format: OutputFormat) -> Self {
+        Self { writer, format }
     }
 
-    fn emit(&mut self, out: &Output) {
-        let rendered = output_fmt::render_output(out, self.format);
-        if let Some(file) = self.output_file.as_mut() {
-            let _ = writeln!(file, "{rendered}");
-        } else {
-            let _ = writeln!(std::io::stdout(), "{rendered}");
-        }
-        if let Some(file) = self.log_file.as_mut() {
-            let _ = writeln!(file, "{rendered}");
-        }
+    fn emit(&mut self, out: &Output) -> Result<(), agent_first_data::CliEmitterError> {
+        crate::output_fmt::emit_output(&mut self.writer, out, self.format)
     }
 }
 
@@ -192,19 +214,6 @@ fn psql_mode_permission_event(options: &QueryOptions) -> Output {
     }
 }
 
-fn open_output_file(path: Option<&str>, flag: &str) -> Result<Option<File>, String> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map(Some)
-        .map_err(|e| format!("{flag} file open failed: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,13 +238,13 @@ mod tests {
             Some("container-write")
         );
         assert!(cfg.get("note").is_some());
-        assert!(log_enabled(
-            &["mode".to_string()],
-            log_event::MODE_PERMISSION_DEFAULT_CHANGED
-        ));
-        assert!(!log_enabled(
-            &[],
-            log_event::MODE_PERMISSION_DEFAULT_CHANGED
-        ));
+        assert!(
+            agent_first_data::LogFilters::new(["mode"])
+                .enabled(log_event::MODE_PERMISSION_DEFAULT_CHANGED)
+        );
+        assert!(
+            !agent_first_data::LogFilters::default()
+                .enabled(log_event::MODE_PERMISSION_DEFAULT_CHANGED)
+        );
     }
 }

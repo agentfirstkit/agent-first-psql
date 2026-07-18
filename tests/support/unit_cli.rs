@@ -94,6 +94,187 @@ fn parse_param_value_primitives() {
 }
 
 #[test]
+fn inspect_databases_includes_size_and_connection_facts() {
+    let (sql, params) = build_inspect_sql(InspectAction::Databases(InspectDatabasesArgs {
+        all: false,
+    }));
+    assert!(params.is_empty());
+    for needle in [
+        "pg_database_size",
+        "datcollate",
+        "datctype",
+        "datistemplate",
+        "datallowconn",
+        "datconnlimit",
+        "numbackends",
+        "has_database_privilege",
+    ] {
+        assert!(
+            sql.contains(needle),
+            "databases SQL missing {needle}: {sql}"
+        );
+    }
+    // Default hides templates.
+    assert!(sql.contains("where not d.datistemplate"));
+}
+
+#[test]
+fn inspect_databases_all_includes_templates() {
+    let (sql, _) = build_inspect_sql(InspectAction::Databases(InspectDatabasesArgs { all: true }));
+    // --all drops the template filter so template0/template1 appear.
+    assert!(!sql.contains("where not d.datistemplate"), "SQL: {sql}");
+}
+
+#[test]
+fn inspect_database_summarizes_object_counts() {
+    let (sql, params) = build_inspect_sql(InspectAction::Database);
+    assert!(params.is_empty());
+    for needle in [
+        "current_database()",
+        "as schemas",
+        "as tables",
+        "as views",
+        "as materialized_views",
+        "as sequences",
+        "pg_database_size(current_database())",
+    ] {
+        assert!(sql.contains(needle), "database SQL missing {needle}: {sql}");
+    }
+}
+
+#[test]
+fn inspect_schemas_includes_counts_and_size() {
+    let (sql, params) = build_inspect_sql(InspectAction::Schemas);
+    assert!(params.is_empty());
+    assert!(sql.contains("pg_namespace"));
+    assert!(sql.contains("as tables") && sql.contains("as size"));
+}
+
+#[test]
+fn inspect_schema_exports_full_metadata_snapshot() {
+    let (sql, params) = build_inspect_sql(InspectAction::Schema(InspectSchemaArgs {
+        schema: "app".to_string(),
+        like: Some("order%".to_string()),
+    }));
+    assert_eq!(params[0], Value::String("app".to_string()));
+    assert_eq!(params[1], Value::String("order%".to_string()));
+    for needle in [
+        "with relation_filter",
+        "'extension'::text as kind",
+        "'column'::text as kind",
+        "'constraint'::text as kind",
+        "'index'::text as kind",
+        "'trigger'::text as kind",
+        "'function'::text as kind",
+        "pg_get_serial_sequence",
+        "c.relname like $2",
+    ] {
+        assert!(sql.contains(needle), "schema SQL missing {needle}: {sql}");
+    }
+}
+
+#[test]
+fn inspect_snapshot_uses_same_full_metadata_shape() {
+    let (sql, params) = build_inspect_sql(InspectAction::Snapshot(InspectSchemaArgs {
+        schema: "public".to_string(),
+        like: None,
+    }));
+    assert_eq!(params[0], Value::String("public".to_string()));
+    assert_eq!(params[1], Value::Null);
+    assert!(sql.contains("select * from snapshot"));
+    assert!(sql.contains("order by case kind"));
+}
+
+#[test]
+fn inspect_tables_includes_owner_rows_and_size() {
+    let (sql, params) = build_inspect_sql(InspectAction::Tables(InspectTablesArgs {
+        schema: "public".to_string(),
+        like: Some("foo%".to_string()),
+    }));
+    assert_eq!(params.len(), 2);
+    assert!(sql.contains("estimated_rows"));
+    assert!(sql.contains("pg_total_relation_size"));
+    assert!(sql.contains("c.relname like $2"));
+}
+
+#[test]
+fn inspect_indexes_can_include_builtin_usage_stats() {
+    let (sql, params) = build_inspect_sql(InspectAction::Indexes(InspectIndexesArgs {
+        schema: "ignored".to_string(),
+        table: Some("app.orders".to_string()),
+        stats: true,
+    }));
+    assert_eq!(params[0], Value::String("app".to_string()));
+    assert_eq!(params[1], Value::String("orders".to_string()));
+    for needle in [
+        "pg_get_indexdef",
+        "pg_relation_size",
+        "pg_stat_user_indexes",
+        "index_scan_count",
+        "index_tuple_read_count",
+        "tc.relname = $2",
+    ] {
+        assert!(sql.contains(needle), "indexes SQL missing {needle}: {sql}");
+    }
+}
+
+#[test]
+fn inspect_indexes_without_stats_omits_stats_view() {
+    let (sql, params) = build_inspect_sql(InspectAction::Indexes(InspectIndexesArgs {
+        schema: "public".to_string(),
+        table: None,
+        stats: false,
+    }));
+    assert_eq!(params, vec![Value::String("public".to_string())]);
+    assert!(!sql.contains("pg_stat_user_indexes"), "SQL: {sql}");
+    assert!(!sql.contains("index_scan_count"), "SQL: {sql}");
+}
+
+#[test]
+fn inspect_table_describes_keys_and_comments() {
+    let (sql, params) = build_inspect_sql(InspectAction::Table(InspectTableArgs {
+        name: "myschema.t".to_string(),
+        full: false,
+    }));
+    assert_eq!(params[0], Value::String("myschema".to_string()));
+    assert_eq!(params[1], Value::String("t".to_string()));
+    assert!(sql.contains("format_type"));
+    assert!(sql.contains("as primary_key"));
+    assert!(sql.contains("col_description"));
+}
+
+#[test]
+fn inspect_table_full_returns_snapshot_rows_for_one_table() {
+    let (sql, params) = build_inspect_sql(InspectAction::Table(InspectTableArgs {
+        name: "myschema.t".to_string(),
+        full: true,
+    }));
+    assert_eq!(params[0], Value::String("myschema".to_string()));
+    assert_eq!(params[1], Value::String("t".to_string()));
+    assert!(sql.contains("c.relname = $2"));
+    assert!(sql.contains("'constraint'::text as kind"));
+    assert!(sql.contains("'index'::text as kind"));
+    assert!(sql.contains("'trigger'::text as kind"));
+}
+
+#[test]
+fn clap_accepts_extended_inspect_subcommands() {
+    for args in [
+        vec!["afpsql", "inspect", "schema", "--schema", "public"],
+        vec!["afpsql", "inspect", "snapshot", "--like", "foo%"],
+        vec![
+            "afpsql", "inspect", "indexes", "--schema", "public", "--table", "users", "--stats",
+        ],
+        vec!["afpsql", "inspect", "table", "public.users", "--full"],
+    ] {
+        assert!(
+            AfdCli::try_parse_from(args).is_ok(),
+            "extended inspect command did not parse"
+        );
+    }
+}
+
+#[test]
 fn parse_output_formats() {
     assert!(matches!(parse_output("json"), Ok(OutputFormat::Json)));
     assert!(matches!(parse_output("yaml"), Ok(OutputFormat::Yaml)));
@@ -109,7 +290,10 @@ fn parse_log_categories_normalizes_and_dedups() {
         "".to_string(),
         "ALL".to_string(),
     ]);
-    assert_eq!(logs, vec!["query.result".to_string(), "all".to_string()]);
+    assert_eq!(
+        logs,
+        agent_first_data::LogFilters::new(["query.result", "all"])
+    );
 }
 
 #[test]
@@ -120,7 +304,7 @@ fn clap_log_flag_accepts_startup() {
     if let Ok(cli) = cli_res {
         assert_eq!(
             parse_log_categories(&cli.log),
-            vec!["startup".to_string(), "query.error".to_string()]
+            agent_first_data::LogFilters::new(["startup", "query.error"])
         );
     }
 }
@@ -149,7 +333,7 @@ fn clap_accepts_skill_admin_subcommands() {
         "--agent",
         "claude-code",
         "--scope",
-        "project",
+        "workspace",
         "--force",
     ]);
     assert!(cli_res.is_ok());
@@ -178,6 +362,10 @@ fn clap_accepts_ssh_transport_flags() {
         "afpsql",
         "--ssh",
         "user@example.com",
+        "--ssh-via",
+        "user@jump1",
+        "--ssh-via",
+        "user@jump2",
         "--ssh-option",
         "ProxyJump=bastion",
         "--ssh-local-host",
@@ -194,6 +382,10 @@ fn clap_accepts_ssh_transport_flags() {
     assert!(cli_res.is_ok());
     if let Ok(cli) = cli_res {
         assert_eq!(cli.ssh.as_deref(), Some("user@example.com"));
+        assert_eq!(
+            cli.ssh_via,
+            vec!["user@jump1".to_string(), "user@jump2".to_string()]
+        );
         assert_eq!(cli.ssh_options, vec!["ProxyJump=bastion".to_string()]);
         assert_eq!(cli.ssh_local_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(cli.ssh_local_port, Some(15432));
@@ -283,10 +475,10 @@ fn clap_accepts_sql_values_that_look_like_flags() {
         assert!(cli.dry_run);
     }
 
-    let help_sql_res = AfdCli::try_parse_from(["afpsql", "--sql", "--help-markdown", "--dry-run"]);
+    let help_sql_res = AfdCli::try_parse_from(["afpsql", "--sql", "--explain", "--dry-run"]);
     assert!(help_sql_res.is_ok());
     if let Ok(cli) = help_sql_res {
-        assert_eq!(cli.sql.as_deref(), Some("--help-markdown"));
+        assert_eq!(cli.sql.as_deref(), Some("--explain"));
         assert!(cli.dry_run);
     }
 }
@@ -348,21 +540,26 @@ fn top_level_mode_scan_ignores_option_values() {
 }
 
 #[test]
-fn top_level_help_markdown_scan_ignores_option_values() {
-    assert!(top_level_help_markdown_requested(&raw_args(&[
-        "afpsql",
-        "--help-markdown",
-    ])));
-    assert!(!top_level_help_markdown_requested(&raw_args(&[
-        "afpsql",
-        "--sql",
-        "--help-markdown",
-        "--dry-run",
-    ])));
-    assert!(!top_level_help_markdown_requested(&raw_args(&[
-        "afpsql",
-        "--sql=--help-markdown",
-    ])));
+fn help_output_markdown_scan_ignores_option_values() {
+    let rendered = agent_first_data::cli_handle_help_or_continue(
+        &raw_args(&["afpsql", "--help", "--output", "markdown"]),
+        &AfdCli::command(),
+        &agent_first_data::HelpConfig::human_cli_default(),
+    );
+    assert!(
+        matches!(&rendered, Ok(Some(md)) if md.contains("# Agent-First PSQL") && md.contains("`afpsql`")),
+        "markdown help should render with the afpsql title and command name"
+    );
+
+    let non_helper = agent_first_data::cli_handle_help_or_continue(
+        &raw_args(&["afpsql", "--sql", "--help", "--dry-run"]),
+        &AfdCli::command(),
+        &agent_first_data::HelpConfig::human_cli_default(),
+    );
+    assert!(
+        matches!(non_helper, Ok(None)),
+        "non-helper request should produce no help output"
+    );
 }
 
 #[test]
@@ -388,13 +585,18 @@ fn startup_payload_summarizes_sql_without_text() {
 
 #[test]
 fn startup_env_snapshot_records_presence_only() {
+    let _env_guard = crate::test_env::env_lock();
     let key = "PGPASSWORD";
     let old = std::env::var_os(key);
-    std::env::set_var(key, "pg-secret-for-startup-test");
+    // SAFETY: all tests in this crate that mutate environment variables hold
+    // the shared test environment lock for the full mutation window.
+    unsafe { std::env::set_var(key, "pg-secret-for-startup-test") };
     let env = startup_env_snapshot();
     match old {
-        Some(value) => std::env::set_var(key, value),
-        None => std::env::remove_var(key),
+        // SAFETY: the shared test environment lock is still held here.
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        // SAFETY: the shared test environment lock is still held here.
+        None => unsafe { std::env::remove_var(key) },
     }
 
     let entries = env.as_array();
@@ -407,9 +609,11 @@ fn startup_env_snapshot_records_presence_only() {
         assert_eq!(entry["present"], true);
         assert!(entry.get("value").is_none());
     }
-    assert!(!serde_json::to_string(&env)
-        .unwrap_or_default()
-        .contains("pg-secret-for-startup-test"));
+    assert!(
+        !serde_json::to_string(&env)
+            .unwrap_or_default()
+            .contains("pg-secret-for-startup-test")
+    );
 }
 
 #[test]
@@ -417,16 +621,152 @@ fn resolve_secret_value_from_env_and_errors() {
     let path = std::env::var("PATH");
     assert!(path.is_ok());
     if let Ok(path) = path {
-        let resolved = resolve_secret_value("--dsn-secret", None, Some("PATH"));
+        let resolved = resolve_secret_value("--dsn-secret", None, Some("PATH"), None);
         assert_eq!(resolved, Ok(Some(path)));
     }
 
-    let conflict = resolve_secret_value("--dsn-secret", Some("direct".to_string()), Some("PATH"));
+    let conflict = resolve_secret_value(
+        "--dsn-secret",
+        Some("direct".to_string()),
+        Some("PATH"),
+        None,
+    );
     assert!(conflict.is_err());
 
     let missing_name = format!("AFPSQL_TEST_MISSING_{}", std::process::id());
-    let missing = resolve_secret_value("--dsn-secret", None, Some(&missing_name));
+    let missing = resolve_secret_value("--dsn-secret", None, Some(&missing_name), None);
     assert!(missing.is_err());
+}
+
+#[test]
+fn clap_accepts_two_value_config_sources_and_rejects_slot_conflicts() {
+    for flag in [
+        "--dsn-secret-config",
+        "--conninfo-secret-config",
+        "--password-secret-config",
+    ] {
+        let parsed = AfdCli::try_parse_from([
+            "afpsql",
+            flag,
+            "config.yaml",
+            "database.url",
+            "--sql",
+            "select 1",
+        ]);
+        assert!(parsed.is_ok(), "failed to parse {flag}");
+
+        let equals = format!("{flag}=config.yaml");
+        let parsed =
+            AfdCli::try_parse_from(["afpsql", &equals, "database.url", "--sql", "select 1"]);
+        assert!(parsed.is_err(), "accepted unsupported {equals}");
+
+        for invalid in [
+            vec!["afpsql", flag, "config.yaml", "--sql", "select 1"],
+            vec![
+                "afpsql",
+                flag,
+                "config.yaml",
+                "database.url",
+                "extra",
+                "--sql",
+                "select 1",
+            ],
+        ] {
+            assert!(AfdCli::try_parse_from(invalid).is_err(), "accepted {flag}");
+        }
+    }
+
+    for (direct, env, config) in [
+        ("--dsn-secret", "--dsn-secret-env", "--dsn-secret-config"),
+        (
+            "--conninfo-secret",
+            "--conninfo-secret-env",
+            "--conninfo-secret-config",
+        ),
+        (
+            "--password-secret",
+            "--password-secret-env",
+            "--password-secret-config",
+        ),
+    ] {
+        for args in [
+            vec!["afpsql", direct, "direct", env, "SECRET_ENV"],
+            vec!["afpsql", direct, "direct", config, "config.json", "value"],
+            vec!["afpsql", env, "SECRET_ENV", config, "config.json", "value"],
+        ] {
+            assert!(AfdCli::try_parse_from(args).is_err());
+        }
+    }
+}
+
+#[test]
+fn psql_parser_consumes_config_source_pairs_and_rejects_bad_arity() {
+    for (flag, field) in [
+        ("--dsn-secret-config", "dsn"),
+        ("--conninfo-secret-config", "conninfo"),
+        ("--password-secret-config", "password"),
+    ] {
+        let raw = vec![
+            "afpsql".to_string(),
+            "--mode=psql".to_string(),
+            flag.to_string(),
+            "config.env".to_string(),
+            "SECRET".to_string(),
+            "-c".to_string(),
+            "select 1".to_string(),
+        ];
+        let mut state = PsqlModeState::default();
+        let mut index = 2;
+        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_ok());
+        let reference = match field {
+            "dsn" => state.dsn_secret_config,
+            "conninfo" => state.conninfo_secret_config,
+            _ => state.password_secret_config,
+        };
+        assert_eq!(
+            reference.map(|value| value.path),
+            Some("SECRET".to_string())
+        );
+        assert_eq!(index, raw.len() - 2);
+
+        let raw = raw_args(&[
+            "afpsql",
+            "--mode=psql",
+            &format!("{flag}=config.env"),
+            "SECRET",
+            "-c",
+            "select 1",
+        ]);
+        let mut state = PsqlModeState::default();
+        let mut index = 2;
+        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
+
+        let raw = raw_args(&[
+            "afpsql",
+            "--mode=psql",
+            flag,
+            "config.env",
+            "-c",
+            "select 1",
+        ]);
+        let mut state = PsqlModeState::default();
+        let mut index = 2;
+        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
+
+        let raw = raw_args(&[
+            "afpsql",
+            "--mode=psql",
+            flag,
+            "config.env",
+            "SECRET",
+            "extra",
+            "-c",
+            "select 1",
+        ]);
+        let mut state = PsqlModeState::default();
+        let mut index = 2;
+        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
+    }
 }
 
 #[test]
@@ -521,7 +861,7 @@ fn parse_psql_mode_all_flags_and_sql_file() {
         "host=localhost user=roger dbname=postgres".to_string(),
         "-v".to_string(),
         "1=7".to_string(),
-        "--output-format".to_string(),
+        "--output".to_string(),
         "plain".to_string(),
     ];
     let mode_res = parse_psql_mode(&raw);
@@ -1100,20 +1440,12 @@ fn parse_psql_mode_dbname_accepts_database_conninfo_or_uri_forms() {
 }
 
 #[test]
-fn parse_psql_mode_file_routing_options_are_supported() {
-    for (args, output_file, log_file) in [
-        (vec!["-o", "/tmp/out.txt"], Some("/tmp/out.txt"), None),
-        (vec!["-o/tmp/out.txt"], Some("/tmp/out.txt"), None),
-        (vec!["--output", "/tmp/out.txt"], Some("/tmp/out.txt"), None),
-        (vec!["--output=/tmp/out.txt"], Some("/tmp/out.txt"), None),
-        (vec!["-L", "/tmp/log.txt"], None, Some("/tmp/log.txt")),
-        (vec!["-L/tmp/log.txt"], None, Some("/tmp/log.txt")),
-        (
-            vec!["--log-file", "/tmp/log.txt"],
-            None,
-            Some("/tmp/log.txt"),
-        ),
-        (vec!["--log-file=/tmp/log.txt"], None, Some("/tmp/log.txt")),
+fn parse_psql_mode_stream_redirect_options_are_accepted() {
+    for args in [
+        vec!["--stdout-file", "/tmp/out.txt"],
+        vec!["--stdout-file=/tmp/out.txt"],
+        vec!["--stderr-file", "/tmp/err.txt"],
+        vec!["--stderr-file=/tmp/err.txt"],
     ] {
         let mut raw = vec![
             "afpsql".to_string(),
@@ -1126,8 +1458,7 @@ fn parse_psql_mode_file_routing_options_are_supported() {
         let mode_res = parse_psql_mode(&raw);
         assert!(mode_res.is_ok(), "{args:?} should parse");
         if let Ok(Mode::Cli(req)) = mode_res {
-            assert_eq!(req.output_file.as_deref(), output_file);
-            assert_eq!(req.log_file.as_deref(), log_file);
+            assert!(matches!(req.output, OutputFormat::Json));
         }
     }
 }
@@ -1147,7 +1478,24 @@ fn parse_psql_mode_long_output_accepts_format_alias() {
     assert!(mode_res.is_ok());
     if let Ok(Mode::Cli(req)) = mode_res {
         assert!(matches!(req.output, OutputFormat::Json));
-        assert_eq!(req.output_file, None);
+    }
+}
+
+#[test]
+fn parse_psql_mode_long_output_rejects_file_paths() {
+    let raw = vec![
+        "afpsql".to_string(),
+        "--mode".to_string(),
+        "psql".to_string(),
+        "-c".to_string(),
+        "select 1".to_string(),
+        "--output".to_string(),
+        "/tmp/out.txt".to_string(),
+    ];
+    let err_res = parse_psql_mode(&raw);
+    assert!(err_res.is_err());
+    if let Err(err) = err_res {
+        assert!(err.contains("invalid --output format"), "{err}");
     }
 }
 

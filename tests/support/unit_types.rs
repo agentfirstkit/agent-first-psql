@@ -127,6 +127,7 @@ fn session_config_flat_wire_round_trips_through_substructs() {
         "dbname": "app",
         "password_secret": "PG_PASSWORD",
         "ssh": "root@bastion",
+        "ssh_via": ["root@jump"],
         "ssh_options": ["ProxyJump=jump"],
         "ssh_local_host": "127.0.0.1",
         "ssh_local_port": 15432,
@@ -152,6 +153,7 @@ fn session_config_flat_wire_round_trips_through_substructs() {
     let Ok(cfg) = parsed else { return };
     assert_eq!(cfg.host.as_deref(), Some("127.0.0.1"));
     assert_eq!(cfg.ssh.destination.as_deref(), Some("root@bastion"));
+    assert_eq!(cfg.ssh.via, vec!["root@jump".to_string()]);
     assert_eq!(cfg.ssh.options, vec!["ProxyJump=jump".to_string()]);
     assert_eq!(cfg.ssh.local_port, Some(15432));
     assert_eq!(cfg.ssh.sudo_user.as_deref(), Some("postgres"));
@@ -187,10 +189,9 @@ fn session_config_flat_wire_round_trips_through_substructs() {
         !object.values().any(|v| v.is_object()),
         "wire format must stay flat, got nested object in {reserialized}"
     );
-    assert_eq!(
-        reserialized, wire,
-        "round-trip must preserve flat wire shape"
-    );
+    let mut expected = wire;
+    expected["password_secret"] = serde_json::Value::String("***".to_string());
+    assert_eq!(reserialized, expected, "output wire must redact secrets");
 }
 
 #[test]

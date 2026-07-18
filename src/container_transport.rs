@@ -300,7 +300,20 @@ pub async fn connect_stdio_bridge(
     let stdout = child.stdout.take().ok_or_else(|| {
         ConnectError::new("start container bridge failed: stdout pipe unavailable")
     })?;
-    wait_bridge_handshake(&mut child, &stderr_capture, handshake_rx).await?;
+    if let Err(mut err) = wait_bridge_handshake(&mut child, &stderr_capture, handshake_rx).await {
+        // If the runtime could not find/exec the target, list the real container
+        // names instead of telling the agent to "check the target name".
+        let stderr_text = captured_stderr(&stderr_capture);
+        if stderr_indicates_missing_target(&stderr_text)
+            && let Some(list) = list_container_targets(&settings).await
+        {
+            err.hint = Some(match err.hint.take() {
+                Some(base) => format!("{base}; available containers: {list}"),
+                None => format!("available containers: {list}"),
+            });
+        }
+        return Err(err);
+    }
     let stream = ContainerStdioStream { stdout, stdin };
     let pg_cfg = resolve_pg_config(cfg)
         .map_err(|e| ConnectError::new(format!("invalid container connection config: {e}")))?;
@@ -521,6 +534,74 @@ fn container_bridge_hint(status: Option<std::process::ExitStatus>, stderr: &str)
         Some(base.to_string())
     } else {
         Some(format!("{base}; container bridge stderr: {trimmed}"))
+    }
+}
+
+fn stderr_indicates_missing_target(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no such container")
+        || lower.contains("is not running")
+        || (lower.contains("not found") && lower.contains("container"))
+}
+
+/// A best-effort diagnostic listing is not worth blocking the error path on.
+const CONTAINER_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// List the runtime's actual container names so a wrong-target error can name the
+/// real options. Best-effort; `None` on any failure or unsupported driver.
+async fn list_container_targets(settings: &ContainerSettings) -> Option<String> {
+    if settings.ssh_destination.is_some() {
+        return None;
+    }
+    let mut args = Vec::new();
+    match settings.driver {
+        ContainerDriver::Docker | ContainerDriver::Podman | ContainerDriver::Nerdctl => {
+            if settings.driver == ContainerDriver::Docker
+                && let Some(context) = settings.context.as_ref()
+            {
+                args.push(format!("--context={context}"));
+            }
+            // Running only — you can only exec into a running container, and the
+            // generic hint already covers the stopped-container case.
+            args.push("ps".to_string());
+            args.push("--format".to_string());
+            args.push("{{.Names}}".to_string());
+        }
+        // Compose service names and kubectl pods need different listings; skip
+        // for now and fall back to the generic hint.
+        ContainerDriver::Compose | ContainerDriver::Kubectl => return None,
+    }
+    let output = tokio::time::timeout(
+        CONTAINER_LIST_TIMEOUT,
+        tokio::process::Command::new(&settings.runtime)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    // Cap the list but never hide truncation — a silently cut list reads as
+    // "these are all of them" when the real target was dropped.
+    const MAX_LISTED: usize = 30;
+    if names.len() > MAX_LISTED {
+        let shown = names[..MAX_LISTED].join(", ");
+        let extra = names.len() - MAX_LISTED;
+        Some(format!("{shown} (+{extra} more)"))
+    } else {
+        Some(names.join(", "))
     }
 }
 
@@ -796,13 +877,14 @@ fn build_container_exec_args(
     target: &ContainerTarget,
     nonce: &str,
 ) -> Result<Vec<String>, String> {
+    let command = bridge_command_args(target, nonce);
     let mut args = Vec::new();
     match settings.driver {
         ContainerDriver::Docker | ContainerDriver::Podman | ContainerDriver::Nerdctl => {
-            if settings.driver == ContainerDriver::Docker {
-                if let Some(context) = settings.context.as_ref() {
-                    args.push(format!("--context={context}"));
-                }
+            if settings.driver == ContainerDriver::Docker
+                && let Some(context) = settings.context.as_ref()
+            {
+                args.push(format!("--context={context}"));
             }
             args.push("exec".to_string());
             args.push("-i".to_string());
@@ -811,7 +893,7 @@ fn build_container_exec_args(
                 args.push(user.clone());
             }
             args.push(settings.target.clone());
-            args.extend(bridge_command_args(target, nonce));
+            args.extend(command);
         }
         ContainerDriver::Compose => {
             if !is_docker_compose_runtime(&settings.runtime) {
@@ -832,7 +914,7 @@ fn build_container_exec_args(
                 args.push(user.clone());
             }
             args.push(settings.target.clone());
-            args.extend(bridge_command_args(target, nonce));
+            args.extend(command);
         }
         ContainerDriver::Kubectl => {
             if let Some(context) = settings.context.as_ref() {
@@ -849,7 +931,7 @@ fn build_container_exec_args(
                 args.push(container.clone());
             }
             args.push("--".to_string());
-            args.extend(bridge_command_args(target, nonce));
+            args.extend(command);
         }
     }
     Ok(args)
@@ -958,9 +1040,7 @@ fn env_colon_list(name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
 
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
     const TEST_NONCE: &str = "deadbeefcafef00d";
 
     fn settings(driver: ContainerDriver) -> ContainerSettings {
@@ -977,6 +1057,30 @@ mod tests {
             ssh_destination: None,
             ssh_options: vec![],
         }
+    }
+
+    #[test]
+    fn typed_drivers_select_fixed_default_runtimes() {
+        for (driver, runtime) in [
+            (ContainerDriver::Docker, "docker"),
+            (ContainerDriver::Podman, "podman"),
+            (ContainerDriver::Nerdctl, "nerdctl"),
+            (ContainerDriver::Compose, "docker"),
+            (ContainerDriver::Kubectl, "kubectl"),
+        ] {
+            assert_eq!(driver.default_runtime(), runtime);
+        }
+    }
+
+    #[test]
+    fn missing_target_detection() {
+        assert!(stderr_indicates_missing_target(
+            "Error response from daemon: No such container: pg-typo"
+        ));
+        assert!(stderr_indicates_missing_target("container is not running"));
+        assert!(!stderr_indicates_missing_target(
+            "sh: python3: not found in PATH"
+        ));
     }
 
     #[test]
@@ -1369,9 +1473,12 @@ mod tests {
 
     #[test]
     fn settings_accept_compose_file_env_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::env_lock();
         let old = std::env::var("AFPSQL_CONTAINER_COMPOSE_FILE").ok();
-        std::env::set_var("AFPSQL_CONTAINER_COMPOSE_FILE", "base.yml:prod.yml");
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe {
+            std::env::set_var("AFPSQL_CONTAINER_COMPOSE_FILE", "base.yml:prod.yml");
+        }
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
                 target: Some("pg".to_string()),
@@ -1382,8 +1489,10 @@ mod tests {
         };
         let settings = resolve_container_settings(&cfg);
         match old {
-            Some(value) => std::env::set_var("AFPSQL_CONTAINER_COMPOSE_FILE", value),
-            None => std::env::remove_var("AFPSQL_CONTAINER_COMPOSE_FILE"),
+            // SAFETY: this test module's environment lock is still held here.
+            Some(value) => unsafe { std::env::set_var("AFPSQL_CONTAINER_COMPOSE_FILE", value) },
+            // SAFETY: this test module's environment lock is still held here.
+            None => unsafe { std::env::remove_var("AFPSQL_CONTAINER_COMPOSE_FILE") },
         }
         assert!(matches!(
             settings,

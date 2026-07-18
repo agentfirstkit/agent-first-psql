@@ -29,6 +29,9 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -68,11 +71,15 @@ jobs:
           BIN_DIR="target/${TARGET}/release"
           if [ "$ARCHIVE_KIND" = "zip" ]; then
             ARCHIVE="afpsql-${TAG}-${TARGET}.zip"
-            cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" afpsql.exe && cd -
+            cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" afpsql.exe afpsql-readonly.exe && cd -
+            7z l "$ARCHIVE" | grep -q 'afpsql-readonly.exe'
           else
             ARCHIVE="afpsql-${TAG}-${TARGET}.tar.gz"
-            tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql
+            tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql afpsql-readonly
+            tar -tzf "$ARCHIVE" | grep -qx 'afpsql-readonly'
           fi
+          "$BIN_DIR/afpsql" --version
+          ./scripts/release-smoke.sh "$BIN_DIR"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"

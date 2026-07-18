@@ -3,13 +3,13 @@ use crate::db::{
     DbExecutor, ExecError, ExecOutcome, ExecRequest, PostgresExecutor, RowSink, StreamOutcome,
     TransportLogContext,
 };
-use crate::protocol::{command_tag, error_code, log_enabled, log_event};
+use crate::protocol::{command_tag, error_code, log_event};
 use crate::types::*;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 const QUERY_QUEUED: u8 = 0;
 const QUERY_RUNNING: u8 = 1;
@@ -83,6 +83,8 @@ impl InFlightQuery {
 }
 
 pub struct App {
+    pub capability: crate::Capability,
+    pub locked_readonly_profile: std::sync::atomic::AtomicBool,
     pub config: RwLock<RuntimeConfig>,
     pub executor: Arc<dyn DbExecutor>,
     pub writer: mpsc::Sender<Output>,
@@ -92,8 +94,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(config: RuntimeConfig, writer: mpsc::Sender<Output>) -> Self {
+    pub fn new(
+        config: RuntimeConfig,
+        writer: mpsc::Sender<Output>,
+        capability: crate::Capability,
+    ) -> Self {
         Self {
+            capability,
+            locked_readonly_profile: std::sync::atomic::AtomicBool::new(false),
             config: RwLock::new(config),
             executor: Arc::new(PostgresExecutor::new()),
             writer,
@@ -152,7 +160,18 @@ pub async fn execute_query(
         Ok(opts) => opts,
         Err(message) => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
-            let hint = permission_error_hint(&options, &session_cfg);
+            let readonly_write = app.capability == crate::Capability::ReadOnly
+                && options
+                    .permission
+                    .is_some_and(|value| !value.is_read_only());
+            let (message, hint) = if readonly_write {
+                (
+                    "write permission is unavailable in afpsql-readonly".to_string(),
+                    crate::readonly_hint().to_string(),
+                )
+            } else {
+                (message, permission_error_hint(&options, &session_cfg))
+            };
             let _ = app
                 .writer
                 .send(Output::Error {
@@ -180,6 +199,58 @@ pub async fn execute_query(
             return;
         }
     };
+
+    let readonly_policy_error = if app.capability == crate::Capability::ReadOnly {
+        crate::readonly_policy::validate_session_with_trust(
+            &session_cfg,
+            app.locked_readonly_profile.load(Ordering::Relaxed),
+        )
+        .err()
+        .map(|error| (error, crate::readonly_local_capability_hint()))
+        .or_else(|| {
+            crate::readonly_policy::validate_sql(&sql)
+                .err()
+                .map(|error| (error, crate::readonly_hint()))
+        })
+    } else {
+        None
+    };
+    if readonly_policy_error.is_some()
+        || (app.capability == crate::Capability::ReadOnly && !resolved_opts.read_only)
+    {
+        let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+        let (error, hint) = readonly_policy_error.unwrap_or_else(|| {
+            (
+                "write permission is unavailable in afpsql-readonly".to_string(),
+                crate::readonly_hint(),
+            )
+        });
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id: id.clone(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error,
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: Some(hint.to_string()),
+                retryable: false,
+                trace: trace.clone(),
+            })
+            .await;
+        emit_log(
+            app,
+            log_event::QUERY_ERROR,
+            id.as_deref(),
+            Some(&resolved_session),
+            Some(error_code::INVALID_REQUEST),
+            None,
+            &trace,
+        )
+        .await;
+        return;
+    }
 
     let cancel_slot_for_suppression = cancel_slot.clone();
 
@@ -472,28 +543,28 @@ async fn probe_session_identity(
         })
         .await;
 
-    if let Ok(ExecOutcome::Rows { rows, .. }) = probe {
-        if let Some(row) = rows.first().and_then(|v| v.as_object()) {
-            let s = |key: &str| -> Option<String> {
-                row.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
-            };
-            let port = row
-                .get("port")
-                .and_then(|v| v.as_i64())
-                .and_then(|n| u16::try_from(n).ok())
-                .or_else(|| {
-                    row.get("port")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse().ok())
-                });
-            return (
-                s("database").or_else(|| session_cfg.dbname.clone()),
-                s("user").or_else(|| session_cfg.user.clone()),
-                s("host").or_else(|| session_cfg.host.clone()),
-                port.or(session_cfg.port),
-                s("server_version"),
-            );
-        }
+    if let Ok(ExecOutcome::Rows { rows, .. }) = probe
+        && let Some(row) = rows.first().and_then(|v| v.as_object())
+    {
+        let s = |key: &str| -> Option<String> {
+            row.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+        };
+        let port = row
+            .get("port")
+            .and_then(|v| v.as_i64())
+            .and_then(|n| u16::try_from(n).ok())
+            .or_else(|| {
+                row.get("port")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+            });
+        return (
+            s("database").or_else(|| session_cfg.dbname.clone()),
+            s("user").or_else(|| session_cfg.user.clone()),
+            s("host").or_else(|| session_cfg.host.clone()),
+            port.or(session_cfg.port),
+            s("server_version"),
+        );
     }
 
     (
@@ -1024,7 +1095,7 @@ async fn emit_log(
 ) {
     let enabled = {
         let cfg = app.config.read().await;
-        log_enabled(&cfg.log, event)
+        cfg.log.enabled(event)
     };
     if !enabled {
         return;

@@ -148,7 +148,9 @@ fn connect_retryable_for_sqlstate(sqlstate: &str) -> bool {
 
 fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
     let hint = match sqlstate {
-        "28P01" => "password authentication failed; check --user and --password-secret-env PGPASSWORD, or use an authentication method accepted by pg_hba.conf",
+        "28P01" => {
+            "password authentication failed; check --user and --password-secret-env PGPASSWORD, or use an authentication method accepted by pg_hba.conf"
+        }
         "28000" => {
             if message.contains("role") && message.contains("does not exist") {
                 "PostgreSQL rejected the role; check --user/PGUSER, create the role, or for local peer auth use a matching OS user or --ssh-sudo-user postgres with --ssh-remote-socket"
@@ -156,11 +158,21 @@ fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
                 "PostgreSQL authentication or authorization failed; check pg_hba.conf, --user/PGUSER, database access, and whether peer/password auth is expected"
             }
         }
-        "3D000" => "database does not exist; check --dbname/PGDATABASE or connect to the postgres maintenance database to inspect available databases",
-        "57P03" => "PostgreSQL is not accepting connections yet; retry after the service finishes starting or leaves recovery/maintenance",
-        "53300" => "PostgreSQL has too many active connections; wait, terminate idle sessions, or raise max_connections/pool limits",
-        "53400" => "PostgreSQL rejected the connection because a configured limit was exceeded; inspect server logs and connection limits",
-        state if state.starts_with("08") => "connection exception from PostgreSQL; check host/port/socket path, SSH tunnel, listener status, and network reachability",
+        "3D000" => {
+            "database does not exist; check --dbname/PGDATABASE or connect to the postgres maintenance database to inspect available databases"
+        }
+        "57P03" => {
+            "PostgreSQL is not accepting connections yet; retry after the service finishes starting or leaves recovery/maintenance"
+        }
+        "53300" => {
+            "PostgreSQL has too many active connections; wait, terminate idle sessions, or raise max_connections/pool limits"
+        }
+        "53400" => {
+            "PostgreSQL rejected the connection because a configured limit was exceeded; inspect server logs and connection limits"
+        }
+        state if state.starts_with("08") => {
+            "connection exception from PostgreSQL; check host/port/socket path, SSH tunnel, listener status, and network reachability"
+        }
         _ => return None,
     };
     Some(hint.to_string())
@@ -168,6 +180,9 @@ fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
 
 fn connect_hint_for_message(message: &str) -> Option<String> {
     if message.contains("password missing") {
+        if message.contains("container") {
+            return Some("PostgreSQL requested password authentication but no password was provided; set --password-secret-env PGPASSWORD or --password-secret, or use peer auth over the container socket: --container-user <db-os-user> --host /var/run/postgresql (the --container-user, e.g. postgres, must match the database role)".to_string());
+        }
         return Some("PostgreSQL requested password authentication but no password was provided; set --password-secret-env PGPASSWORD or --password-secret, or use a peer/socket authentication path".to_string());
     }
     if message.contains("error connecting to server") && message.contains("Operation not permitted")
@@ -212,17 +227,20 @@ mod tests {
     #[test]
     fn connect_hints_classify_common_sqlstates() {
         let auth = connect_hint_for_sqlstate("28P01", "password authentication failed");
-        assert!(auth
-            .as_deref()
-            .unwrap_or_default()
-            .contains("password authentication failed"));
+        assert!(
+            auth.as_deref()
+                .unwrap_or_default()
+                .contains("password authentication failed")
+        );
         assert!(!connect_retryable_for_sqlstate("28P01"));
 
         let missing_role = connect_hint_for_sqlstate("28000", "role \"root\" does not exist");
-        assert!(missing_role
-            .as_deref()
-            .unwrap_or_default()
-            .contains("--user"));
+        assert!(
+            missing_role
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--user")
+        );
         assert!(!connect_retryable_for_sqlstate("28000"));
 
         let db = connect_hint_for_sqlstate("3D000", "database does not exist");
@@ -237,12 +255,21 @@ mod tests {
     #[test]
     fn connect_hints_classify_transport_messages() {
         let password = ConnectError::new("connect failed: invalid configuration: password missing");
-        assert!(password
-            .hint
-            .as_deref()
-            .unwrap_or_default()
-            .contains("PGPASSWORD"));
+        assert!(
+            password
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("PGPASSWORD")
+        );
         assert!(!password.retryable);
+
+        let container_password = connect_hint_for_message(
+            "connect through container bridge failed: invalid configuration: password missing",
+        );
+        let container_password = container_password.as_deref().unwrap_or_default();
+        assert!(container_password.contains("--container-user"));
+        assert!(container_password.contains("/var/run/postgresql"));
 
         let sandbox = connect_hint_for_message(
             "allocate ssh local port on 127.0.0.1 failed: Operation not permitted",
@@ -252,17 +279,21 @@ mod tests {
         let tcp_sandbox = connect_hint_for_message(
             "connect failed: error connecting to server: Operation not permitted (os error 1)",
         );
-        assert!(tcp_sandbox
-            .as_deref()
-            .unwrap_or_default()
-            .contains("sandbox"));
+        assert!(
+            tcp_sandbox
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sandbox")
+        );
 
         let socket = connect_hint_for_message(
             "--ssh-sudo-user requires an explicit remote PostgreSQL Unix socket",
         );
-        assert!(socket
-            .as_deref()
-            .unwrap_or_default()
-            .contains("--ssh-remote-socket"));
+        assert!(
+            socket
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--ssh-remote-socket")
+        );
     }
 }

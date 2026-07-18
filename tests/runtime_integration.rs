@@ -30,6 +30,22 @@ fn unique_suffix() -> String {
     format!("{}_{}", std::process::id(), nanos)
 }
 
+fn run_write_sql(sql: &str) -> std::process::Output {
+    Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--permission")
+        .arg("write")
+        .arg("--sql")
+        .arg(sql)
+        .output()
+        .expect("run write sql")
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_closes_backend_connection_before_exit() {
     let first = Command::new(bin())
@@ -46,7 +62,9 @@ fn cli_closes_backend_connection_before_exit() {
         String::from_utf8_lossy(&first.stderr)
     );
     let first_json: Value = serde_json::from_slice(&first.stdout).expect("json output");
-    let pid = first_json["rows"][0]["pid"].as_i64().expect("backend pid");
+    let pid = first_json["result"]["rows"][0]["pid"]
+        .as_i64()
+        .expect("backend pid");
 
     let check = Command::new(bin())
         .arg("--dsn-secret")
@@ -64,9 +82,13 @@ fn cli_closes_backend_connection_before_exit() {
         String::from_utf8_lossy(&check.stderr)
     );
     let check_json: Value = serde_json::from_slice(&check.stdout).expect("json output");
-    assert_eq!(check_json["rows"][0]["n"], 0);
+    assert_eq!(check_json["result"]["rows"][0]["n"], 0);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_invalid_param_count_returns_error() {
     let out = Command::new(bin())
@@ -79,10 +101,14 @@ fn cli_invalid_param_count_returns_error() {
 
     assert!(!out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "invalid_params");
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "invalid_params");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_inline_max_rows_soft_truncates() {
     let out = Command::new(bin())
@@ -101,13 +127,17 @@ fn cli_inline_max_rows_soft_truncates() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["truncated"], true);
-    assert_eq!(v["truncated_at_rows"], 2);
-    assert_eq!(v["row_count"], 2);
-    assert_eq!(v["rows"].as_array().map(|a| a.len()), Some(2));
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["truncated"], true);
+    assert_eq!(v["result"]["truncated_at_rows"], 2);
+    assert_eq!(v["result"]["row_count"], 2);
+    assert_eq!(v["result"]["rows"].as_array().map(|a| a.len()), Some(2));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_returning_truncation_completes_update_but_caps_rows() {
     // Inline truncation now matches PostgreSQL's own cursor semantics: the
@@ -156,10 +186,10 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    assert_eq!(v["truncated"], true);
-    assert_eq!(v["truncated_at_rows"], 1);
-    assert_eq!(v["rows"].as_array().map(|a| a.len()), Some(1));
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["truncated"], true);
+    assert_eq!(v["result"]["truncated_at_rows"], 1);
+    assert_eq!(v["result"]["rows"].as_array().map(|a| a.len()), Some(1));
 
     let check_sql = format!("select count(*)::int as n from {table} where touched");
     let out = Command::new(bin())
@@ -175,7 +205,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"], 3);
+    assert_eq!(v["result"]["rows"][0]["n"], 3);
 
     let _ = Command::new(bin())
         .arg("--dsn-secret")
@@ -187,6 +217,10 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
         .output();
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_default_permission_rejects_write() {
     let out = Command::new(bin())
@@ -199,10 +233,15 @@ fn cli_default_permission_rejects_write() {
 
     assert!(!out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "sql_error");
-    assert_eq!(v["sqlstate"], "25006");
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "sql_error");
+    assert_eq!(v["error"]["sqlstate"], "25006");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_statement_timeout_triggers_sql_error() {
     let out = Command::new(bin())
@@ -217,9 +256,14 @@ fn cli_statement_timeout_triggers_sql_error() {
 
     assert!(!out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "sql_error");
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "sql_error");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_handles_parse_error_cancel_ping_and_close() {
     let payload = "\n{not-json}\n".to_string()
@@ -253,15 +297,16 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
     let out = child.wait_with_output().expect("wait output");
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).expect("utf8");
-    assert!(text.contains("\"error_code\":\"invalid_request\""));
-    assert!(
-        text.contains("\"error_code\":\"cancelled\"")
-            || text.contains("no queued or running query")
-    );
+    assert!(text.contains("\"code\":\"invalid_request\""));
+    assert!(text.contains("\"code\":\"cancelled\"") || text.contains("no queued or running query"));
     assert!(text.contains("\"code\":\"pong\""));
     assert!(text.contains("\"code\":\"close\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_bytea_decodes_as_hex_string() {
     let out = Command::new(bin())
@@ -277,9 +322,13 @@ fn cli_bytea_decodes_as_hex_string() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["b"], "\\x48656c6c6f");
+    assert_eq!(v["result"]["rows"][0]["b"], "\\x48656c6c6f");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_text_array_decodes_as_json_array() {
     let out = Command::new(bin())
@@ -295,11 +344,15 @@ fn cli_text_array_decodes_as_json_array() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["items"][0], "a");
-    assert_eq!(v["rows"][0]["items"][1], "b");
-    assert!(v["rows"][0]["items"][2].is_null());
+    assert_eq!(v["result"]["rows"][0]["items"][0], "a");
+    assert_eq!(v["result"]["rows"][0]["items"][1], "b");
+    assert!(v["result"]["rows"][0]["items"][2].is_null());
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_explain_returns_plan_json() {
     let out = Command::new(bin())
@@ -316,11 +369,15 @@ fn cli_explain_returns_plan_json() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    let plan = &v["rows"][0]["QUERY PLAN"][0]["Plan"];
+    assert_eq!(v["kind"], "result");
+    let plan = &v["result"]["rows"][0]["QUERY PLAN"][0]["Plan"];
     assert!(plan["Node Type"].is_string(), "plan missing node type: {v}");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_explain_analyze_reports_actual_timing() {
     let out = Command::new(bin())
@@ -337,13 +394,17 @@ fn cli_explain_analyze_reports_actual_timing() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    let plan = &v["rows"][0]["QUERY PLAN"][0]["Plan"];
+    let plan = &v["result"]["rows"][0]["QUERY PLAN"][0]["Plan"];
     assert!(
         plan["Actual Total Time"].is_number(),
         "plan missing Actual Total Time: {v}"
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_explicit_tx_commit_persists_changes() {
     let table = format!("afpsql_pipe_tx_{}", unique_suffix());
@@ -390,10 +451,14 @@ fn pipe_explicit_tx_commit_persists_changes() {
         .find(|l| l.contains("\"id\":\"check\""))
         .expect("check event");
     let check: Value = serde_json::from_str(check_line).expect("parse check");
-    assert_eq!(check["row_count"], 1);
-    assert_eq!(check["rows"][0]["n"], 7);
+    assert_eq!(check["result"]["row_count"], 1);
+    assert_eq!(check["result"]["rows"][0]["n"], 7);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_explicit_tx_rollback_discards_changes() {
     let table = format!("afpsql_pipe_rb_{}", unique_suffix());
@@ -437,11 +502,15 @@ fn pipe_explicit_tx_rollback_discards_changes() {
         .expect("check event");
     let check: Value = serde_json::from_str(check_line).expect("parse check");
     assert!(
-        check["rows"][0]["exists"].is_null(),
+        check["result"]["rows"][0]["exists"].is_null(),
         "table should have been rolled back: {check}"
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_explicit_tx_savepoint_isolates_failed_query() {
     // A failed query inside an explicit tx wraps itself in a savepoint and
@@ -486,10 +555,14 @@ fn pipe_explicit_tx_savepoint_isolates_failed_query() {
         .find(|l| l.contains("\"id\":\"qgood\""))
         .expect("qgood event");
     let qgood: Value = serde_json::from_str(qgood_line).expect("parse qgood");
-    assert_eq!(qgood["code"], "result");
-    assert_eq!(qgood["rows"][0]["ok"], 1);
+    assert_eq!(qgood["kind"], "result");
+    assert_eq!(qgood["result"]["rows"][0]["ok"], 1);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_inspect_schemas_lists_public() {
     let out = Command::new(bin())
@@ -505,15 +578,85 @@ fn cli_inspect_schemas_lists_public() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
-    let rows = v["rows"].as_array().expect("rows array");
-    let names: Vec<&str> = rows
-        .iter()
-        .filter_map(|r| r["schema_name"].as_str())
-        .collect();
+    assert_eq!(v["kind"], "result");
+    let rows = v["result"]["rows"].as_array().expect("rows array");
+    let names: Vec<&str> = rows.iter().filter_map(|r| r["schema"].as_str()).collect();
     assert!(names.contains(&"public"), "schemas: {names:?}");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn cli_inspect_database_summarizes_connected_db() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("database")
+        .output()
+        .expect("run afpsql inspect database");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["row_count"], 1);
+    let row = &v["result"]["rows"][0];
+    assert!(row["database"].is_string(), "row: {row}");
+    // Counts are present and numeric (>= 0).
+    for key in [
+        "schemas",
+        "tables",
+        "views",
+        "materialized_views",
+        "sequences",
+    ] {
+        assert!(row[key].is_number(), "missing numeric {key}: {row}");
+    }
+    assert!(row["size"].is_string(), "size missing: {row}");
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn cli_inspect_databases_includes_size_and_encoding() {
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("databases")
+        .output()
+        .expect("run afpsql inspect databases");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    assert_eq!(v["kind"], "result");
+    let rows = v["result"]["rows"].as_array().expect("rows array");
+    let row = rows.first().expect("at least one database");
+    for key in [
+        "database",
+        "owner",
+        "encoding",
+        "collate",
+        "allow_connections",
+    ] {
+        assert!(row.get(key).is_some(), "missing {key}: {row}");
+    }
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_inspect_table_describes_columns() {
     let table = format!("afpsql_inspect_{}", unique_suffix());
@@ -557,8 +700,8 @@ fn cli_inspect_table_describes_columns() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["row_count"], 3);
-    let rows = v["rows"].as_array().expect("rows array");
+    assert_eq!(v["result"]["row_count"], 3);
+    let rows = v["result"]["rows"].as_array().expect("rows array");
     assert_eq!(rows[0]["name"], "id");
     assert_eq!(rows[0]["nullable"], false);
     assert_eq!(rows[1]["name"], "name");
@@ -567,6 +710,152 @@ fn cli_inspect_table_describes_columns() {
     assert_eq!(rows[2]["nullable"], true);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn cli_inspect_schema_table_full_and_index_stats_export_metadata() {
+    let suffix = unique_suffix();
+    let schema = format!("afpsql_inspect_schema_{suffix}");
+    let setup_statements = [
+        format!("create schema {schema}"),
+        format!(
+            "create table {schema}.parent(\
+             id serial primary key, \
+             code text not null unique)"
+        ),
+        format!(
+            "create table {schema}.child(\
+             id bigint generated by default as identity primary key, \
+             parent_id int not null references {schema}.parent(id), \
+             qty int not null check (qty > 0), \
+             note text default 'x')"
+        ),
+        format!("create index child_parent_idx on {schema}.child(parent_id)"),
+        format!(
+            "create function {schema}.touch_child() returns trigger \
+             language plpgsql as $$ \
+             begin \
+               new.note = coalesce(new.note, 'x'); \
+               return new; \
+             end $$"
+        ),
+        format!(
+            "create trigger child_touch \
+             before insert on {schema}.child \
+             for each row execute function {schema}.touch_child()"
+        ),
+    ];
+    for sql in setup_statements {
+        let out = run_write_sql(&sql);
+        assert!(
+            out.status.success(),
+            "sql: {sql}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let schema_out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("schema")
+        .arg("--schema")
+        .arg(&schema)
+        .arg("--like")
+        .arg("child")
+        .output()
+        .expect("run afpsql inspect schema");
+    let table_full_out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("table")
+        .arg(format!("{schema}.child"))
+        .arg("--full")
+        .output()
+        .expect("run afpsql inspect table --full");
+    let indexes_out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("inspect")
+        .arg("indexes")
+        .arg("--schema")
+        .arg(&schema)
+        .arg("--table")
+        .arg("child")
+        .arg("--stats")
+        .output()
+        .expect("run afpsql inspect indexes --stats");
+
+    let _ = run_write_sql(&format!("drop schema if exists {schema} cascade"));
+
+    for (name, out) in [
+        ("schema", &schema_out),
+        ("table --full", &table_full_out),
+        ("indexes --stats", &indexes_out),
+    ] {
+        assert!(
+            out.status.success(),
+            "{name} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let schema_json: Value = serde_json::from_slice(&schema_out.stdout).expect("schema json");
+    let schema_rows = schema_json["result"]["rows"]
+        .as_array()
+        .expect("schema rows");
+    for kind in ["relation", "column", "constraint", "index", "trigger"] {
+        assert!(
+            schema_rows.iter().any(|row| row["kind"] == kind),
+            "missing {kind} row: {schema_rows:?}"
+        );
+    }
+    let id_col = schema_rows
+        .iter()
+        .find(|row| row["kind"] == "column" && row["name"] == "id")
+        .expect("id column row");
+    assert!(
+        id_col["payload"]["serial_sequence"].is_string(),
+        "missing serial sequence relationship: {id_col}"
+    );
+
+    let full_json: Value = serde_json::from_slice(&table_full_out.stdout).expect("full json");
+    let full_rows = full_json["result"]["rows"].as_array().expect("full rows");
+    assert!(
+        full_rows
+            .iter()
+            .any(|row| row["kind"] == "trigger" && row["name"] == "child_touch"),
+        "missing trigger row: {full_rows:?}"
+    );
+    assert!(
+        full_rows
+            .iter()
+            .any(|row| row["kind"] == "constraint" && row["object_type"] == "foreign key"),
+        "missing foreign key row: {full_rows:?}"
+    );
+
+    let indexes_json: Value = serde_json::from_slice(&indexes_out.stdout).expect("indexes json");
+    let index_rows = indexes_json["result"]["rows"]
+        .as_array()
+        .expect("index rows");
+    let child_parent = index_rows
+        .iter()
+        .find(|row| row["name"] == "child_parent_idx")
+        .expect("child_parent_idx row");
+    assert_eq!(child_parent["method"], "btree");
+    assert!(
+        child_parent.get("index_scan_count").is_some(),
+        "pg_stat_user_indexes counters missing: {child_parent}"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_inspect_tables_filters_by_schema_and_pattern() {
     let suffix = unique_suffix();
@@ -614,10 +903,14 @@ fn cli_inspect_tables_filters_by_schema_and_pattern() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["row_count"], 1);
-    assert_eq!(v["rows"][0]["name"], table);
+    assert_eq!(v["result"]["row_count"], 1);
+    assert_eq!(v["result"]["rows"][0]["name"], table);
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_dry_run_reports_param_types_and_columns() {
     let out = Command::new(bin())
@@ -638,13 +931,18 @@ fn cli_dry_run_reports_param_types_and_columns() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "dry_run");
-    assert_eq!(v["param_types"][0], "int4");
-    assert_eq!(v["param_types"][1], "text");
-    assert_eq!(v["columns"][0]["name"], "n");
-    assert_eq!(v["columns"][1]["name"], "t");
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["code"], "dry_run");
+    assert_eq!(v["result"]["param_types"][0], "int4");
+    assert_eq!(v["result"]["param_types"][1], "text");
+    assert_eq!(v["result"]["columns"][0]["name"], "n");
+    assert_eq!(v["result"]["columns"][1]["name"], "t");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
     let out = Command::new(bin())
@@ -657,10 +955,15 @@ fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "sql_error");
-    assert_eq!(v["sqlstate"], "42P01");
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "sql_error");
+    assert_eq!(v["error"]["sqlstate"], "42P01");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_param_preserves_string_form_for_text_column() {
     let out = Command::new(bin())
@@ -678,9 +981,13 @@ fn cli_param_preserves_string_form_for_text_column() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["raw"], "00123");
+    assert_eq!(v["result"]["rows"][0]["raw"], "00123");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_numeric_param_preserves_precision() {
     // Cast result to text to bypass JSON-number precision limits; the goal is
@@ -701,11 +1008,15 @@ fn cli_numeric_param_preserves_precision() {
     );
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
     assert_eq!(
-        v["rows"][0]["n"],
+        v["result"]["rows"][0]["n"],
         "12345678901234567890.12345678901234500000"
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_session_info_reports_connection_identity() {
     let payload = serde_json::json!({"code":"session_info"}).to_string()
@@ -740,10 +1051,10 @@ fn pipe_session_info_reports_connection_identity() {
         .expect("session_info event");
     let info: Value = serde_json::from_str(info_line).expect("parse session_info");
     let (expected_user, expected_db) = test_env::dsn_identity(&test_dsn());
-    assert_eq!(info["database"], expected_db.as_str());
-    assert_eq!(info["user"], expected_user.as_str());
+    assert_eq!(info["result"]["database"], expected_db.as_str());
+    assert_eq!(info["result"]["user"], expected_user.as_str());
     assert!(
-        info["server_version"].is_string(),
+        info["result"]["server_version"].is_string(),
         "server_version missing: {info_line}"
     );
 }
@@ -759,10 +1070,15 @@ fn cli_invalid_output_returns_exit_2() {
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(2));
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "invalid_request");
+    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "invalid_request");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_yaml_output_mode() {
     let out = Command::new(bin())
@@ -779,6 +1095,10 @@ fn cli_yaml_output_mode() {
     assert!(text.contains("code: \"result\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn cli_plain_output_mode() {
     let out = Command::new(bin())
@@ -795,6 +1115,10 @@ fn cli_plain_output_mode() {
     assert!(text.contains("result") || text.contains("code"));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_query_then_close_timeout_path() {
     let payload = serde_json::json!({
@@ -831,6 +1155,10 @@ fn pipe_query_then_close_timeout_path() {
     assert!(text.contains("\"code\":\"close\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_config_and_cancel_existing_query() {
     let payload = serde_json::json!({
@@ -883,11 +1211,11 @@ fn pipe_config_and_cancel_existing_query() {
     let outcomes_for_q1 = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|v| v["id"] == "q1")
+        .filter(|v| v["result"]["id"] == "q1" || v["error"]["id"] == "q1")
         .filter(|v| {
-            let code = v["code"].as_str().unwrap_or("");
-            matches!(code, "result" | "sql_error")
-                || (code == "error" && v["error_code"].as_str() == Some("cancelled"))
+            v["kind"] == "result"
+                || (v["kind"] == "error"
+                    && matches!(v["error"]["code"].as_str(), Some("sql_error" | "cancelled")))
         })
         .count();
     assert_eq!(
@@ -897,6 +1225,10 @@ fn pipe_config_and_cancel_existing_query() {
     assert!(text.contains("\"code\":\"close\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_session_preserves_temp_table_across_queries() {
     let payload = serde_json::json!({
@@ -954,6 +1286,10 @@ fn pipe_session_preserves_temp_table_across_queries() {
     assert!(text.contains("\"n\":7"), "output: {text}");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_same_session_queries_are_fifo() {
     let payload = serde_json::json!({
@@ -1003,6 +1339,10 @@ fn pipe_same_session_queries_are_fifo() {
     assert!(slow < fast, "same-session outputs not FIFO: {text}");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_cancel_queued_query_prevents_execution() {
     let payload = serde_json::json!({
@@ -1066,14 +1406,15 @@ fn pipe_cancel_queued_query_prevents_execution() {
     );
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"id\":\"qqueued\""), "output: {text}");
-    assert!(
-        text.contains("\"error_code\":\"cancelled\""),
-        "output: {text}"
-    );
+    assert!(text.contains("\"code\":\"cancelled\""), "output: {text}");
     assert!(text.contains("\"id\":\"qcheck\""), "output: {text}");
     assert!(text.contains("\"n\":0"), "output: {text}");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_config_update_switches_session_connection() {
     let mut child = Command::new(bin())
@@ -1144,11 +1485,15 @@ fn pipe_config_update_switches_session_connection() {
     assert!(all.contains("\"code\":\"config\""));
     assert!(all.contains("\"id\":\"q2\""));
     assert!(
-        all.contains("\"error_code\":\"connect_failed\""),
+        all.contains("\"code\":\"connect_failed\""),
         "full output: {all}"
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_config_patch_can_clear_dsn_secret() {
     let mut child = Command::new(bin())
@@ -1227,11 +1572,15 @@ fn pipe_config_patch_can_clear_dsn_secret() {
     assert!(all.contains("\"code\":\"config\""));
     assert!(all.contains("\"id\":\"q2\""));
     assert!(
-        all.contains("\"error_code\":\"connect_failed\""),
+        all.contains("\"code\":\"connect_failed\""),
         "full output: {all}"
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_cancel_after_query_finished_returns_invalid_request() {
     let mut child = Command::new(bin())
@@ -1288,11 +1637,15 @@ fn pipe_cancel_after_query_finished_returns_invalid_request() {
     let status = child.wait().expect("wait status");
     assert!(status.success());
     assert!(all.contains("\"id\":\"qdone\""));
-    assert!(all.contains("\"error_code\":\"invalid_request\""));
+    assert!(all.contains("\"code\":\"invalid_request\""));
     assert!(all.contains("query already finished"));
     assert!(all.contains("\"code\":\"close\""));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_cancel_race_and_long_query() {
     let payload = serde_json::json!({
@@ -1343,11 +1696,11 @@ fn pipe_cancel_race_and_long_query() {
     let outcomes_for_qrace = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|v| v["id"] == "qrace")
+        .filter(|v| v["result"]["id"] == "qrace" || v["error"]["id"] == "qrace")
         .filter(|v| {
-            let code = v["code"].as_str().unwrap_or("");
-            matches!(code, "result" | "sql_error")
-                || (code == "error" && v["error_code"].as_str() == Some("cancelled"))
+            v["kind"] == "result"
+                || (v["kind"] == "error"
+                    && matches!(v["error"]["code"].as_str(), Some("sql_error" | "cancelled")))
         })
         .count();
     assert_eq!(
@@ -1356,6 +1709,10 @@ fn pipe_cancel_race_and_long_query() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     let marker = format!("afpsql_cancel_marker_{}", unique_suffix());
@@ -1397,7 +1754,7 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
             .expect("query pg_stat_activity");
         if out.status.success() {
             let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-            if v["rows"][0]["n"].as_i64().unwrap_or(0) > 0 {
+            if v["result"]["rows"][0]["n"].as_i64().unwrap_or(0) > 0 {
                 saw_active = true;
                 break;
             }
@@ -1419,10 +1776,7 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     reader.read_to_string(&mut all).expect("read output");
     let status = child.wait().expect("wait status");
     assert!(status.success());
-    assert!(
-        all.contains("\"error_code\":\"cancelled\""),
-        "output: {all}"
-    );
+    assert!(all.contains("\"code\":\"cancelled\""), "output: {all}");
     assert!(
         all.contains("server-side cancel requested"),
         "server-side cancel hint missing: {all}"
@@ -1437,5 +1791,5 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
         .expect("query pg_stat_activity after cancel");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"].as_i64().unwrap_or(-1), 0);
+    assert_eq!(v["result"]["rows"][0]["n"].as_i64().unwrap_or(-1), 0);
 }

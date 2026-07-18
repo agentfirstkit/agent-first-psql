@@ -50,6 +50,9 @@ impl RuntimeConfig {
                 if let Some(v) = s.ssh.destination.into_update() {
                     entry.ssh.destination = v;
                 }
+                if let Some(v) = s.ssh.via.into_update() {
+                    entry.ssh.via = v.unwrap_or_default();
+                }
                 if let Some(v) = s.ssh.options.into_update() {
                     entry.ssh.options = v.unwrap_or_default();
                 }

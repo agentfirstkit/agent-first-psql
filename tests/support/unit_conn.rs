@@ -63,10 +63,11 @@ fn resolve_conn_rejects_unsupported_tls_options_with_hint() {
     assert!(err.is_err());
     if let Err(err) = err {
         assert!(err.message().contains("unsupported dsn sslmode"));
-        assert!(err
-            .hint()
-            .unwrap_or_default()
-            .contains("disable, prefer, and require"));
+        assert!(
+            err.hint()
+                .unwrap_or_default()
+                .contains("disable, prefer, and require")
+        );
     }
 
     let cfg2 = SessionConfig {
@@ -77,10 +78,11 @@ fn resolve_conn_rejects_unsupported_tls_options_with_hint() {
     assert!(err2.is_err());
     if let Err(err2) = err2 {
         assert!(err2.message().contains("sslrootcert"));
-        assert!(err2
-            .hint()
-            .unwrap_or_default()
-            .contains("verify-ca/verify-full"));
+        assert!(
+            err2.hint()
+                .unwrap_or_default()
+                .contains("verify-ca/verify-full")
+        );
     }
 }
 
@@ -194,8 +196,10 @@ fn resolve_conn_discrete_fields_are_not_conninfo_or_url_interpolated() {
 
 #[test]
 fn resolve_conn_uses_pgpassword_fallback() {
+    let _env_guard = crate::test_env::env_lock();
     let old = std::env::var_os("PGPASSWORD");
-    std::env::set_var("PGPASSWORD", "pgpass-test");
+    // SAFETY: the shared test environment lock is held for this mutation.
+    unsafe { std::env::set_var("PGPASSWORD", "pgpass-test") };
 
     let out_res = resolve_pg_config(&SessionConfig {
         host: Some("localhost".to_string()),
@@ -205,8 +209,10 @@ fn resolve_conn_uses_pgpassword_fallback() {
     });
 
     match old {
-        Some(value) => std::env::set_var("PGPASSWORD", value),
-        None => std::env::remove_var("PGPASSWORD"),
+        // SAFETY: the shared test environment lock is still held here.
+        Some(value) => unsafe { std::env::set_var("PGPASSWORD", value) },
+        // SAFETY: the shared test environment lock is still held here.
+        None => unsafe { std::env::remove_var("PGPASSWORD") },
     }
 
     assert!(out_res.is_ok());
@@ -217,6 +223,7 @@ fn resolve_conn_uses_pgpassword_fallback() {
 
 #[test]
 fn libpq_env_fallbacks_lists_only_unfilled_pg_vars() {
+    let _env_guard = crate::test_env::env_lock();
     let names = [
         "PGHOST",
         "PGPORT",
@@ -234,10 +241,14 @@ fn libpq_env_fallbacks_lists_only_unfilled_pg_vars() {
     ];
     let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var_os(n))).collect();
     for n in &names {
-        std::env::remove_var(n);
+        // SAFETY: the shared test environment lock is held for this mutation.
+        unsafe { std::env::remove_var(n) };
     }
-    std::env::set_var("PGHOST", "envhost");
-    std::env::set_var("PGPASSWORD", "envpw");
+    // SAFETY: the shared test environment lock is held for these mutations.
+    unsafe {
+        std::env::set_var("PGHOST", "envhost");
+        std::env::set_var("PGPASSWORD", "envpw");
+    }
 
     let only_explicit = libpq_env_fallbacks_in_use(&SessionConfig {
         host: Some("explicit".to_string()),
@@ -252,8 +263,10 @@ fn libpq_env_fallbacks_lists_only_unfilled_pg_vars() {
 
     for (n, value) in saved {
         match value {
-            Some(v) => std::env::set_var(n, v),
-            None => std::env::remove_var(n),
+            // SAFETY: the shared test environment lock is still held here.
+            Some(v) => unsafe { std::env::set_var(n, v) },
+            // SAFETY: the shared test environment lock is still held here.
+            None => unsafe { std::env::remove_var(n) },
         }
     }
 

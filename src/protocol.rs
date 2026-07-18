@@ -32,16 +32,5 @@ pub mod command_tag {
     }
 }
 
-pub fn log_enabled(filters: &[String], event: &str) -> bool {
-    if filters.is_empty() {
-        return false;
-    }
-    if filters.iter().any(|f| f == "all" || f == "*") {
-        return true;
-    }
-    if filters.iter().any(|f| f == event) {
-        return true;
-    }
-    let prefix = event.split('.').next().unwrap_or(event);
-    filters.iter().any(|f| f == prefix)
-}
+// Log-filter matching lives in afdata's `LogFilters::enabled`; afpsql threads
+// the `LogFilters` type through its config instead of keeping a second matcher.

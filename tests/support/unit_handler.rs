@@ -1,9 +1,9 @@
 use super::*;
 use crate::db::{ConnectError, DbExecutor, ExecError, ExecOutcome, ExecRequest};
 use async_trait::async_trait;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::sync::atomic::AtomicU64;
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 #[tokio::test]
 async fn emit_rows_uses_db_columns_even_when_rows_empty() {
@@ -18,7 +18,11 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
         },
     ];
     let (tx, mut rx) = mpsc::channel(16);
-    let app = Arc::new(App::new(RuntimeConfig::default(), tx));
+    let app = Arc::new(App::new(
+        RuntimeConfig::default(),
+        tx,
+        crate::Capability::ReadWrite,
+    ));
     let opts = ResolvedOptions {
         stream_rows: false,
         batch_rows: 10,
@@ -55,7 +59,11 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
 #[tokio::test]
 async fn emit_rows_result_paths() {
     let (tx, mut rx) = mpsc::channel(64);
-    let app = Arc::new(App::new(RuntimeConfig::default(), tx));
+    let app = Arc::new(App::new(
+        RuntimeConfig::default(),
+        tx,
+        crate::Capability::ReadWrite,
+    ));
 
     let stream_opts = ResolvedOptions {
         stream_rows: true,
@@ -166,6 +174,8 @@ fn test_app_with_executor(
 ) -> (Arc<App>, mpsc::Receiver<Output>) {
     let (tx, rx) = mpsc::channel(64);
     let app = Arc::new(App {
+        capability: crate::Capability::ReadWrite,
+        locked_readonly_profile: std::sync::atomic::AtomicBool::new(false),
         config: RwLock::new(cfg),
         executor: Arc::new(MockExecutor {
             result: Mutex::new(Some(result)),
@@ -452,10 +462,11 @@ async fn execute_query_emits_structured_connect_error_details() {
             detail.as_deref(),
             Some("connection matched pg_hba peer rule")
         );
-        assert!(hint
-            .as_deref()
-            .unwrap_or_default()
-            .contains("--user postgres"));
+        assert!(
+            hint.as_deref()
+                .unwrap_or_default()
+                .contains("--user postgres")
+        );
         assert!(!retryable);
     }
 }

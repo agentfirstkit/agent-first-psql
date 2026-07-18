@@ -1,12 +1,13 @@
-use super::errors::{map_pg_error, ConnectError, ExecError};
-use super::params::{build_param_refs, build_params, validate_param_count, QueryParam};
+use super::errors::{ConnectError, ExecError, map_pg_error};
+use super::params::{QueryParam, build_param_refs, build_params, validate_param_count};
 use super::rows::{row_json_size, row_to_json_fallback};
 use super::session::{
-    connect_session, get_session, new_session_map, remove_sessions, shutdown_all_sessions,
-    CancelSlot, SessionMap,
+    CancelSlot, SessionMap, connect_session, get_session, new_session_map, remove_sessions,
+    shutdown_all_sessions,
 };
-use crate::protocol::{log_enabled, log_event};
+use crate::protocol::log_event;
 use crate::types::{ColumnInfo, Output, ResolvedOptions, SessionConfig, Trace};
+use agent_first_data::LogFilters;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use serde_json::Value;
@@ -71,7 +72,7 @@ pub struct ExecRequest<'a> {
 #[derive(Clone)]
 pub struct TransportLogContext {
     pub session: String,
-    pub log: Vec<String>,
+    pub log: LogFilters,
     pub writer: mpsc::Sender<Output>,
 }
 
@@ -151,6 +152,12 @@ pub trait DbExecutor: Send + Sync {
 
 pub struct PostgresExecutor {
     sessions: SessionMap,
+}
+
+impl Default for PostgresExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PostgresExecutor {
@@ -395,7 +402,7 @@ async fn emit_transport_selected(
         return Ok(());
     };
     emit_libpq_env_fallback(ctx, req.session_cfg).await?;
-    if !log_enabled(&ctx.log, log_event::TRANSPORT_SELECTED) {
+    if !ctx.log.enabled(log_event::TRANSPORT_SELECTED) {
         return Ok(());
     }
     let chain = super::session::transport_chain_summary(req.session_cfg, !ctx.log.is_empty());
@@ -421,7 +428,7 @@ async fn emit_libpq_env_fallback(
     ctx: &TransportLogContext,
     cfg: &SessionConfig,
 ) -> Result<(), ExecError> {
-    if !log_enabled(&ctx.log, log_event::CONNECT_LIBPQ_ENV_FALLBACK) {
+    if !ctx.log.enabled(log_event::CONNECT_LIBPQ_ENV_FALLBACK) {
         return Ok(());
     }
     let used = crate::conn::libpq_env_fallbacks_in_use(cfg);
@@ -888,7 +895,7 @@ mod tests {
     fn test_request<'a>(
         cfg: &'a SessionConfig,
         opts: &'a ResolvedOptions,
-        log: Vec<String>,
+        log: LogFilters,
         writer: mpsc::Sender<Output>,
     ) -> ExecRequest<'a> {
         ExecRequest {
@@ -953,7 +960,7 @@ mod tests {
         };
         let opts = default_opts();
         let (tx, mut rx) = mpsc::channel::<Output>(4);
-        let req = test_request(&cfg, &opts, vec![], tx);
+        let req = test_request(&cfg, &opts, LogFilters::default(), tx);
         let selected = super::super::session::TransportSelection { duration_ms: 7 };
         assert!(emit_transport_selected(&req, Some(selected)).await.is_ok());
         assert!(
@@ -967,7 +974,7 @@ mod tests {
         let cfg = SessionConfig::default();
         let opts = default_opts();
         let (tx, mut rx) = mpsc::channel::<Output>(4);
-        let req = test_request(&cfg, &opts, vec!["transport".to_string()], tx);
+        let req = test_request(&cfg, &opts, LogFilters::new(["transport"]), tx);
         assert!(emit_transport_selected(&req, None).await.is_ok());
         assert!(
             rx.try_recv().is_err(),
@@ -978,7 +985,7 @@ mod tests {
     async fn assert_transport_event(cfg: SessionConfig, chain_substring: &str, duration_ms: u64) {
         let opts = default_opts();
         let (tx, mut rx) = mpsc::channel::<Output>(4);
-        let req = test_request(&cfg, &opts, vec!["transport".to_string()], tx);
+        let req = test_request(&cfg, &opts, LogFilters::new(["transport"]), tx);
         let selected = super::super::session::TransportSelection { duration_ms };
         assert!(emit_transport_selected(&req, Some(selected)).await.is_ok());
         let received = rx.try_recv().ok();
@@ -1338,7 +1345,9 @@ fn row_to_json_value(row: &tokio_postgres::Row, wrapped_json: bool) -> Value {
 
 fn wrapped_rows_sql(sql: &str) -> String {
     // Preserve PostgreSQL's own type serialization for SELECT and RETURNING-style rows.
-    format!("with __afpsql_rows as ({sql}) select to_jsonb(__afpsql_rows) as row_json from __afpsql_rows")
+    format!(
+        "with __afpsql_rows as ({sql}) select to_jsonb(__afpsql_rows) as row_json from __afpsql_rows"
+    )
 }
 
 async fn rollback_wrap_savepoint(

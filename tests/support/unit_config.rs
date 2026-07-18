@@ -29,6 +29,7 @@ fn apply_update_merges_session_fields() {
             password_secret: PatchField::Value("pw".to_string()),
             ssh: SshConfigPatch {
                 destination: PatchField::Value("user@example.com".to_string()),
+                via: PatchField::Value(vec!["user@jump".to_string()]),
                 options: PatchField::Value(vec!["ProxyJump=bastion".to_string()]),
                 local_host: PatchField::Value("127.0.0.1".to_string()),
                 local_port: PatchField::Value(15432),
@@ -71,6 +72,7 @@ fn apply_update_merges_session_fields() {
         assert_eq!(s1.dbname.as_deref(), Some("postgres"));
         assert_eq!(s1.password_secret.as_deref(), Some("pw"));
         assert_eq!(s1.ssh.destination.as_deref(), Some("user@example.com"));
+        assert_eq!(s1.ssh.via, vec!["user@jump".to_string()]);
         assert_eq!(s1.ssh.options, vec!["ProxyJump=bastion".to_string()]);
         assert_eq!(s1.ssh.local_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(s1.ssh.local_port, Some(15432));
@@ -92,7 +94,7 @@ fn apply_update_merges_session_fields() {
     assert_eq!(cfg.inline_max_bytes, 20);
     assert_eq!(cfg.statement_timeout_ms, 30);
     assert_eq!(cfg.lock_timeout_ms, 40);
-    assert_eq!(cfg.log, vec!["a".to_string()]);
+    assert_eq!(cfg.log, agent_first_data::LogFilters::new(["a"]));
 }
 
 #[test]
@@ -107,7 +109,10 @@ fn apply_update_normalizes_log_categories() {
         ]),
         ..Default::default()
     });
-    assert_eq!(cfg.log, vec!["query.result".to_string(), "all".to_string()]);
+    assert_eq!(
+        cfg.log,
+        agent_first_data::LogFilters::new(["query.result", "all"])
+    );
 }
 
 #[test]
@@ -377,6 +382,7 @@ fn apply_update_can_clear_session_fields_with_null() {
             password_secret: Some("pw".to_string()),
             ssh: SshConfig {
                 destination: Some("user@example.com".to_string()),
+                via: vec!["user@jump".to_string()],
                 options: vec!["ProxyJump=bastion".to_string()],
                 local_host: Some("127.0.0.1".to_string()),
                 local_port: Some(15432),
@@ -409,6 +415,7 @@ fn apply_update_can_clear_session_fields_with_null() {
             password_secret: PatchField::Null,
             ssh: SshConfigPatch {
                 destination: PatchField::Null,
+                via: PatchField::Null,
                 options: PatchField::Null,
                 local_host: PatchField::Null,
                 local_port: PatchField::Null,
@@ -443,6 +450,7 @@ fn apply_update_can_clear_session_fields_with_null() {
         assert!(s1.dbname.is_none());
         assert!(s1.password_secret.is_none());
         assert!(s1.ssh.destination.is_none());
+        assert!(s1.ssh.via.is_empty());
         assert!(s1.ssh.options.is_empty());
         assert!(s1.ssh.local_host.is_none());
         assert!(s1.ssh.local_port.is_none());

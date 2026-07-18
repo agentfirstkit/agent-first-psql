@@ -29,6 +29,10 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("afpsql_{name}_{}_{}", std::process::id(), suffix))
 }
 
+fn assert_strict_event(value: &Value) {
+    agent_first_data::validate_protocol_event(value, true).expect("strict AFDATA event");
+}
+
 #[test]
 fn psql_mode_help_and_version_flags_are_accepted_without_database() {
     for args in [
@@ -69,33 +73,38 @@ fn psql_mode_interactive_usage_reports_structured_hint_on_stdout() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty());
         let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-        assert_eq!(v["code"], "error");
-        assert_eq!(v["error_code"], "invalid_request");
-        assert!(v["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unsupported psql mode"));
-        assert!(v["hint"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("original psql binary directly"));
+        assert_strict_event(&v);
+        assert_eq!(v["kind"], "error");
+        assert_eq!(v["error"]["code"], "invalid_request");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported psql mode")
+        );
+        assert!(
+            v["error"]["hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("original psql binary directly")
+        );
     }
 }
 
 #[test]
-fn psql_mode_output_and_log_file_route_structured_events() {
+fn psql_mode_stdout_and_stderr_files_redirect_process_streams() {
     let out_path = temp_path("psql_output");
-    let log_path = temp_path("psql_log");
+    let err_path = temp_path("psql_error");
 
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
         .arg("--dsn-secret")
         .arg("postgresql://127.0.0.1:1/postgres")
-        .arg("-o")
+        .arg("--stdout-file")
         .arg(&out_path)
-        .arg("-L")
-        .arg(&log_path)
+        .arg("--stderr-file")
+        .arg(&err_path)
         .arg("-c")
         .arg("select 1")
         .output()
@@ -105,12 +114,14 @@ fn psql_mode_output_and_log_file_route_structured_events() {
     assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty());
     let output_text = std::fs::read_to_string(&out_path).expect("read output file");
-    let log_text = std::fs::read_to_string(&log_path).expect("read log file");
-    assert!(output_text.contains("\"code\":\"error\""));
-    assert_eq!(output_text, log_text);
+    let stderr_text = std::fs::read_to_string(&err_path).expect("read stderr file");
+    let v: Value = serde_json::from_str(&output_text).expect("json output file");
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "error");
+    assert!(stderr_text.trim().is_empty());
 
     let _ = std::fs::remove_file(out_path);
-    let _ = std::fs::remove_file(log_path);
+    let _ = std::fs::remove_file(err_path);
 }
 
 #[test]
@@ -128,13 +139,21 @@ fn ssh_transport_validation_reports_structured_error_on_stdout() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "connect_failed");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("SSH transport currently supports discrete connection fields"));
-    assert!(v["hint"].as_str().unwrap_or_default().contains("--ssh"));
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "connect_failed");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SSH transport currently supports discrete connection fields")
+    );
+    assert!(
+        v["error"]["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--ssh")
+    );
 }
 
 #[test]
@@ -156,19 +175,26 @@ fn ssh_sudo_bridge_requires_explicit_socket_with_hint() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "connect_failed");
-    assert!(v["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("explicit remote PostgreSQL Unix socket"));
-    let hint = v["hint"].as_str().unwrap_or_default();
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "connect_failed");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("explicit remote PostgreSQL Unix socket")
+    );
+    let hint = v["error"]["hint"].as_str().unwrap_or_default();
     assert!(hint.contains("--ssh-remote-socket"));
     assert!(hint.contains("--host/PGHOST"));
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
-fn psql_mode_only_translates_supported_cli_flags() {
+fn psql_mode_translates_supported_cli_flags() {
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
@@ -182,8 +208,13 @@ fn psql_mode_only_translates_supported_cli_flags() {
         .expect("run afpsql");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["rows"][0]["n"], 7);
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "result");
+    assert_eq!(v["result"]["rows"][0]["n"], 7);
+}
 
+#[test]
+fn psql_mode_rejects_unsupported_set_flag_without_database() {
     let unsupported = Command::new(bin())
         .arg("--mode")
         .arg("psql")
@@ -193,9 +224,14 @@ fn psql_mode_only_translates_supported_cli_flags() {
         .expect("run afpsql");
     assert_eq!(unsupported.status.code(), Some(2));
     let v: Value = serde_json::from_slice(&unsupported.stdout).expect("json output");
-    assert_eq!(v["error_code"], "invalid_request");
+    assert_strict_event(&v);
+    assert_eq!(v["error"]["code"], "invalid_request");
 }
 
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
 #[test]
 fn psql_mode_keeps_write_compatible_default() {
     let out = Command::new(bin())
@@ -209,7 +245,8 @@ fn psql_mode_keeps_write_compatible_default() {
         .expect("run afpsql");
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "result");
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "result");
 }
 
 #[test]
@@ -221,7 +258,8 @@ fn afd_mode_rejects_psql_short_flags() {
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(2));
     let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    assert_eq!(v["code"], "error");
-    assert_eq!(v["error_code"], "invalid_request");
+    assert_strict_event(&v);
+    assert_eq!(v["kind"], "error");
+    assert_eq!(v["error"]["code"], "invalid_request");
     assert!(String::from_utf8_lossy(&out.stderr).trim().is_empty());
 }

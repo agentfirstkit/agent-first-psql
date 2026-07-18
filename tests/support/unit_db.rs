@@ -1,9 +1,6 @@
 use super::*;
 use crate::types::{ColumnInfo, ContainerConfig, QueryOptions, RuntimeConfig, SshConfig};
 
-#[path = "env.rs"]
-mod test_env;
-
 #[test]
 fn parse_helpers_error_paths() {
     assert!(matches!(
@@ -150,7 +147,7 @@ async fn postgres_executor_rejects_unsupported_tls_config() {
 }
 
 fn test_dsn() -> Option<String> {
-    test_env::test_dsn()
+    crate::test_env::test_dsn()
 }
 
 fn test_session_config(dsn: String) -> SessionConfig {

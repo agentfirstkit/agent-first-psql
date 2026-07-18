@@ -1,10 +1,10 @@
 use crate::conn::resolve_pg_config;
 use crate::types::{SessionConfig, TransportKind};
 
-use super::errors::{map_connect_error, ConnectError, ExecError};
+use super::errors::{ConnectError, ExecError, map_connect_error};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
@@ -268,11 +268,20 @@ pub(super) fn transport_chain_summary(cfg: &SessionConfig, reveal_targets: bool)
         TransportKind::Direct => postgres_endpoint_summary(cfg, reveal_targets),
         TransportKind::Ssh => {
             let ssh = if reveal_targets {
-                cfg.ssh
-                    .destination
-                    .as_deref()
-                    .map(|destination| format!("ssh:{destination}"))
-                    .unwrap_or_else(|| "ssh".to_string())
+                let mut hops = cfg
+                    .ssh
+                    .via
+                    .iter()
+                    .map(|hop| format!("ssh:{hop}"))
+                    .collect::<Vec<_>>();
+                if let Some(destination) = cfg.ssh.destination.as_deref() {
+                    hops.push(format!("ssh:{destination}"));
+                }
+                if hops.is_empty() {
+                    "ssh".to_string()
+                } else {
+                    hops.join(" -> ")
+                }
             } else {
                 "ssh".to_string()
             };

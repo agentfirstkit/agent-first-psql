@@ -107,6 +107,54 @@ uses container permissions rather than SSH permissions.
 `psql mode` keeps psql's writable default for script compatibility and does not
 expose native permission flags.
 
+## Readonly executable
+
+`afpsql-readonly` selects an immutable read-only capability in the shared runner.
+The handler checks resolved read-family permission for native, inspect, dry-run,
+explain, and pipe queries; pipe transaction creation separately rejects
+read-write begins. Raw SQL transaction control remains rejected so it cannot
+bypass afpsql's transaction state machine. Psql translation remains unavailable
+because it currently selects write permission by default.
+
+The ordinary readonly entrypoint is not a host sandbox. It accepts local SQL
+files, arbitrary explicitly named secret environment variables, config secret
+files, SSH options, custom container runtimes, stream redirection, skill
+management, and caller-selected direct/SSH/container targets. These capabilities
+can read local data or start processes even though the final database permission
+cannot leave the read family.
+
+PostgreSQL authorization remains the strict database security boundary.
+Deployments requiring adversarial isolation must use a dedicated
+non-owner reader role, audit role membership/functions/RLS, and apply database
+resource governance. PostgreSQL `READ ONLY` does not by itself rule out `NOTIFY`,
+advisory locks, extension behavior, external-side-effect functions, or any
+capability already granted to the reader role.
+
+For narrower host authorization, the executable basename itself can bind a
+trusted profile: `afpsql-readonly-NAME` loads the fixed root-owned file
+`/etc/afpsql/readonly-profiles/NAME.json`. Selection is outside agent-controlled
+CLI/pipe data. The locked mode rejects connection flags and pipe session
+patches, while allowing administrator profile values to use SSH config files,
+ProxyCommand, identity paths, or custom runtimes. Root ownership, a 64 KiB size
+cap, and no group/world write bits establish the Unix trust boundary.
+
+## Config secret source architecture
+
+Canonical and psql-compatible argument parsers translate each
+`--*-secret-config FILE DOT_PATH` pair into a typed config reference. A single
+in-process resolver detects JSON, TOML, YAML, or dotenv through
+agent-first-data's document layer, reads the file once, resolves the dot-path,
+and requires a non-empty string. It never invokes a shell, expands dotenv
+variables, or writes the value into argv or the process environment.
+
+Parser-library errors are converted into source-safe CLI errors containing only
+the flag, file, dot-path, format, and safe line/column metadata. The resolved
+value is stored only in the existing session secret slot. Session serialization
+has one safe projection for direct, env-resolved, and config-resolved values, so
+pipe config responses and every output formatter emit `***` rather than secret
+text. Config references are startup-only in pipe v1; dynamic pipe file/path
+references and automatic rotation are deliberately out of scope.
+
 ## Session semantics: named sessions mean backend state
 
 A pipe named session is intended to correspond to one PostgreSQL backend session
@@ -173,7 +221,7 @@ When values are dynamic, clients should use `$N` placeholders and `params`.
 Validation rules:
 
 1. Placeholder count must match `params` length, using prepared-statement metadata.
-2. Invalid client-side shapes or local binding conversions return `error_code:"invalid_params"`.
+2. Invalid client-side shapes or local binding conversions return `error.code:"invalid_params"`.
 3. PostgreSQL server conversion/execution failures remain `sql_error` events with the original SQLSTATE.
 
 Unsupported by design:
@@ -225,8 +273,8 @@ Agents should branch on `sqlstate`, not parse message text.
 
 Client/protocol/runtime failure. Include:
 
-- `error_code`
-- `error`
+- `error.code`
+- `error.message`
 - optional `sqlstate`, `message`, `detail` when PostgreSQL rejects the
   connection before query execution
 - optional `hint`
@@ -235,8 +283,8 @@ Client/protocol/runtime failure. Include:
 
 Permission mismatches, validation errors, connection setup failures, unsupported
 TLS settings, and SSH transport validation should use this path.
-Connection-stage PostgreSQL failures still use `code:"error"` with
-`error_code:"connect_failed"`, but should preserve SQLSTATE diagnostics when
+Connection-stage PostgreSQL failures still use `kind:"error"` with
+`error.code:"connect_failed"`, but should preserve SQLSTATE diagnostics when
 available so agents can distinguish authentication, role, database, capacity, and
 startup failures without parsing prose.
 
@@ -269,12 +317,12 @@ It must reject or mark unsupported:
 - Add tests for each permission boundary and hint.
 - Preserve session/tunnel lifetimes with active work rather than only map entries.
 - Avoid destructive changes to session state on config updates until active work is safe.
-- Keep generated CLI docs in sync with `--help-markdown`.
+- Keep generated CLI docs in sync with `--help --recursive --output markdown`.
 - Preserve `clippy.toml` bans that prevent SQL keyword scanning and stderr protocol leaks.
 
 ## Skill design: behavior, not flag reference
 
-`skills/agent-first-psql.md` is loaded by Claude Code and Codex as the agent's
+`skills/agent-first-psql/SKILL.md` is loaded by Claude Code and Codex as the agent's
 behavior contract when working with afpsql. Its audience is users of the
 installed binary — the source tree and `docs/reference.md` may not be present on
 the user's machine, but `afpsql --help` always is. The skill is shaped around
@@ -284,7 +332,7 @@ Keep in the skill:
 
 - behavior rules (defaults, what to do / not do)
 - decision rules (when to use which mode, permission, or transport)
-- recovery rules (specific `SQLSTATE` or `error_code` → action)
+- recovery rules (specific `SQLSTATE` or `error.code` → action)
 - non-obvious defaults the agent would otherwise miss (e.g. read-only default,
   libpq `PG*` env silently filling missing fields)
 - a small set of canonical examples that establish the pattern
@@ -297,7 +345,7 @@ Drop from the skill:
 - full canonical command variants for every transport combination
 
 For anything in the "drop" list, the agent runs `afpsql --help` or
-`afpsql --help-markdown` to discover the current flag surface. Mirroring
+`afpsql --help --recursive --output markdown` to discover the current flag surface. Mirroring
 `--help` content into the skill makes it rot every release, bloats agent
 context, and trains the agent on stale flag names.
 

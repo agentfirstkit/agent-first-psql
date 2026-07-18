@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_postgres::types::{Json, Type};
 
 pub(super) fn row_json_size(row: &Value) -> usize {
@@ -115,10 +115,10 @@ pub(super) fn decode_row_value_fallback(row: &tokio_postgres::Row, idx: usize, t
             if let Ok(Some(v)) = row.try_get::<_, Option<i64>>(idx) {
                 return json!(v);
             }
-            if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(idx) {
-                if let Some(n) = serde_json::Number::from_f64(v) {
-                    return Value::Number(n);
-                }
+            if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(idx)
+                && let Some(n) = serde_json::Number::from_f64(v)
+            {
+                return Value::Number(n);
             }
             Value::String(format!("<unhandled_type:{}>", ty.name()))
         }
