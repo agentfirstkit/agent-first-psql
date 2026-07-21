@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 default-run = "afpsql"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."
@@ -23,7 +23,7 @@ name = "afpsql-readonly"
 path = "src/readonly_main.rs"
 
 [dependencies]
-agent-first-data = { version = "0.19.1", features = ["cli-help", "cli-help-markdown", "skill-admin", "stream-redirect"] }
+agent-first-data = { version = "0.22.0", features = ["cli-help", "cli-help-markdown", "skill-admin", "stream-redirect"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

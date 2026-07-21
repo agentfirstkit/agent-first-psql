@@ -591,4 +591,4 @@ Options:
   -h, --help
           Print help
 ```
-AFDATA: 0.19.1
+AFDATA: 0.22.0

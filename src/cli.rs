@@ -653,10 +653,17 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
     }
     let startup_requested = startup_requested_from_raw(&raw);
 
+    let build = match env!("GIT_SHA") {
+        "unknown" => None,
+        sha => Some(sha),
+    };
     match agent_first_data::cli_handle_version_or_continue(
         &raw,
+        &command_for_bin(bin_name),
         bin_name,
+        Some(env!("DISPLAY_NAME")),
         env!("CARGO_PKG_VERSION"),
+        build,
     ) {
         Ok(Some(version)) => {
             let _ = write!(std::io::stdout(), "{version}");

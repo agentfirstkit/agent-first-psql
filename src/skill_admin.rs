@@ -12,6 +12,7 @@ const SPEC: SkillSpec = SkillSpec {
     source: include_str!("../skills/agent-first-psql/SKILL.md"),
     title: "Agent-First PSQL",
     marker_slug: "afpsql",
+    assets: &[],
 };
 
 pub fn run(req: SkillAdminRequest) -> i32 {

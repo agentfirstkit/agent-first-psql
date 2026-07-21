@@ -1,7 +1,6 @@
 ---
 name: agent-first-psql
 description: "Reliable agent/script access to PostgreSQL via structured stdout events, explicit read/write permissions, and SSH/container transports. Use instead of parsing human psql output or SSHing in to run psql."
-disable-model-invocation: true
 allowed-tools: Bash, Read
 ---
 
