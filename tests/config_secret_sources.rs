@@ -47,7 +47,17 @@ fn assert_no_canaries(output: &Output) {
 }
 
 fn first_event(output: &Output) -> Value {
-    serde_json::from_slice(&output.stdout).expect("structured JSON event")
+    let stream = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        assert!(
+            output.stderr.is_empty(),
+            "default split routing unexpectedly produced both streams: {}",
+            combined(output)
+        );
+        &output.stdout
+    };
+    serde_json::from_slice(stream).expect("structured JSON event")
 }
 
 #[test]
@@ -109,6 +119,8 @@ fn pipe_startup_config_is_read_once_and_serializes_only_redaction() {
             "DATABASE_URL",
             "--log",
             "startup",
+            "--output-to",
+            "stdout",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -381,6 +393,37 @@ fn resolved_config_secret_reaches_ssh_container_and_combined_transports() {
         assert!(!rendered.contains("password-secret-config"), "{rendered}");
     }
     std::fs::remove_file(path).expect("remove transport config source");
+}
+
+#[test]
+fn ssh_transport_parses_dsn_config_in_process_without_leaking() {
+    let path = temp_config(
+        "ssh-dsn",
+        "env",
+        &format!("DATABASE_URL=postgresql://user:{DSN_CANARY}@db1:5432,db2:5433/app\n"),
+    );
+    let path_text = path.to_str().expect("utf8 path");
+    let output = Command::new(afpsql())
+        .args([
+            "--ssh",
+            "user@example.invalid",
+            "--dsn-secret-config",
+            path_text,
+            "DATABASE_URL",
+            "--sql",
+            "select 1",
+        ])
+        .output()
+        .expect("run SSH DSN config source");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_canaries(&output);
+    let event = first_event(&output);
+    assert_eq!(event["error"]["code"], "connect_failed");
+    let message = event["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("single PostgreSQL host and port"));
+    assert!(!message.contains("discrete connection fields"));
+    std::fs::remove_file(path).expect("remove SSH DSN config source");
 }
 
 #[cfg_attr(

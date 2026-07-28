@@ -28,8 +28,6 @@ pub mod types;
 pub mod writer;
 
 use agent_first_data::OutputFormat;
-use std::io::Write as _;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     ReadWrite,
@@ -43,9 +41,15 @@ impl Capability {
 }
 
 pub async fn run(capability: Capability, bin_name: &str) {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if let Err(error) = emit::install_output_to_from_raw(&raw_args) {
+        if emit::emit_cli_error(&error, None, OutputFormat::Json).is_err() {
+            std::process::exit(4);
+        }
+        std::process::exit(2);
+    }
     let mut locked_profile = None;
     if capability == Capability::ReadOnly {
-        let raw_args = std::env::args().collect::<Vec<_>>();
         let profile_name = match raw_args
             .first()
             .map(String::as_str)
@@ -165,12 +169,7 @@ fn install_stream_redirect_or_exit()
         Ok(redirect) => redirect,
         Err(error) => {
             let value = agent_first_data::build_cli_error(&error.to_string(), None);
-            let rendered = agent_first_data::render(
-                value.as_value(),
-                OutputFormat::Json,
-                &agent_first_data::OutputOptions::default(),
-            );
-            let _ = writeln!(std::io::stdout(), "{rendered}");
+            let _ = emit::emit_value(value.into(), OutputFormat::Json);
             std::process::exit(2);
         }
     }

@@ -1,4 +1,4 @@
-use crate::conn::resolve_pg_config;
+use crate::conn::{make_supported_tls, resolve_pg_config};
 use crate::types::{SessionConfig, TransportKind};
 
 use super::errors::{ConnectError, ExecError, map_connect_error};
@@ -213,8 +213,9 @@ pub(super) async fn connect_session(
         ));
     }
 
+    let pg_cfg = resolve_pg_config(cfg).map_err(ExecError::from)?;
     if crate::ssh_transport::needs_stdio_bridge(cfg) {
-        let (client, bridge) = crate::ssh_transport::connect_stdio_bridge(cfg)
+        let (client, bridge) = crate::ssh_transport::connect_stdio_bridge(cfg, &pg_cfg)
             .await
             .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
         let backend_pid = fetch_backend_pid(&client).await?;
@@ -233,16 +234,15 @@ pub(super) async fn connect_session(
         ));
     }
 
-    let (connect_cfg, ssh_tunnel) = crate::ssh_transport::prepare_session(cfg)
+    let (connect_cfg, ssh_tunnel) = crate::ssh_transport::prepare_session(cfg, &pg_cfg)
         .await
         .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
-    let pg_cfg = resolve_pg_config(&connect_cfg).map_err(ExecError::from)?;
     let tls = make_supported_tls().map_err(|e| {
         ExecError::Connect(Box::new(ConnectError::new(format!(
             "create TLS connector failed: {e}"
         ))))
     })?;
-    let (client, connection) = pg_cfg.connect(tls).await.map_err(map_connect_error)?;
+    let (client, connection) = connect_cfg.connect(tls).await.map_err(map_connect_error)?;
     let connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -433,14 +433,4 @@ impl SessionClient {
             bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
         }
     }
-}
-
-fn make_supported_tls() -> Result<postgres_native_tls::MakeTlsConnector, native_tls::Error> {
-    let tls = native_tls::TlsConnector::builder()
-        // Supported sslmode=prefer/require encrypts without certificate
-        // verification. verify-ca/verify-full are rejected during config parse.
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()?;
-    Ok(postgres_native_tls::MakeTlsConnector::new(tls))
 }

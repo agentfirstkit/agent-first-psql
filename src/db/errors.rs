@@ -192,8 +192,8 @@ fn connect_hint_for_message(message: &str) -> Option<String> {
     if message.contains("allocate ssh local port") && message.contains("Operation not permitted") {
         return Some("local sandbox or OS policy blocked binding the SSH tunnel port; in Codex request escalation, or use SSH sudo Unix-socket bridge mode when appropriate".to_string());
     }
-    if message.contains("SSH transport currently supports discrete connection fields") {
-        return Some("with --ssh, pass discrete connection fields such as --host/--port/--user/--dbname/--password-secret-env instead of --dsn-secret or --conninfo-secret".to_string());
+    if message.contains("single PostgreSQL host and port") {
+        return Some("SSH and container transports currently target one PostgreSQL endpoint; use a DSN/conninfo with one host, or choose one host explicitly with discrete connection fields".to_string());
     }
     if message.contains("container bridge") || message.contains("container transport") {
         return Some("check the container target, runtime access, driver selection, and whether PostgreSQL is listening on the requested container-internal host/port or socket".to_string());
@@ -212,12 +212,12 @@ fn connect_hint_for_message(message: &str) -> Option<String> {
 
 fn connect_retryable_for_message(message: &str) -> bool {
     !(message.contains("password missing")
-        || message.contains("SSH transport currently supports discrete connection fields")
+        || message.contains("single PostgreSQL host and port")
         || message.contains("explicit remote PostgreSQL Unix socket"))
 }
 
 fn default_connect_hint() -> String {
-    "check --host/--port or PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server; for container-local PostgreSQL use --container TARGET; for containers on an SSH host combine --ssh user@server --container TARGET; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
+    "check the DSN/conninfo or --host/--port/PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server (DSN/conninfo targets are interpreted from the final SSH host); for container-local PostgreSQL use --container TARGET; for containers on an SSH host combine --ssh user@server --container TARGET; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
 }
 
 #[cfg(test)]

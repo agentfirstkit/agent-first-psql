@@ -21,7 +21,14 @@ fn readwrite() -> &'static str {
 
 fn error(output: std::process::Output) -> Value {
     assert!(!output.status.success());
-    serde_json::from_slice(&output.stdout).expect("structured error JSON")
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "default split routing wrote an error to stdout"
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stderr).expect("structured error JSON on stderr");
+    agent_first_data::validate_protocol_event(&value, true).expect("strict AFDATA error event");
+    value
 }
 
 fn temp_path(name: &str) -> PathBuf {
@@ -120,6 +127,8 @@ fn readonly_allows_skill_admin_redirects_and_sql_files() {
         .args([
             "--stdout-file",
             output_path.to_str().expect("utf8 path"),
+            "--output-to",
+            "stdout",
             "--sql",
             "select 1",
         ])
@@ -246,7 +255,7 @@ fn readonly_pipe_rejects_write_begin_and_query() {
         "\n",
     );
     let mut child = Command::new(readonly())
-        .args(["--mode", "pipe"])
+        .args(["--mode", "pipe", "--output-to", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -466,7 +475,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
             "unexpected success for {sql}: {}",
             String::from_utf8_lossy(&output.stdout)
         );
-        let value: Value = serde_json::from_slice(&output.stdout).expect("boundary error JSON");
+        let value = error(output);
         assert_eq!(
             value["error"]["code"], "sql_error",
             "unexpected result for {sql}: {value}"
@@ -637,7 +646,14 @@ fn readonly_pipe_keeps_read_only_lifecycle_available() {
         "\n",
     );
     let mut child = Command::new(readonly())
-        .args(["--mode", "pipe", "--dsn-secret", &dsn])
+        .args([
+            "--mode",
+            "pipe",
+            "--dsn-secret",
+            &dsn,
+            "--output-to",
+            "stdout",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

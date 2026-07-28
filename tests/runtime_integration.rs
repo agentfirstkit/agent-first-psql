@@ -42,6 +42,17 @@ fn run_write_sql(sql: &str) -> std::process::Output {
         .expect("run write sql")
 }
 
+fn split_error_event(output: &std::process::Output) -> Value {
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "default split routing wrote an error to stdout"
+    );
+    let value: Value =
+        serde_json::from_slice(&output.stderr).expect("structured error JSON on stderr");
+    agent_first_data::validate_protocol_event(&value, true).expect("strict AFDATA error event");
+    value
+}
+
 #[cfg_attr(
     not(feature = "db-tests"),
     ignore = "requires PostgreSQL test database"
@@ -100,7 +111,7 @@ fn cli_invalid_param_count_returns_error() {
         .expect("run afpsql");
 
     assert!(!out.status.success());
-    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "invalid_params");
 }
@@ -232,7 +243,7 @@ fn cli_default_permission_rejects_write() {
         .expect("run afpsql");
 
     assert!(!out.status.success());
-    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "sql_error");
     assert_eq!(v["error"]["sqlstate"], "25006");
@@ -255,7 +266,7 @@ fn cli_statement_timeout_triggers_sql_error() {
         .expect("run afpsql");
 
     assert!(!out.status.success());
-    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "sql_error");
 }
@@ -954,7 +965,7 @@ fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
         .output()
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(1));
-    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+    let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "sql_error");
     assert_eq!(v["error"]["sqlstate"], "42P01");
@@ -1069,8 +1080,7 @@ fn cli_invalid_output_returns_exit_2() {
         .output()
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(2));
-    let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-    agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
+    let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "invalid_request");
 }

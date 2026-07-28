@@ -51,7 +51,8 @@ Non-goals:
 ## Core principles: reliability over throughput
 
 1. Reliability over throughput.
-2. Structured stdout events are the protocol; stderr is not a runtime channel.
+2. Structured AFDATA events are the protocol. Finite mode defaults to
+   `--output-to split`; ordered stream consumers select one output stream.
 3. Native/pipe writes require explicit permission.
 4. PostgreSQL `SQLSTATE` is preserved for database errors.
 5. Permission, validation, transport, and protocol errors include actionable hints.
@@ -155,6 +156,14 @@ pipe config responses and every output formatter emit `***` rather than secret
 text. Config references are startup-only in pipe v1; dynamic pipe file/path
 references and automatic rotation are deliberately out of scope.
 
+Direct, SSH, and container paths resolve DSN/conninfo through the same typed
+`tokio_postgres::Config`. Boundary transports derive one internal PostgreSQL
+endpoint from that parsed config rather than splitting connection text. A local
+SSH tunnel replaces only the network endpoint; authentication, database,
+startup options, timeout/keepalive behavior, channel binding, and supported TLS
+settings remain attached to the connection. Multi-host sources fail explicitly
+until one bridge can represent multiple failover targets.
+
 ## Session semantics: named sessions mean backend state
 
 A pipe named session is intended to correspond to one PostgreSQL backend session
@@ -206,9 +215,9 @@ Output events:
   `server_version` from a probe SELECT when reachable)
 - `log`
 
-Every recoverable runtime condition should be represented by one of these stdout
-events. Startup argument parsing can still exit with code `2`, but it should use
-structured CLI error output when possible.
+Every recoverable runtime condition should be represented by one of these
+AFDATA events. Startup argument parsing can still exit with code `2`, but it
+should use structured CLI error output when possible.
 
 ## Parameter binding: values never become SQL text
 
@@ -293,6 +302,18 @@ startup failures without parsing prose.
 `psql mode` exists to let non-interactive scripts use familiar flags while
 receiving structured afpsql events.
 
+The canonical afpsql surface follows AFDATA's long-flags-only default:
+`--host`, `--help`, `--version`, and `--output` have no short aliases.
+Psql-compatible shorts such as `-h`, `-V`, and `-v` belong only to
+`--mode psql` and the managed psql wrapper, where their established meanings
+are unambiguous.
+
+Psql's `-o` / `--output` names an output file, while canonical afpsql's
+`--output` selects the structured rendering format. Psql mode rejects both
+spellings instead of silently changing their meaning. Use `--stdout-file` for
+process-level redirection, or canonical mode's long-only `--output` for
+json/yaml/plain rendering.
+
 It may translate:
 
 - `-c` / `--command`
@@ -308,17 +329,19 @@ It must reject or mark unsupported:
 - single-step/single-line interactive modes
 - no command source
 - meta-command workflows
+- psql output-file flags `-o` / `--output`
 - afpsql native permission flags
 - afpsql SSH transport extension flags
 
 ## Implementation guardrails: protect the reliability contract
 
-- Keep runtime errors structured and on stdout.
+- Keep runtime errors structured and honor `--output-to`.
 - Add tests for each permission boundary and hint.
 - Preserve session/tunnel lifetimes with active work rather than only map entries.
 - Avoid destructive changes to session state on config updates until active work is safe.
 - Keep generated CLI docs in sync with `--help --recursive --output markdown`.
-- Preserve `clippy.toml` bans that prevent SQL keyword scanning and stderr protocol leaks.
+- Preserve `clippy.toml` bans that prevent SQL keyword scanning and ad-hoc
+  process-stream writes.
 
 ## Skill design: behavior, not flag reference
 

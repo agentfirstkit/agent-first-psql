@@ -1,9 +1,18 @@
 use crate::types::{RuntimeConfig, SessionConfig};
 use std::error::Error as _;
+use std::net::IpAddr;
 use tokio_postgres::Config;
-use tokio_postgres::config::SslMode;
+use tokio_postgres::config::{Host, SslMode};
 
 const SUPPORTED_SSLMODE_HINT: &str = "afpsql supports sslmode=disable, prefer, and require. It does not implement libpq verify-ca/verify-full or client certificate options yet; use psql/libpq when certificate verification or client certificates are required.";
+const DEFAULT_POSTGRES_HOST: &str = "127.0.0.1";
+const DEFAULT_POSTGRES_PORT: u16 = 5432;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostgresEndpoint {
+    Tcp { host: String, port: u16 },
+    UnixSocket { directory: String, port: u16 },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionConfigError {
@@ -105,6 +114,134 @@ pub fn resolve_pg_config(cfg: &SessionConfig) -> Result<Config, ConnectionConfig
         apply_sslmode(&mut pg_cfg, "PGSSLMODE", &sslmode)?;
     }
     Ok(pg_cfg)
+}
+
+pub(crate) fn resolve_single_postgres_endpoint(
+    pg_cfg: &Config,
+    transport_name: &str,
+) -> Result<PostgresEndpoint, String> {
+    let hosts = pg_cfg.get_hosts();
+    let hostaddrs = pg_cfg.get_hostaddrs();
+    let ports = pg_cfg.get_ports();
+    if hosts.len() > 1 || hostaddrs.len() > 1 || ports.len() > 1 {
+        return Err(format!(
+            "{transport_name} supports a single PostgreSQL host and port; the connection source resolved to multiple targets"
+        ));
+    }
+
+    let port = ports.first().copied().unwrap_or(DEFAULT_POSTGRES_PORT);
+    if let Some(hostaddr) = hostaddrs.first() {
+        #[cfg(unix)]
+        if matches!(hosts.first(), Some(Host::Unix(_))) {
+            return Err(format!(
+                "{transport_name} cannot combine a PostgreSQL Unix socket with hostaddr"
+            ));
+        }
+        return Ok(PostgresEndpoint::Tcp {
+            host: hostaddr.to_string(),
+            port,
+        });
+    }
+
+    match hosts.first() {
+        Some(Host::Tcp(host)) if host.starts_with('/') => Ok(PostgresEndpoint::UnixSocket {
+            directory: host.clone(),
+            port,
+        }),
+        Some(Host::Tcp(host)) => Ok(PostgresEndpoint::Tcp {
+            host: host.clone(),
+            port,
+        }),
+        #[cfg(unix)]
+        Some(Host::Unix(path)) => Ok(PostgresEndpoint::UnixSocket {
+            directory: path.to_string_lossy().into_owned(),
+            port,
+        }),
+        None => Ok(PostgresEndpoint::Tcp {
+            host: DEFAULT_POSTGRES_HOST.to_string(),
+            port,
+        }),
+    }
+}
+
+pub(crate) fn pg_config_for_tcp_tunnel(
+    source: &Config,
+    local_host: &str,
+    local_port: u16,
+) -> Config {
+    let mut target = Config::new();
+    if let Some(user) = source.get_user() {
+        target.user(user);
+    }
+    if let Some(password) = source.get_password() {
+        target.password(password);
+    }
+    if let Some(dbname) = source.get_dbname() {
+        target.dbname(dbname);
+    }
+    if let Some(options) = source.get_options() {
+        target.options(options);
+    }
+    if let Some(application_name) = source.get_application_name() {
+        target.application_name(application_name);
+    }
+    target
+        .ssl_mode(source.get_ssl_mode())
+        .ssl_negotiation(source.get_ssl_negotiation())
+        .keepalives(source.get_keepalives())
+        .target_session_attrs(source.get_target_session_attrs())
+        .channel_binding(source.get_channel_binding())
+        .load_balance_hosts(source.get_load_balance_hosts());
+    if let Some(connect_timeout) = source.get_connect_timeout() {
+        target.connect_timeout(*connect_timeout);
+    }
+    if let Some(tcp_user_timeout) = source.get_tcp_user_timeout() {
+        target.tcp_user_timeout(*tcp_user_timeout);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        target.keepalives_idle(source.get_keepalives_idle());
+        if let Some(interval) = source.get_keepalives_interval() {
+            target.keepalives_interval(interval);
+        }
+        if let Some(retries) = source.get_keepalives_retries() {
+            target.keepalives_retries(retries);
+        }
+    }
+
+    match (
+        source.get_hosts().first(),
+        local_host.parse::<IpAddr>().ok(),
+    ) {
+        (Some(Host::Tcp(original_host)), Some(local_addr)) if !original_host.starts_with('/') => {
+            // Connect to the local tunnel address while retaining the original
+            // hostname for PostgreSQL TLS SNI.
+            target.host(original_host).hostaddr(local_addr);
+        }
+        _ => {
+            target.host(local_host);
+        }
+    }
+    target.port(local_port);
+    target
+}
+
+pub(crate) fn postgres_tls_server_name(pg_cfg: &Config) -> &str {
+    match pg_cfg.get_hosts().first() {
+        Some(Host::Tcp(host)) if !host.starts_with('/') => host,
+        _ => "",
+    }
+}
+
+pub(crate) fn make_supported_tls()
+-> Result<postgres_native_tls::MakeTlsConnector, native_tls::Error> {
+    let tls = native_tls::TlsConnector::builder()
+        // Supported sslmode=prefer/require encrypts without certificate
+        // verification. verify-ca/verify-full are rejected during config parse.
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()?;
+    Ok(postgres_native_tls::MakeTlsConnector::new(tls))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {

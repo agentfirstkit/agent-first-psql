@@ -60,6 +60,8 @@ value in-process through Agent-First Data's document layer.
 afpsql --dsn-secret-config config.yaml database.url --sql 'select 1'
 afpsql --dsn-secret-config .env DATABASE_URL --sql 'select 1'
 afpsql --conninfo-secret-config .env PG_CONNINFO --sql 'select 1'
+afpsql --ssh user@server \
+  --dsn-secret-config config.yaml database.url --sql 'select 1'
 afpsql --host localhost --user app --dbname app \
   --password-secret-config .env PGPASSWORD --sql 'select 1'
 ```
@@ -75,6 +77,12 @@ Resolved secrets never enter argv, a temporary environment variable, startup
 logs, errors, or config responses. Runtime config output represents a configured
 `dsn_secret`, `conninfo_secret`, or `password_secret` as `***`. Startup logging
 may include only the source kind, file path, and dot-path.
+
+With SSH or container transport, afpsql parses DSN/conninfo locally and uses its
+host/port or Unix socket inside the final transport boundary. It preserves the
+remaining authentication and TLS settings; do not reveal or split a connection
+URL in shell code. Boundary transports currently require the source to resolve
+to one PostgreSQL endpoint rather than a multi-host failover list.
 
 ## Write safety: read by default, explicit by permission
 
@@ -152,11 +160,14 @@ instead of installing afpsql on that server or asking the agent to run human
 `psql` over SSH:
 
 ```bash
-afpsql --ssh user@server --host 127.0.0.1 --port 5432 \
-  --user app --dbname appdb \
-  --password-secret-env PGPASSWORD \
+afpsql --ssh user@server \
+  --dsn-secret-config config.yaml database.url \
   --sql "select now()"
 ```
+
+The DSN host/port is interpreted from `user@server`, while afpsql keeps the
+connection secret local. Discrete `--host`, `--port`, `--user`, `--dbname`, and
+password sources remain available when the application does not store a DSN.
 
 For two-hop SSH, keep `afpsql` in charge of the transport and pass the jump host
 through OpenSSH options instead of creating an external temporary port forward:

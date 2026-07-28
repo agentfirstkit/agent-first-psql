@@ -1,6 +1,6 @@
 ---
 name: agent-first-psql
-description: "Reliable agent/script access to PostgreSQL via structured stdout events, explicit read/write permissions, and SSH/container transports. Use instead of parsing human psql output or SSHing in to run psql."
+description: "Reliable agent/script access to PostgreSQL via structured AFDATA events, explicit read/write permissions, and SSH/container transports. Use instead of parsing human psql output or SSHing in to run psql."
 allowed-tools: Bash, Read
 ---
 
@@ -16,9 +16,11 @@ skill covers behavior, decisions, and recovery only.
 
 ## Core Rules
 
-- Treat stdout as the protocol: parse strict Agent-First Data envelopes by
-  top-level `kind`. Business result codes stay at `result.code`; failures use
-  `error.code`, `error.message`, and `error.retryable`.
+- Parse strict Agent-First Data envelopes by top-level `kind`. The default
+  `--output-to split` sends results to stdout and errors/logs/progress to
+  stderr; use `--output-to stdout` for one ordered pipe stream. Business result
+  codes stay at `result.code`; failures use `error.code`, `error.message`, and
+  `error.retryable`.
 - When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
   It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
   transaction-control SQL, and psql translation. It still permits SQL/config
@@ -34,6 +36,12 @@ skill covers behavior, decisions, and recovery only.
   permissions: `write`, `ssh-write`, or `container-write`.
 - Use `--ssh`, `--container`, or `--ssh + --container` as afpsql transports;
   keep afpsql local unless the user explicitly asks for server-side tools.
+- With `--ssh`, use `--dsn-secret[-env|-config]` or
+  `--conninfo-secret[-env|-config]` directly when that is how the application
+  stores its connection. afpsql parses the value locally in-process, uses its
+  host/port as the PostgreSQL target visible from the final SSH host, and keeps
+  the remaining authentication/TLS settings for the tunneled connection. Never
+  reveal or split a DSN in shell code.
 - For SSH jump hosts, keep using afpsql transport. If every hop is reachable
   from the local OpenSSH client, use `--ssh-option ProxyJump=bastion`. If a
   later hop is reachable only from an earlier host, repeat `--ssh-via` in chain
@@ -162,8 +170,11 @@ work, open an explicit transaction:
 
 ## Non-Obvious Behaviors
 
-- SSH transport expects discrete connection fields; avoid `--dsn-secret` and
-  `--conninfo-secret` with `--ssh`.
+- SSH and container transports accept DSN, conninfo, or discrete connection
+  fields. Their PostgreSQL host/port or Unix socket is interpreted inside the
+  final transport boundary. A DSN/conninfo used with either transport must
+  resolve to one PostgreSQL endpoint; choose one host explicitly when an
+  application DSN contains a failover host list.
 - `--ssh-via` is repeatable and means "local SSHs to this hop, that hop SSHs to
   the next hop, and the final `--ssh` host runs the PostgreSQL bridge." The
   PostgreSQL `--host/--port` are interpreted on the final host, so
@@ -217,9 +228,12 @@ afpsql psql install             # optional: psql-compatible wrapper
 - Multi-hop SSH with hop-local credentials: repeat `--ssh-via` in order, for
   example `--ssh-via ubuntu@me_automanage --ssh ubuntu@zhiya --host localhost`.
   Do not replace this with nested manual `ssh ... psql`; keep afpsql local so
-  stdout remains structured and SSH stderr is captured in the error event.
+  output remains structured and SSH stderr is captured in the error event.
 - SSH `connection refused`: check the remote host/port or Unix socket path, not
   the local workstation's PostgreSQL service.
+- A `single PostgreSQL host and port` error means the DSN/conninfo contains a
+  failover list that one SSH/container bridge cannot target; select one host or
+  use discrete connection fields for that run.
 - `password authentication failed`: TCP auth rules are in effect; use the correct
   secret or switch to a valid remote Unix-socket/peer pattern.
 - `peer authentication failed`: the OS user does not match the database role;

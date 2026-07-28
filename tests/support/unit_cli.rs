@@ -4,6 +4,19 @@ fn raw_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
+fn count_help_surface(command: &Value) -> (usize, usize) {
+    let mut commands = 1;
+    let mut arguments = command["arguments"].as_array().map_or(0, Vec::len);
+    if let Some(subcommands) = command["subcommands"].as_array() {
+        for subcommand in subcommands {
+            let (subcommand_count, argument_count) = count_help_surface(subcommand);
+            commands += subcommand_count;
+            arguments += argument_count;
+        }
+    }
+    (commands, arguments)
+}
+
 #[test]
 fn parse_params_order_and_types() {
     let p_res = parse_params(&["2=active".to_string(), "1=42".to_string()]);
@@ -467,6 +480,20 @@ fn clap_accepts_permission_flag() {
 }
 
 #[test]
+fn canonical_clap_rejects_psql_compatibility_shorts() {
+    for args in [
+        vec!["afpsql", "-h", "db.example", "--sql", "select 1"],
+        vec!["afpsql", "-V"],
+        vec!["afpsql", "-o", "yaml", "--sql", "select 1"],
+    ] {
+        assert!(
+            AfdCli::try_parse_from(args).is_err(),
+            "canonical afpsql accepted a psql compatibility short"
+        );
+    }
+}
+
+#[test]
 fn clap_accepts_sql_values_that_look_like_flags() {
     let cli_res = AfdCli::try_parse_from(["afpsql", "--sql", "--mode=psql", "--dry-run"]);
     assert!(cli_res.is_ok());
@@ -518,7 +545,6 @@ fn top_level_mode_scan_ignores_option_values() {
         "-c",
         "select 1",
     ])));
-
     assert!(!is_psql_mode_requested(&raw_args(&[
         "afpsql",
         "--sql",
@@ -543,23 +569,117 @@ fn top_level_mode_scan_ignores_option_values() {
 fn help_output_markdown_scan_ignores_option_values() {
     let rendered = agent_first_data::cli_handle_help_or_continue(
         &raw_args(&["afpsql", "--help", "--output", "markdown"]),
-        &AfdCli::command(),
-        &agent_first_data::HelpConfig::human_cli_default(),
+        &command_for_bin("afpsql"),
+        &agent_first_data::HelpConfig::output_aware(),
     );
     assert!(
-        matches!(&rendered, Ok(Some(md)) if md.contains("# Agent-First PSQL") && md.contains("`afpsql`")),
-        "markdown help should render with the afpsql title and command name"
+        matches!(&rendered, Ok(Some(md)) if md.starts_with("# afpsql -") && md.contains("`afpsql`")),
+        "markdown help should render with the canonical afpsql command name"
     );
 
     let non_helper = agent_first_data::cli_handle_help_or_continue(
         &raw_args(&["afpsql", "--sql", "--help", "--dry-run"]),
-        &AfdCli::command(),
-        &agent_first_data::HelpConfig::human_cli_default(),
+        &command_for_bin("afpsql"),
+        &agent_first_data::HelpConfig::output_aware(),
     );
     assert!(
         matches!(non_helper, Ok(None)),
         "non-helper request should produce no help output"
     );
+}
+
+#[test]
+fn scoped_help_progressively_discloses_global_connection_arguments() {
+    let command = command_for_bin("afpsql");
+    let rendered = agent_first_data::cli_handle_help_or_continue(
+        &raw_args(&["afpsql", "inspect", "table", "--help"]),
+        &command,
+        &agent_first_data::HelpConfig::output_aware(),
+    )
+    .expect("scoped help request should be valid")
+    .expect("scoped help should render");
+    let event: Value = serde_json::from_str(&rendered).expect("scoped help must be JSON");
+    let help = &event["result"]["help"];
+    assert_eq!(help["command_path"], "afpsql inspect table");
+    assert_eq!(
+        help["inherited_arguments_from"],
+        serde_json::json!(["afpsql"])
+    );
+    assert!(help["arguments"].as_array().is_some_and(|arguments| {
+        arguments
+            .iter()
+            .any(|argument| argument["name"] == "--full")
+    }));
+    assert!(
+        !rendered.contains("--dsn-secret"),
+        "structured leaf help must not repeat global connection arguments"
+    );
+
+    let root = agent_first_data::cli_handle_help_or_continue(
+        &raw_args(&["afpsql", "--help"]),
+        &command,
+        &agent_first_data::HelpConfig::output_aware(),
+    )
+    .expect("root help request should be valid")
+    .expect("root help should render");
+    let root_event: Value = serde_json::from_str(&root).expect("root help must be JSON");
+    let root_arguments = root_event["result"]["help"]["arguments"]
+        .as_array()
+        .expect("root help arguments");
+    assert!(
+        root_arguments
+            .iter()
+            .any(|argument| { argument["name"] == "--dsn-secret" && argument["global"] == true }),
+        "root help must define global connection arguments"
+    );
+    assert!(
+        root_arguments
+            .iter()
+            .any(|argument| argument["name"] == "--host" && argument.get("short").is_none())
+    );
+
+    let plain = agent_first_data::cli_handle_help_or_continue(
+        &raw_args(&["afpsql", "inspect", "table", "--help", "--output", "plain"]),
+        &command,
+        &agent_first_data::HelpConfig::output_aware(),
+    )
+    .expect("plain scoped help request should be valid")
+    .expect("plain scoped help should render");
+    assert!(plain.contains("Usage: afpsql inspect table [OPTIONS] <NAME>"));
+    assert!(plain.contains("--dsn-secret"));
+}
+
+#[test]
+fn clap_help_pseudo_command_is_disabled() {
+    let error = command_for_bin("afpsql")
+        .try_get_matches_from(["afpsql", "help"])
+        .expect_err("help pseudo-command must be disabled");
+    assert_ne!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+}
+
+#[test]
+fn structured_help_stays_within_structural_payload_budget() {
+    for raw in [
+        raw_args(&["afpsql", "--help"]),
+        raw_args(&["afpsql", "--help", "--recursive"]),
+    ] {
+        let rendered = agent_first_data::cli_handle_help_or_continue(
+            &raw,
+            &command_for_bin("afpsql"),
+            &agent_first_data::HelpConfig::output_aware(),
+        )
+        .expect("help request should be valid")
+        .expect("help should render");
+        let event: Value = serde_json::from_str(&rendered).expect("help must be JSON");
+        let help = &event["result"]["help"];
+        let (commands, arguments) = count_help_surface(help);
+        let budget = 512 + commands * 160 + arguments * 120;
+        assert!(
+            rendered.len() < budget,
+            "help exceeded its payload budget: {} >= {budget}",
+            rendered.len()
+        );
+    }
 }
 
 #[test]
@@ -861,8 +981,6 @@ fn parse_psql_mode_all_flags_and_sql_file() {
         "host=localhost user=roger dbname=postgres".to_string(),
         "-v".to_string(),
         "1=7".to_string(),
-        "--output".to_string(),
-        "plain".to_string(),
     ];
     let mode_res = parse_psql_mode(&raw);
     assert!(mode_res.is_ok());
@@ -879,7 +997,7 @@ fn parse_psql_mode_all_flags_and_sql_file() {
             );
             assert!(req.startup_args.get("sql_file").is_none());
             assert!(req.startup_args.get("param").is_none());
-            assert!(matches!(req.output, OutputFormat::Plain));
+            assert!(matches!(req.output, OutputFormat::Json));
             assert_eq!(req.session.host.as_deref(), Some("localhost"));
             assert_eq!(req.session.user.as_deref(), Some("roger"));
             assert_eq!(req.session.dbname.as_deref(), Some("postgres"));
@@ -1464,38 +1582,28 @@ fn parse_psql_mode_stream_redirect_options_are_accepted() {
 }
 
 #[test]
-fn parse_psql_mode_long_output_accepts_format_alias() {
-    let raw = vec![
-        "afpsql".to_string(),
-        "--mode".to_string(),
-        "psql".to_string(),
-        "-c".to_string(),
-        "select 1".to_string(),
-        "--output".to_string(),
-        "json".to_string(),
-    ];
-    let mode_res = parse_psql_mode(&raw);
-    assert!(mode_res.is_ok());
-    if let Ok(Mode::Cli(req)) = mode_res {
-        assert!(matches!(req.output, OutputFormat::Json));
-    }
-}
-
-#[test]
-fn parse_psql_mode_long_output_rejects_file_paths() {
-    let raw = vec![
-        "afpsql".to_string(),
-        "--mode".to_string(),
-        "psql".to_string(),
-        "-c".to_string(),
-        "select 1".to_string(),
-        "--output".to_string(),
-        "/tmp/out.txt".to_string(),
-    ];
-    let err_res = parse_psql_mode(&raw);
-    assert!(err_res.is_err());
-    if let Err(err) = err_res {
-        assert!(err.contains("invalid --output format"), "{err}");
+fn parse_psql_mode_rejects_output_flags() {
+    for args in [
+        vec!["--output", "json"],
+        vec!["--output=json"],
+        vec!["-o", "/tmp/out.txt"],
+    ] {
+        let mut raw = vec![
+            "afpsql".to_string(),
+            "--mode".to_string(),
+            "psql".to_string(),
+            "-c".to_string(),
+            "select 1".to_string(),
+        ];
+        raw.extend(args.iter().map(|value| value.to_string()));
+        let err_res = parse_psql_mode(&raw);
+        assert!(err_res.is_err(), "{args:?} unexpectedly parsed");
+        if let Err(err) = err_res {
+            assert!(
+                err.contains("unsupported psql-mode argument"),
+                "{args:?}: {err}"
+            );
+        }
     }
 }
 

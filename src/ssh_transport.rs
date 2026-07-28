@@ -1,4 +1,7 @@
-use crate::conn::resolve_pg_config;
+use crate::conn::{
+    PostgresEndpoint, make_supported_tls, pg_config_for_tcp_tunnel, postgres_tls_server_name,
+    resolve_single_postgres_endpoint,
+};
 use crate::types::SessionConfig;
 use std::io::Read as _;
 use std::net::{TcpListener, TcpStream};
@@ -9,11 +12,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::tls::MakeTlsConnect;
+use tokio_postgres::{Client, Config};
 
 const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
-const DEFAULT_REMOTE_HOST: &str = "127.0.0.1";
-const DEFAULT_REMOTE_PORT: u16 = 5432;
 const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_READY_POLL: Duration = Duration::from_millis(50);
 const TUNNEL_READY_SETTLE: Duration = Duration::from_millis(100);
@@ -270,9 +272,10 @@ pub fn needs_stdio_bridge(cfg: &SessionConfig) -> bool {
 
 pub async fn prepare_session(
     cfg: &SessionConfig,
-) -> Result<(SessionConfig, Option<SshTunnelGuard>), String> {
+    pg_cfg: &Config,
+) -> Result<(Config, Option<SshTunnelGuard>), String> {
     let Some(settings) = resolve_ssh_settings(cfg)? else {
-        return Ok((cfg.clone(), None));
+        return Ok((pg_cfg.clone(), None));
     };
 
     if settings.sudo_user.is_some() {
@@ -281,32 +284,27 @@ pub async fn prepare_session(
     if !settings.via.is_empty() {
         return Err("--ssh-via requires SSH stdio bridge mode".to_string());
     }
-    reject_secret_conn_strings_with_ssh(cfg)?;
 
     let target = if let Some(path) = settings.remote_socket.clone() {
         TunnelTarget::UnixSocket { path }
     } else {
-        let host = effective_remote_host(cfg);
-        let port = effective_remote_port(cfg);
-        if host.starts_with('/') {
-            TunnelTarget::UnixSocket {
-                path: socket_file_from_dir(&host, port),
-            }
-        } else {
-            TunnelTarget::Tcp { host, port }
+        match resolve_single_postgres_endpoint(pg_cfg, "SSH transport")? {
+            PostgresEndpoint::Tcp { host, port } => TunnelTarget::Tcp { host, port },
+            PostgresEndpoint::UnixSocket { directory, port } => TunnelTarget::UnixSocket {
+                path: socket_file_from_dir(&directory, port),
+            },
         }
     };
     let tunnel = start_tunnel(&settings, target).await?;
 
-    let mut local_cfg = cfg.clone();
-    local_cfg.dsn_secret = None;
-    local_cfg.conninfo_secret = None;
-    local_cfg.host = Some(tunnel.local_host.clone());
-    local_cfg.port = Some(tunnel.local_port);
+    let local_cfg = pg_config_for_tcp_tunnel(pg_cfg, &tunnel.local_host, tunnel.local_port);
     Ok((local_cfg, Some(tunnel)))
 }
 
-pub async fn connect_stdio_bridge(cfg: &SessionConfig) -> Result<(Client, SshBridgeGuard), String> {
+pub async fn connect_stdio_bridge(
+    cfg: &SessionConfig,
+    pg_cfg: &Config,
+) -> Result<(Client, SshBridgeGuard), String> {
     let Some(settings) = resolve_ssh_settings(cfg)? else {
         return Err("--ssh is required for SSH stdio bridge mode".to_string());
     };
@@ -315,9 +313,9 @@ pub async fn connect_stdio_bridge(cfg: &SessionConfig) -> Result<(Client, SshBri
             "--ssh-via or --ssh-sudo-user is required for SSH stdio bridge mode".to_string(),
         );
     }
-    reject_secret_conn_strings_with_ssh(cfg)?;
 
-    let target = bridge_target(&settings, cfg)?;
+    let endpoint = resolve_single_postgres_endpoint(pg_cfg, "SSH transport")?;
+    let target = bridge_target(&settings, &endpoint)?;
     let command = remote_stream_bridge_command(&settings, &target);
     let args = build_bridge_ssh_args(&settings, &command);
     let mut child = tokio::process::Command::new("ssh")
@@ -343,9 +341,14 @@ pub async fn connect_stdio_bridge(cfg: &SessionConfig) -> Result<(Client, SshBri
         .take()
         .ok_or_else(|| "start ssh bridge failed: stdout pipe unavailable".to_string())?;
     let stream = SshStdioStream { stdout, stdin };
-    let pg_cfg =
-        resolve_pg_config(cfg).map_err(|e| format!("invalid bridge connection config: {e}"))?;
-    let (client, connection) = match pg_cfg.connect_raw(stream, NoTls).await {
+    let mut tls = make_supported_tls().map_err(|e| format!("create TLS connector failed: {e}"))?;
+    let tls =
+        <postgres_native_tls::MakeTlsConnector as MakeTlsConnect<SshStdioStream>>::make_tls_connect(
+            &mut tls,
+            postgres_tls_server_name(pg_cfg),
+        )
+        .map_err(|e| format!("create PostgreSQL TLS stream failed: {e}"))?;
+    let (client, connection) = match pg_cfg.connect_raw(stream, tls).await {
         Ok(connection) => connection,
         Err(e) => {
             let status = match tokio::time::timeout(Duration::from_millis(100), child.wait()).await
@@ -381,9 +384,12 @@ enum BridgeTarget {
     UnixSocket { paths: Vec<String> },
 }
 
-fn bridge_target(settings: &SshSettings, cfg: &SessionConfig) -> Result<BridgeTarget, String> {
+fn bridge_target(
+    settings: &SshSettings,
+    endpoint: &PostgresEndpoint,
+) -> Result<BridgeTarget, String> {
     if settings.sudo_user.is_some() {
-        return bridge_socket_candidates(settings, cfg)
+        return bridge_socket_candidates(settings, endpoint)
             .map(|paths| BridgeTarget::UnixSocket { paths });
     }
     if let Some(remote_socket) = settings.remote_socket.clone() {
@@ -391,14 +397,14 @@ fn bridge_target(settings: &SshSettings, cfg: &SessionConfig) -> Result<BridgeTa
             paths: vec![remote_socket],
         });
     }
-    let host = effective_remote_host(cfg);
-    let port = effective_remote_port(cfg);
-    if host.starts_with('/') {
-        Ok(BridgeTarget::UnixSocket {
-            paths: vec![socket_file_from_dir(&host, port)],
-        })
-    } else {
-        Ok(BridgeTarget::Tcp { host, port })
+    match endpoint {
+        PostgresEndpoint::Tcp { host, port } => Ok(BridgeTarget::Tcp {
+            host: host.clone(),
+            port: *port,
+        }),
+        PostgresEndpoint::UnixSocket { directory, port } => Ok(BridgeTarget::UnixSocket {
+            paths: vec![socket_file_from_dir(directory, *port)],
+        }),
     }
 }
 
@@ -408,16 +414,14 @@ fn socket_file_from_dir(dir: &str, port: u16) -> String {
 
 fn bridge_socket_candidates(
     settings: &SshSettings,
-    cfg: &SessionConfig,
+    endpoint: &PostgresEndpoint,
 ) -> Result<Vec<String>, String> {
     if let Some(remote_socket) = settings.remote_socket.clone() {
         return Ok(vec![remote_socket]);
     }
 
-    let host = effective_remote_host(cfg);
-    let port = effective_remote_port(cfg);
-    if host.starts_with('/') {
-        return Ok(vec![socket_file_from_dir(&host, port)]);
+    if let PostgresEndpoint::UnixSocket { directory, port } = endpoint {
+        return Ok(vec![socket_file_from_dir(directory, *port)]);
     }
 
     Err("--ssh-sudo-user requires an explicit remote PostgreSQL Unix socket".to_string())
@@ -560,47 +564,6 @@ fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, Stri
         remote_socket: cfg.ssh.remote_socket.clone(),
         sudo_user: cfg.ssh.sudo_user.clone(),
     }))
-}
-
-fn reject_secret_conn_strings_with_ssh(cfg: &SessionConfig) -> Result<(), String> {
-    if cfg.dsn_secret.is_some()
-        || cfg.conninfo_secret.is_some()
-        || env_nonempty("AFPSQL_DSN_SECRET").is_some()
-        || env_nonempty("AFPSQL_CONNINFO_SECRET").is_some()
-    {
-        return Err("SSH transport currently supports discrete connection fields only; use --host/--port/--user/--dbname/--password-secret-env instead of --dsn-secret or --conninfo-secret".to_string());
-    }
-    Ok(())
-}
-
-fn effective_remote_host(cfg: &SessionConfig) -> String {
-    cfg.host
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_HOST"))
-        .or_else(|| env_nonempty("PGHOST"))
-        .unwrap_or_else(|| DEFAULT_REMOTE_HOST.to_string())
-}
-
-fn effective_remote_port(cfg: &SessionConfig) -> u16 {
-    cfg.port
-        .or_else(|| env_u16("AFPSQL_PORT").and_then(Result::ok))
-        .or_else(|| env_u16("PGPORT").and_then(Result::ok))
-        .unwrap_or(DEFAULT_REMOTE_PORT)
-}
-
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn env_u16(name: &str) -> Option<Result<u16, String>> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<u16>()
-                .map_err(|_| format!("{name} must be a valid TCP port"))
-        })
 }
 
 fn build_tunnel_ssh_args(
@@ -908,16 +871,12 @@ mod tests {
             remote_socket: None,
             sudo_user: Some("postgres".to_string()),
         };
-        let cfg = SessionConfig {
-            ssh: crate::types::SshConfig {
-                destination: Some("user@example.com".to_string()),
-                sudo_user: Some("postgres".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
+        let endpoint = PostgresEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
         };
 
-        let Err(err) = bridge_socket_candidates(&settings, &cfg) else {
+        let Err(err) = bridge_socket_candidates(&settings, &endpoint) else {
             return Err("expected explicit socket error".to_string());
         };
         assert!(err.contains("explicit remote PostgreSQL Unix socket"));
@@ -935,9 +894,12 @@ mod tests {
             remote_socket: Some("/custom/.s.PGSQL.6543".to_string()),
             sudo_user: Some("postgres".to_string()),
         };
-        let cfg = SessionConfig::default();
+        let endpoint = PostgresEndpoint::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+        };
         assert_eq!(
-            bridge_socket_candidates(&explicit_settings, &cfg)?,
+            bridge_socket_candidates(&explicit_settings, &endpoint)?,
             vec!["/custom/.s.PGSQL.6543".to_string()]
         );
 
@@ -950,13 +912,12 @@ mod tests {
             remote_socket: None,
             sudo_user: Some("postgres".to_string()),
         };
-        let cfg = SessionConfig {
-            host: Some("/run/postgresql".to_string()),
-            port: Some(5433),
-            ..Default::default()
+        let endpoint = PostgresEndpoint::UnixSocket {
+            directory: "/run/postgresql".to_string(),
+            port: 5433,
         };
         assert_eq!(
-            bridge_socket_candidates(&dir_settings, &cfg)?,
+            bridge_socket_candidates(&dir_settings, &endpoint)?,
             vec!["/run/postgresql/.s.PGSQL.5433".to_string()]
         );
         Ok(())

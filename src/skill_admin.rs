@@ -17,9 +17,9 @@ const SPEC: SkillSpec = SkillSpec {
 
 pub fn run(req: SkillAdminRequest) -> i32 {
     let (action, options) = split_action(req.action);
-    let stdout = std::io::stdout();
     let mut emitter =
-        agent_first_data::CliEmitter::new(stdout.lock(), req.output).with_strict_protocol();
+        agent_first_data::CliEmitter::from_output_to(crate::emit::output_to(), req.output)
+            .with_strict_protocol();
     match skill::run_skill_admin(&SPEC, action, &options) {
         Ok(report) => match serde_json::to_value(&report) {
             Ok(value) => match emitter.emit_result(value) {

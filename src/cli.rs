@@ -1,9 +1,11 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
 use crate::secret_config::{SecretConfigRef, resolve_config_secret};
 use crate::types::{ContainerConfig, Permission, QueryOptions, SessionConfig, SshConfig};
-use agent_first_data::{LogFilters, OutputFormat, cli_parse_log_filters, cli_parse_output};
+use agent_first_data::{
+    LogFilters, OutputFormat, OutputTo, cli_parse_log_filters, cli_parse_output,
+};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -296,15 +298,16 @@ struct SkillWriteArgs {
     force: bool,
 }
 
-#[doc = r#"`afpsql` gives agents a reliable PostgreSQL contract: structured stdout
-events, first-class SSH/container transports, explicit write permissions,
+#[doc = r#"`afpsql` gives agents a reliable PostgreSQL contract: structured
+AFDATA events, first-class SSH/container transports, explicit write permissions,
 stable pipe sessions, and machine-readable failures.
 
 ### Interface Policy
 
 - default mode is canonical agent-first CLI
 - `--mode psql` is argument translation only; runtime output stays JSONL
-- stdout carries protocol events; stderr is not a protocol channel
+- `--output-to split` sends results to stdout and errors/logs/progress to stderr
+- `--output-to stdout|stderr` selects one ordered event stream
 - native CLI and pipe mode default to read-only transactions; writes require permission
 - SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
@@ -328,6 +331,8 @@ stable pipe sessions, and machine-readable failures.
 - every `*-secret` flag has a `*-secret-env` partner that reads the value from a named environment variable
 - every secret slot also has a `*-secret-config FILE DOT_PATH` source for JSON, TOML, YAML, or dotenv
 - add `--ssh user@server` when PostgreSQL is reachable only from the server boundary
+- with `--ssh`, DSN/conninfo endpoints are interpreted from the final SSH host and secrets stay local
+- SSH and container transports currently require one PostgreSQL endpoint, not a multi-host failover list
 - add `--container TARGET` when PostgreSQL is reachable only from inside a container boundary
 - use named container scope flags instead of raw driver option passthrough
 - use `--container-driver docker|podman|nerdctl|compose|kubectl` for the exec syntax
@@ -349,7 +354,7 @@ afpsql --sql-file ./query.sql
 afpsql --sql 'select * from users where id = $1' --param 1=123
 afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
 afpsql --dsn-secret-config config.yaml database.url --sql "select 1"
-afpsql --ssh user@server --host 127.0.0.1 --port 5432 --user app --dbname appdb --sql "select 1"
+afpsql --ssh user@server --dsn-secret-config config.yaml database.url --sql "select 1"
 afpsql --container pg-container --dsn-secret-env DATABASE_URL --sql "select 1"
 afpsql --ssh root@server --container app --host host.container.internal --port 5432 --user app --dbname appdb --sql "select 1"
 afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
@@ -371,9 +376,11 @@ afpsql skill install
 #[command(
     name = env!("DISPLAY_NAME"),
     bin_name = "afpsql",
-    version,
     verbatim_doc_comment,
     about = env!("CARGO_PKG_DESCRIPTION"),
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true,
 )]
 pub struct AfdCli {
     /// Inline SQL string to execute.
@@ -385,7 +392,9 @@ pub struct AfdCli {
     /// Positional bind parameter in `N=value` form. Repeat for additional parameters.
     #[arg(long = "param", help_heading = "Query")]
     param: Vec<String>,
-    /// Stream large result sets as `result_rows` batches instead of a single inline result.
+    /// Stream large results as `result_rows` batches.
+    ///
+    /// Avoids buffering one large inline result.
     #[arg(long = "stream-rows", help_heading = "Query")]
     stream_rows: bool,
     /// Maximum rows per streamed batch.
@@ -406,8 +415,10 @@ pub struct AfdCli {
     /// Maximum inline payload bytes before returning `result_too_large`.
     #[arg(long = "inline-max-bytes", help_heading = "Query")]
     inline_max_bytes: Option<usize>,
-    /// Query permission. Defaults to read, ssh-read with --ssh, or
-    /// container-read with --container.
+    /// Query permission policy.
+    ///
+    /// Defaults to read, ssh-read with --ssh, or container-read with
+    /// --container.
     #[arg(long = "permission", value_enum, help_heading = "Query")]
     permission: Option<Permission>,
     /// Preview the query without executing it
@@ -421,8 +432,10 @@ pub struct AfdCli {
         conflicts_with = "explain_analyze"
     )]
     explain: bool,
-    /// Wrap the query in EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS). The underlying
-    /// SQL actually runs; writes require the matching write permission.
+    /// Run EXPLAIN ANALYZE with JSON and buffer metrics.
+    ///
+    /// The underlying SQL actually runs; writes require the matching write
+    /// permission.
     #[arg(long = "explain-analyze", help_heading = "Query")]
     explain_analyze: bool,
 
@@ -604,14 +617,16 @@ pub struct AfdCli {
     container_pod_container: Option<String>,
 
     /// Output format: json (default), yaml, or plain.
+    #[arg(long, default_value = "json", global = true, help_heading = "Runtime")]
+    output: String,
+    /// Output routing: split (default), stdout, or stderr.
     #[arg(
-        long,
-        short = 'o',
-        default_value = "json",
+        long = "output-to",
+        default_value = "split",
         global = true,
         help_heading = "Runtime"
     )]
-    output: String,
+    output_to: String,
     /// Redirect stdout bytes to this file.
     #[arg(
         long = "stdout-file",
@@ -628,9 +643,10 @@ pub struct AfdCli {
         help_heading = "Runtime"
     )]
     stderr_file: Option<String>,
-    /// Diagnostic log categories (comma-separated). Categories: startup,
-    /// connect, query, transport, mode; or an exact event name like
-    /// `query.error`; or `all` for everything.
+    /// Diagnostic log filters (comma-separated).
+    ///
+    /// Use startup, connect, query, transport, mode, an exact event such as
+    /// `query.error`, or `all`.
     #[arg(
         long = "log",
         value_delimiter = ',',
@@ -657,41 +673,22 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
         "unknown" => None,
         sha => Some(sha),
     };
-    match agent_first_data::cli_handle_version_or_continue(
+    match agent_first_data::cli_handle_version_or_help_or_continue(
         &raw,
         &command_for_bin(bin_name),
+        &agent_first_data::HelpConfig::output_aware(),
         bin_name,
         Some(env!("DISPLAY_NAME")),
         env!("CARGO_PKG_VERSION"),
         build,
     ) {
-        Ok(Some(version)) => {
-            let _ = write!(std::io::stdout(), "{version}");
+        Ok(Some(rendered)) => {
+            let _ = crate::emit::write_result_text(&rendered);
             std::process::exit(0);
         }
         Ok(None) => {}
         Err(err) => {
-            let stdout = std::io::stdout();
-            let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), OutputFormat::Json);
-            let _ = emitter.emit_error("cli_error", &err.to_string());
-            std::process::exit(2);
-        }
-    }
-
-    match agent_first_data::cli_handle_help_or_continue(
-        &raw,
-        &command_for_bin(bin_name),
-        &agent_first_data::HelpConfig::human_cli_default(),
-    ) {
-        Ok(Some(help)) => {
-            let _ = write!(std::io::stdout(), "{help}");
-            std::process::exit(0);
-        }
-        Ok(None) => {}
-        Err(err) => {
-            let stdout = std::io::stdout();
-            let mut emitter = agent_first_data::CliEmitter::new(stdout.lock(), OutputFormat::Json);
-            let _ = emitter.emit_error("cli_error", &err.to_string());
+            let _ = crate::emit::emit_value(err, OutputFormat::Json);
             std::process::exit(2);
         }
     }
@@ -704,7 +701,7 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
         Err(e) => {
             use clap::error::ErrorKind;
             if matches!(e.kind(), ErrorKind::DisplayVersion | ErrorKind::DisplayHelp) {
-                let _ = writeln!(std::io::stdout(), "{e}");
+                let _ = crate::emit::write_result_text(&e.to_string());
                 std::process::exit(0);
             }
             return Err(e.to_string());
@@ -712,6 +709,7 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
     };
     let _stream_redirect_args = (&cli.stdout_file, &cli.stderr_file);
     let output = parse_output(&cli.output)?;
+    let _output_to = OutputTo::parse(&cli.output_to)?;
     let log = parse_log_categories(&cli.log);
     let dsn_config = SecretConfigRef::from_values("--dsn-secret-config", cli.dsn_secret_config)?;
     let conninfo_config =
@@ -1363,13 +1361,13 @@ fn parse_psql_long_arg(
                 Some(take_long_arg_value(raw, i, "--container-pod-container")?);
             Ok(())
         }
-        "--output" => {
-            let value = take_long_arg_value(raw, i, "--output")?;
-            state.output = parse_output(&value)?;
-            Ok(())
-        }
         "--stdout-file" | "--stderr-file" => {
             let _ = take_long_arg_value(raw, i, long_name(arg))?;
+            Ok(())
+        }
+        "--output-to" => {
+            let value = take_long_arg_value(raw, i, "--output-to")?;
+            let _ = OutputTo::parse(&value)?;
             Ok(())
         }
         "--log" => {
@@ -1431,11 +1429,6 @@ fn parse_psql_short_arg(
             }
             'F' | 'P' | 'R' | 'T' => {
                 let _ = take_short_arg_value(raw, i, arg, offset, &format!("-{flag}"))?;
-                return Ok(());
-            }
-            'o' => {
-                let value = take_short_arg_value(raw, i, arg, offset, "-o")?;
-                state.output = parse_output(&value)?;
                 return Ok(());
             }
             'l' => state.list_databases = true,
@@ -1632,23 +1625,22 @@ fn psql_list_databases_sql() -> String {
 }
 
 fn emit_psql_mode_version() {
-    let _ = writeln!(
-        std::io::stdout(),
-        "psql (afpsql wrapper) {}",
+    let _ = crate::emit::write_result_text(&format!(
+        "psql (afpsql wrapper) {}\n",
         env!("CARGO_PKG_VERSION")
-    );
+    ));
 }
 
 fn emit_psql_mode_help() {
-    let _ = writeln!(
-        std::io::stdout(),
+    let _ = crate::emit::write_result_text(&format!(
         "psql (afpsql wrapper) {}\n\
 Usage:\n  psql [OPTION]... [DBNAME [USERNAME]]\n\n\
 Supported non-interactive forms:\n  -c, --command=SQL\n  -f, --file=FILE\n  -l, --list\n  -h/-p/-U/-d and --host/--port/--username/--dbname\n  -v N=value, --set N=value for positional bind parameters\n\n\
-Output:\n  -o, --output=json|yaml|plain changes afpsql rendering\n  --stdout-file=FILE redirects stdout bytes to FILE\n  --stderr-file=FILE redirects stderr bytes to FILE\n\n\
+Output:\n  --stdout-file=FILE redirects stdout bytes to FILE\n  --stderr-file=FILE redirects stderr bytes to FILE\n\n\
+  --output-to=split|stdout|stderr selects AFDATA event routing\n\n\
 Human-interactive psql modes and psql meta-commands are not supported by this wrapper.",
         env!("CARGO_PKG_VERSION")
-    );
+    ));
 }
 
 fn psql_admin_action(action: PsqlCliAction) -> PsqlAdminAction {

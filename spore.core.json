@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,15 +13,21 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Emit afpsql/afpsql-readonly --version as an AFDATA protocol-v1 JSON event (name, display_name, version, build) via a clap-introspecting pre-parser instead of plain version text.",
-    "Stamp the build commit SHA into the version's build field via build.rs, falling back to \"unknown\" for crates.io tarball builds with no reachable git.",
-    "Upgrade to agent-first-data 0.22, adopting the SkillSpec assets field in the skill-admin bundle.",
-    "Keep the embedded skill model-invocable by dropping disable-model-invocation from the skill template."
+    "Accept --dsn-secret and --conninfo-secret with --ssh and --container: afpsql parses the connection string locally in-process and derives the transport's internal PostgreSQL endpoint from it, so agents never split or reveal a DSN in shell code",
+    "Preserve the full parsed connection across an SSH tunnel — authentication, database, startup options, timeouts, keepalives, channel binding and TLS settings survive the local port forward, with the original hostname retained for PostgreSQL TLS",
+    "Encrypt the SSH stdio bridge connection with the same supported TLS modes instead of forcing an unencrypted connection",
+    "Reject a DSN or conninfo that resolves to a multi-host failover list under SSH/container transport with an explicit single-endpoint error and a recovery hint instead of silently picking one target",
+    "Add --output-to split|stdout|stderr, defaulting to split (results on stdout; errors, logs and progress on stderr), resolved before argument parsing so startup failures, --help and --version honor it too",
+    "Drop short aliases from the canonical CLI surface (-h, -V, -o), confining psql-compatible shorts to --mode psql and the managed psql wrapper",
+    "Reject psql's -o and --output output-file flags in psql mode instead of silently reinterpreting them as afpsql's rendering format",
+    "Delegate --help and --version to Agent-First Data's unified handler, emitting a structured version event and removing the auto-generated help subcommand",
+    "Rename runtime config secret metadata fields to config_file_path and dot_path to match the Agent-First Data naming convention",
+    "Upgrade to agent-first-data 0.26.1"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.eDai9QqMqX9gR8Fayep7D2HiWCtLd4EW8o8UtwDgCaQ",
+      "uri": "cmn://agentfirstkit.com/b3.3JvaoXaDbsCT6z16jtvCD1oGrPZEsEXGn6g1CWqKCpJF",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

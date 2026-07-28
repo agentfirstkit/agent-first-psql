@@ -7,8 +7,7 @@ pub async fn writer_task(
     format: OutputFormat,
 ) -> Result<(), agent_first_data::CliEmitterError> {
     while let Some(output) = rx.recv().await {
-        let stdout = std::io::stdout();
-        crate::output_fmt::emit_output(stdout.lock(), &output, format)?;
+        crate::emit::emit_output(&output, format)?;
     }
     Ok(())
 }

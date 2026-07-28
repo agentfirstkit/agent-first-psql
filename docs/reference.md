@@ -1,13 +1,14 @@
 # Agent-First PSQL — Protocol Reference
 
-Every stdin line is one JSON object tagged by a required `code`. Every stdout
+Every stdin line is one JSON object tagged by a required `code`. Every emitted
 line is an Agent-First Data envelope tagged by a top-level `kind`; see
-[Output (stdout)](#output-stdout) for the envelope shape.
+[Output](#output) for the envelope shape.
 
 - pipe mode: full protocol with `id` correlation
 - CLI mode: same event schema, `id` may be omitted in display output
-- protocol events are emitted on `stdout` only
-- `stderr` is not part of the runtime protocol contract
+- `--output-to split` sends results to stdout and errors/logs/progress to stderr
+- `--output-to stdout|stderr` sends every event to one ordered stream; use a
+  unified stream for pipe mode when cross-kind ordering matters
 
 ## Interface Boundary
 
@@ -19,7 +20,7 @@ This protocol is the only runtime interface.
 
 Agent-facing reliability guarantees:
 
-- recoverable runtime conditions are stdout events, not stderr prose
+- recoverable runtime conditions are structured events, not ad-hoc prose
 - native CLI and pipe writes require explicit permission
 - pipe named sessions execute FIFO and are intended to preserve PostgreSQL
   backend session state until invalidation or shutdown
@@ -47,7 +48,7 @@ a general local-process sandbox.
 | SSH options and custom container runtime | allowed on the ordinary entrypoint |
 | transaction control sent as query SQL | `invalid_request`; use typed pipe transaction requests |
 
-Every readonly rejection is a structured stdout error with
+Every readonly rejection is a structured error event with
 `error.code: "invalid_request"` and a hint directing write work to `afpsql`.
 The client transaction is a safety belt, not an adversarial SQL sandbox. A
 whitelist for the ordinary executable grants caller-selected local file and env
@@ -236,14 +237,19 @@ libpq TLS modes/options such as `verify-ca`, `verify-full`, `sslrootcert`,
 `sslcert`, and `sslkey` fail with structured errors and hints.
 
 SSH transport fields start a local OpenSSH tunnel or Unix-socket bridge before
-connecting. They currently expect discrete connection fields rather than
-`dsn_secret` or `conninfo_secret`.
+connecting. SSH accepts `dsn_secret`, `conninfo_secret`, or discrete connection
+fields. afpsql parses DSN/conninfo locally, interprets its PostgreSQL endpoint
+from the final SSH host, and preserves authentication, database, startup-option,
+and supported TLS settings when connecting through the tunnel. The source must
+resolve to one PostgreSQL host and port; multi-host failover lists return a
+structured non-retryable connection error.
 
 Container transport fields start a no-TTY exec bridge through the selected
 driver (`docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a small
 stdio bridge inside the container. The PostgreSQL host/port or Unix socket is
 interpreted inside the container. Container transport can use `dsn_secret`,
-`conninfo_secret`, or discrete connection fields.
+`conninfo_secret`, or discrete connection fields and likewise requires one
+PostgreSQL endpoint.
 
 Container driver scope is configured with named fields, not raw argv
 passthrough: `container_context` applies to Docker and kubectl,
@@ -348,10 +354,11 @@ losing prior progress. Send `rollback` to discard the whole transaction or
 Tx control runs through the same session FIFO as `query`, so the order an
 agent writes events to stdin is the order PostgreSQL sees them.
 
-## Output (stdout)
+## Output
 
-Every stdout line is an Agent-First Data envelope: a top-level `kind` with the
+Every output line is an Agent-First Data envelope: a top-level `kind` with the
 event payload nested under the matching key, and `trace` as a top-level sibling.
+The selected `--output-to` policy determines which process stream carries it.
 
 ```json
 {"kind": "result", "result": { ...payload... }, "trace": { ...timing... }}

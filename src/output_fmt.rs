@@ -1,7 +1,7 @@
 use crate::types::Output;
 use agent_first_data::{
-    CliEmitter, CliEmitterError, OutputFormat, OutputOptions, PlainStyle, ProtocolViolation,
-    RedactionPolicy, Redactor,
+    CliEmitter, CliEmitterError, OutputFormat, OutputOptions, OutputTo, PlainStyle,
+    ProtocolViolation, RedactionPolicy, Redactor,
 };
 use serde_json::Value;
 use std::io::Write;
@@ -25,6 +25,26 @@ pub fn emit_output<W: Write>(
     out: &Output,
     format: OutputFormat,
 ) -> Result<(), CliEmitterError> {
+    let emitter = CliEmitter::with_options(writer, format, output_options_for_output(out))
+        .with_strict_protocol();
+    emit_output_with_emitter(out, emitter)
+}
+
+pub fn emit_process_output(
+    out: &Output,
+    format: OutputFormat,
+    output_to: OutputTo,
+) -> Result<(), CliEmitterError> {
+    let emitter =
+        CliEmitter::from_output_to_with(output_to, format, output_options_for_output(out))
+            .with_strict_protocol();
+    emit_output_with_emitter(out, emitter)
+}
+
+fn emit_output_with_emitter<W: Write>(
+    out: &Output,
+    mut emitter: CliEmitter<W>,
+) -> Result<(), CliEmitterError> {
     let mut value = serde_json::to_value(out).map_err(|error| {
         CliEmitterError::Validation(ProtocolViolation {
             rule: "output_serialization_failed",
@@ -44,8 +64,6 @@ pub fn emit_output<W: Write>(
     if let Value::Object(fields) = &mut value {
         fields.remove("trace");
     }
-    let mut emitter = CliEmitter::with_options(writer, format, output_options_for_output(out))
-        .with_strict_protocol();
     match code.as_str() {
         "log" => {
             let timestamp_epoch_ms = std::time::SystemTime::now()

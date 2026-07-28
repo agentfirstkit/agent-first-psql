@@ -1,4 +1,4 @@
-use crate::conn::resolve_pg_config;
+use crate::conn::{PostgresEndpoint, resolve_pg_config, resolve_single_postgres_endpoint};
 use crate::db::ConnectError;
 use crate::types::SessionConfig;
 use std::pin::Pin;
@@ -10,12 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::oneshot;
-use tokio_postgres::config::Host;
 use tokio_postgres::{Client, NoTls};
 
 const DEFAULT_DRIVER: &str = "docker";
-const DEFAULT_REMOTE_HOST: &str = "127.0.0.1";
-const DEFAULT_REMOTE_PORT: u16 = 5432;
 const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
 const STDERR_HINT_BYTES: usize = 512;
 const BRIDGE_READY_PREFIX: &str = "AFPSQL_BRIDGE_OK";
@@ -817,35 +814,10 @@ fn reject_nonempty<T>(value: &[T], message: &str) -> Result<(), String> {
 fn resolve_container_target(cfg: &SessionConfig) -> Result<ContainerTarget, String> {
     let pg_cfg =
         resolve_pg_config(cfg).map_err(|e| format!("invalid container connection config: {e}"))?;
-    let hosts = pg_cfg.get_hosts();
-    if hosts.len() > 1 {
-        return Err("container transport supports a single PostgreSQL host".to_string());
-    }
-    let ports = pg_cfg.get_ports();
-    if ports.len() > 1 {
-        return Err("container transport supports a single PostgreSQL port".to_string());
-    }
-    let port = ports.first().copied().unwrap_or(DEFAULT_REMOTE_PORT);
-    match hosts.first() {
-        Some(Host::Tcp(host)) => {
-            if host.starts_with('/') {
-                Ok(ContainerTarget::UnixSocket {
-                    path: socket_file_from_dir(host, port),
-                })
-            } else {
-                Ok(ContainerTarget::Tcp {
-                    host: host.clone(),
-                    port,
-                })
-            }
-        }
-        #[cfg(unix)]
-        Some(Host::Unix(path)) => Ok(ContainerTarget::UnixSocket {
-            path: socket_file_from_dir(&path.to_string_lossy(), port),
-        }),
-        None => Ok(ContainerTarget::Tcp {
-            host: DEFAULT_REMOTE_HOST.to_string(),
-            port,
+    match resolve_single_postgres_endpoint(&pg_cfg, "container transport")? {
+        PostgresEndpoint::Tcp { host, port } => Ok(ContainerTarget::Tcp { host, port }),
+        PostgresEndpoint::UnixSocket { directory, port } => Ok(ContainerTarget::UnixSocket {
+            path: socket_file_from_dir(&directory, port),
         }),
     }
 }

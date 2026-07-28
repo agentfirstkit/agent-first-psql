@@ -6,7 +6,6 @@ use crate::logutil::build_startup_log;
 use crate::protocol::log_event;
 use crate::types::{Output, QueryOptions, RuntimeConfig, Trace};
 use agent_first_data::OutputFormat;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
@@ -30,8 +29,7 @@ pub async fn run(
         psql_mode,
     } = req;
 
-    let stdout = std::io::stdout();
-    let mut sink = CliOutputSink::new(stdout.lock(), output_format);
+    let mut sink = CliOutputSink::new(output_format);
 
     let config = RuntimeConfig::default();
     let (tx, mut rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
@@ -170,18 +168,17 @@ pub async fn run(
     std::process::exit(if had_error { 1 } else { 0 });
 }
 
-struct CliOutputSink<W: Write> {
-    writer: W,
+struct CliOutputSink {
     format: OutputFormat,
 }
 
-impl<W: Write> CliOutputSink<W> {
-    fn new(writer: W, format: OutputFormat) -> Self {
-        Self { writer, format }
+impl CliOutputSink {
+    fn new(format: OutputFormat) -> Self {
+        Self { format }
     }
 
     fn emit(&mut self, out: &Output) -> Result<(), agent_first_data::CliEmitterError> {
-        crate::output_fmt::emit_output(&mut self.writer, out, self.format)
+        crate::emit::emit_output(out, self.format)
     }
 }
 

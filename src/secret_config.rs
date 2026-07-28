@@ -29,8 +29,8 @@ impl SecretConfigRef {
     pub fn safe_metadata(&self) -> serde_json::Value {
         serde_json::json!({
             "kind": "config",
-            "file": self.file,
-            "path": self.path,
+            "config_file_path": self.file,
+            "dot_path": self.path,
         })
     }
 }
