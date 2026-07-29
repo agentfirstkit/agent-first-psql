@@ -39,6 +39,9 @@ fn psql_mode_all_translation_paths() {
     let path = std::env::temp_dir().join(format!("afpsql_cov_{}.sql", std::process::id()));
     std::fs::write(&path, "select $1::int as n").expect("write temp sql");
 
+    // psql mode deliberately does not translate `-o`/`--output`: in psql those
+    // name an output file, while canonical afpsql's `--output` selects the
+    // rendering format.
     let mut cmd = Command::new(bin());
     cmd.arg("--mode")
         .arg("psql")
@@ -47,20 +50,22 @@ fn psql_mode_all_translation_paths() {
         .arg("-f")
         .arg(path.to_string_lossy().to_string())
         .arg("-v")
-        .arg("1=9")
-        .arg("--output")
-        .arg("json");
-    let (code, stdout, _stderr) = run(cmd);
-    assert_eq!(code, 0);
+        .arg("1=9");
+    let (code, stdout, stderr) = run(cmd);
+    assert_eq!(code, 0, "stderr: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("json output");
     agent_first_data::validate_protocol_event(&v, true).expect("strict AFDATA event");
     assert_eq!(v["result"]["rows"][0]["n"], 9);
 
     let mut bad = Command::new(bin());
     bad.arg("--mode").arg("psql").arg("--bad");
-    let (code, stdout, _) = run(bad);
+    let (code, stdout, stderr) = run(bad);
     assert_eq!(code, 2);
-    assert!(stdout.contains("unsupported psql-mode argument"));
+    assert!(stdout.trim().is_empty(), "stdout: {stdout}");
+    assert!(
+        stderr.contains("unsupported psql-mode argument"),
+        "{stderr}"
+    );
 
     let _ = std::fs::remove_file(path);
 }
@@ -179,7 +184,9 @@ fn has_session_override_each_field_in_pipe_mode() {
     ignore = "requires PostgreSQL test database"
 )]
 #[test]
-fn cli_emits_structured_stdout_log_events_when_enabled() {
+fn cli_emits_structured_log_events_on_the_diagnostic_stream() {
+    // A finite query splits by kind: the result payload is what the caller
+    // captures from stdout, while logs are diagnostics and stay off it.
     let mut cmd = Command::new(bin());
     cmd.arg("--dsn-secret")
         .arg(test_dsn())
@@ -188,13 +195,14 @@ fn cli_emits_structured_stdout_log_events_when_enabled() {
         .arg("--sql")
         .arg("select 1 as n");
     let (code, stdout, stderr) = run(cmd);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("\"kind\":\"result\""));
-    assert!(stdout.contains("\"kind\":\"log\""));
-    assert!(stdout.contains("\"event\":\"query.result\""));
-    assert!(!stdout.contains("\"event\":\"startup\""));
-    assert!(stdout.contains("\"duration_ms\""));
-    assert!(stderr.trim().is_empty());
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("\"kind\":\"result\""), "{stdout}");
+    assert!(stdout.contains("\"duration_ms\""), "{stdout}");
+    assert!(!stdout.contains("\"kind\":\"log\""), "{stdout}");
+
+    assert!(stderr.contains("\"kind\":\"log\""), "{stderr}");
+    assert!(stderr.contains("\"event\":\"query.result\""), "{stderr}");
+    assert!(!stderr.contains("\"event\":\"startup\""), "{stderr}");
 }
 
 #[cfg_attr(

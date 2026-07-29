@@ -52,11 +52,20 @@ pub fn resolve_session_name(cfg: &RuntimeConfig, requested: Option<&str>) -> Str
 }
 
 pub fn resolve_pg_config(cfg: &SessionConfig) -> Result<Config, ConnectionConfigError> {
-    if let Some(dsn) = cfg
-        .dsn_secret
-        .clone()
-        .or_else(|| std::env::var("AFPSQL_DSN_SECRET").ok())
-    {
+    // An administrator-locked readonly profile pins the endpoint, and the CLI
+    // already rejects every connection flag. Environment variables were the one
+    // remaining way to move such an executable off its target, so a pinned
+    // session reads none of them — including PGSSLMODE, which would otherwise
+    // let a caller downgrade TLS on a connection it does not control.
+    let env = |name: &str| {
+        if cfg.profile_pinned {
+            None
+        } else {
+            env_nonempty(name)
+        }
+    };
+
+    if let Some(dsn) = cfg.dsn_secret.clone().or_else(|| env("AFPSQL_DSN_SECRET")) {
         validate_dsn_ssl_options(&dsn)?;
         return dsn.parse().map_err(|e| map_pg_config_parse_error("dsn", e));
     }
@@ -64,7 +73,7 @@ pub fn resolve_pg_config(cfg: &SessionConfig) -> Result<Config, ConnectionConfig
     if let Some(conninfo) = cfg
         .conninfo_secret
         .clone()
-        .or_else(|| std::env::var("AFPSQL_CONNINFO_SECRET").ok())
+        .or_else(|| env("AFPSQL_CONNINFO_SECRET"))
     {
         validate_conninfo_ssl_options(&conninfo)?;
         return conninfo
@@ -75,42 +84,38 @@ pub fn resolve_pg_config(cfg: &SessionConfig) -> Result<Config, ConnectionConfig
     let host = cfg
         .host
         .clone()
-        .or_else(|| std::env::var("AFPSQL_HOST").ok())
-        .or_else(|| std::env::var("PGHOST").ok())
+        .or_else(|| env("AFPSQL_HOST"))
+        .or_else(|| env("PGHOST"))
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = cfg
         .port
-        .or_else(|| {
-            std::env::var("AFPSQL_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-        })
-        .or_else(|| std::env::var("PGPORT").ok().and_then(|s| s.parse().ok()))
+        .or_else(|| env("AFPSQL_PORT").and_then(|s| s.parse().ok()))
+        .or_else(|| env("PGPORT").and_then(|s| s.parse().ok()))
         .unwrap_or(5432);
     let user = cfg
         .user
         .clone()
-        .or_else(|| std::env::var("AFPSQL_USER").ok())
-        .or_else(|| std::env::var("PGUSER").ok())
+        .or_else(|| env("AFPSQL_USER"))
+        .or_else(|| env("PGUSER"))
         .unwrap_or_else(|| "postgres".to_string());
     let dbname = cfg
         .dbname
         .clone()
-        .or_else(|| std::env::var("AFPSQL_DBNAME").ok())
-        .or_else(|| std::env::var("PGDATABASE").ok())
+        .or_else(|| env("AFPSQL_DBNAME"))
+        .or_else(|| env("PGDATABASE"))
         .unwrap_or_else(|| "postgres".to_string());
     let password = cfg
         .password_secret
         .clone()
-        .or_else(|| std::env::var("AFPSQL_PASSWORD_SECRET").ok())
-        .or_else(|| std::env::var("PGPASSWORD").ok());
+        .or_else(|| env("AFPSQL_PASSWORD_SECRET"))
+        .or_else(|| env("PGPASSWORD"));
 
     let mut pg_cfg = Config::new();
     pg_cfg.host(host).port(port).user(user).dbname(dbname);
     if let Some(pw) = password {
         pg_cfg.password(pw);
     }
-    if let Some(sslmode) = env_nonempty("PGSSLMODE") {
+    if let Some(sslmode) = env("PGSSLMODE") {
         apply_sslmode(&mut pg_cfg, "PGSSLMODE", &sslmode)?;
     }
     Ok(pg_cfg)
@@ -226,10 +231,17 @@ pub(crate) fn pg_config_for_tcp_tunnel(
     target
 }
 
-pub(crate) fn postgres_tls_server_name(pg_cfg: &Config) -> &str {
-    match pg_cfg.get_hosts().first() {
-        Some(Host::Tcp(host)) if !host.starts_with('/') => host,
-        _ => "",
+/// TLS server name for a stdio-bridged connection.
+///
+/// Derived from the endpoint the bridge actually targets, so it is never empty:
+/// OpenSSL rejects a zero-length SNI name outright, which would turn a hostless
+/// DSN into a TLS handshake failure. An IP literal or a Unix-socket target
+/// yields an address rather than a name, and the TLS backend then skips SNI —
+/// which is the correct behavior for both.
+pub(crate) fn postgres_tls_server_name(endpoint: &PostgresEndpoint) -> String {
+    match endpoint {
+        PostgresEndpoint::Tcp { host, .. } => host.clone(),
+        PostgresEndpoint::UnixSocket { .. } => DEFAULT_POSTGRES_HOST.to_string(),
     }
 }
 

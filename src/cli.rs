@@ -306,8 +306,9 @@ stable pipe sessions, and machine-readable failures.
 
 - default mode is canonical agent-first CLI
 - `--mode psql` is argument translation only; runtime output stays JSONL
-- `--output-to split` sends results to stdout and errors/logs/progress to stderr
-- `--output-to stdout|stderr` selects one ordered event stream
+- a finite query splits by kind: result to stdout, errors/logs/progress to stderr
+- `--mode pipe` and `--stream-rows` are ordered event streams and stay on one stream (stdout)
+- `--output-to split|stdout|stderr` overrides the destination; `split` is rejected for a stream
 - native CLI and pipe mode default to read-only transactions; writes require permission
 - SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
@@ -619,14 +620,12 @@ pub struct AfdCli {
     /// Output format: json (default), yaml, or plain.
     #[arg(long, default_value = "json", global = true, help_heading = "Runtime")]
     output: String,
-    /// Output routing: split (default), stdout, or stderr.
-    #[arg(
-        long = "output-to",
-        default_value = "split",
-        global = true,
-        help_heading = "Runtime"
-    )]
-    output_to: String,
+    /// Output routing: split, stdout, or stderr.
+    ///
+    /// Defaults to split for a finite query, and to stdout for --mode pipe and
+    /// --stream-rows, whose ordered event stream must stay on one stream.
+    #[arg(long = "output-to", global = true, help_heading = "Runtime")]
+    output_to: Option<String>,
     /// Redirect stdout bytes to this file.
     #[arg(
         long = "stdout-file",
@@ -709,7 +708,12 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
     };
     let _stream_redirect_args = (&cli.stdout_file, &cli.stderr_file);
     let output = parse_output(&cli.output)?;
-    let _output_to = OutputTo::parse(&cli.output_to)?;
+    // The destination is resolved before clap in `emit::install_output_to_from_raw`,
+    // which also knows the consumption mode. Re-parse here so an invalid value is
+    // rejected as a clap-time usage error too.
+    if let Some(value) = &cli.output_to {
+        let _ = OutputTo::parse(value)?;
+    }
     let log = parse_log_categories(&cli.log);
     let dsn_config = SecretConfigRef::from_values("--dsn-secret-config", cli.dsn_secret_config)?;
     let conninfo_config =
@@ -755,6 +759,9 @@ pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
         conninfo_config.as_ref(),
     )?;
     let session = SessionConfig {
+        // Caller-supplied, so the ordinary environment fallbacks still apply;
+        // only a locked administrator profile pins the endpoint.
+        profile_pinned: false,
         dsn_secret,
         conninfo_secret,
         host: cli.host,
@@ -1006,6 +1013,9 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         state.conninfo_secret_config.as_ref(),
     )?;
     let session = SessionConfig {
+        // Caller-supplied, so the ordinary environment fallbacks still apply;
+        // only a locked administrator profile pins the endpoint.
+        profile_pinned: false,
         dsn_secret,
         conninfo_secret,
         host: state.host,
@@ -1636,8 +1646,7 @@ fn emit_psql_mode_help() {
         "psql (afpsql wrapper) {}\n\
 Usage:\n  psql [OPTION]... [DBNAME [USERNAME]]\n\n\
 Supported non-interactive forms:\n  -c, --command=SQL\n  -f, --file=FILE\n  -l, --list\n  -h/-p/-U/-d and --host/--port/--username/--dbname\n  -v N=value, --set N=value for positional bind parameters\n\n\
-Output:\n  --stdout-file=FILE redirects stdout bytes to FILE\n  --stderr-file=FILE redirects stderr bytes to FILE\n\n\
-  --output-to=split|stdout|stderr selects AFDATA event routing\n\n\
+Output:\n  --stdout-file=FILE redirects stdout bytes to FILE\n  --stderr-file=FILE redirects stderr bytes to FILE\n  --output-to=split|stdout|stderr selects AFDATA event routing\n\n\
 Human-interactive psql modes and psql meta-commands are not supported by this wrapper.",
         env!("CARGO_PKG_VERSION")
     ));
@@ -1711,7 +1720,7 @@ fn is_psql_mode_requested(raw: &[String]) -> bool {
     false
 }
 
-fn top_level_arg_consumes_two_values(arg: &str) -> bool {
+pub(crate) fn top_level_arg_consumes_two_values(arg: &str) -> bool {
     let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
     matches!(
         name,
@@ -1719,7 +1728,7 @@ fn top_level_arg_consumes_two_values(arg: &str) -> bool {
     )
 }
 
-fn top_level_arg_consumes_value(arg: &str) -> bool {
+pub(crate) fn top_level_arg_consumes_value(arg: &str) -> bool {
     let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
     matches!(
         name,
@@ -1760,6 +1769,7 @@ fn top_level_arg_consumes_value(arg: &str) -> bool {
             | "--container-compose-project"
             | "--container-pod-container"
             | "--output"
+            | "--output-to"
             | "--stdout-file"
             | "--stderr-file"
             | "--log"

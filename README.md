@@ -147,8 +147,9 @@ of `afpsql-readonly`) and a matching
 `/etc/afpsql/readonly-profiles/production.json`. The JSON has the same flat
 connection/SSH/container fields as a pipe session. It must be root-owned and
 not group/world writable. This locked executable rejects every CLI connection
-or transport override and every pipe session patch; the agent may supply only
-query/result-shaping inputs. Whitelist the profile executable itself rather
+or transport override and every pipe session patch, and reads no connection
+environment variables at all; the agent may supply only query/result-shaping
+inputs. Whitelist the profile executable itself rather
 than parsing flags in a shell-prefix rule.
 
 ## First-class remote and container access: keep the agent local

@@ -51,8 +51,8 @@ Non-goals:
 ## Core principles: reliability over throughput
 
 1. Reliability over throughput.
-2. Structured AFDATA events are the protocol. Finite mode defaults to
-   `--output-to split`; ordered stream consumers select one output stream.
+2. Structured AFDATA events are the protocol, and the event destination follows
+   the invocation's consumption mode rather than being a caller preference.
 3. Native/pipe writes require explicit permission.
 4. PostgreSQL `SQLSTATE` is preserved for database errors.
 5. Permission, validation, transport, and protocol errors include actionable hints.
@@ -218,6 +218,26 @@ Output events:
 Every recoverable runtime condition should be represented by one of these
 AFDATA events. Startup argument parsing can still exit with code `2`, but it
 should use structured CLI error output when possible.
+
+## Event destination: the invocation picks it, not the caller
+
+Where events go follows the invocation's consumption mode. A plain query emits
+at most one terminal event and exits, so it is a finite one-shot command and
+splits by kind: the `result` payload is what a caller captures, so it goes to
+stdout, while `error`, `log`, and `progress` are diagnostics and go to stderr.
+That keeps `rows=$(afpsql …)` from ever capturing a failure as data.
+
+`--mode pipe` and `--stream-rows` are different. They emit an interleaved
+multi-event stream whose consumer reads it in order, so they are event streams:
+every event goes to one stream, stdout by default. Splitting a stream across
+stdout and stderr would destroy the ordering that makes it a stream, and would
+strand `result_rows` — which carries the actual row payload — on the diagnostic
+stream while only the row-less `result_end` terminator reached stdout.
+
+`--output-to` overrides the destination but cannot override the mode: asking a
+stream for `split` is a usage error rather than a silent reordering. The
+destination is resolved from raw arguments before the parser runs, so startup
+failures, `--help`, and `--version` honor the same policy.
 
 ## Parameter binding: values never become SQL text
 

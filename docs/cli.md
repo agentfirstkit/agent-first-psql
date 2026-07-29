@@ -12,8 +12,9 @@ stable pipe sessions, and machine-readable failures.
 
 - default mode is canonical agent-first CLI
 - `--mode psql` is argument translation only; runtime output stays JSONL
-- `--output-to split` sends results to stdout and errors/logs/progress to stderr
-- `--output-to stdout|stderr` selects one ordered event stream
+- a finite query splits by kind: result to stdout, errors/logs/progress to stderr
+- `--mode pipe` and `--stream-rows` are ordered event streams and stay on one stream (stdout)
+- `--output-to split|stdout|stderr` overrides the destination; `split` is rejected for a stream
 - native CLI and pipe mode default to read-only transactions; writes require permission
 - SSH/container transports keep afpsql local instead of running human `psql` across boundaries
 
@@ -128,7 +129,7 @@ afpsql [OPTIONS] [COMMAND]
 | `--container-compose-project <CONTAINER_COMPOSE_PROJECT>` | Compose project name passed before compose exec *(global)* |
 | `--container-pod-container <CONTAINER_POD_CONTAINER>` | Kubernetes container name for multi-container pods *(global)* |
 | `--output <OUTPUT>` | Output format: json (default), yaml, or plain *(global, default: `json`)* |
-| `--output-to <OUTPUT_TO>` | Output routing: split (default), stdout, or stderr *(global, default: `split`)* |
+| `--output-to <OUTPUT_TO>` | Output routing: split, stdout, or stderr *(global)* |
 | `--stdout-file <PATH>` | Redirect stdout bytes to this file *(global)* |
 | `--stderr-file <PATH>` | Redirect stderr bytes to this file *(global)* |
 | `--log <LOG>...` | Diagnostic log filters (comma-separated) *(global)* |

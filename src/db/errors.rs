@@ -213,6 +213,7 @@ fn connect_hint_for_message(message: &str) -> Option<String> {
 fn connect_retryable_for_message(message: &str) -> bool {
     !(message.contains("password missing")
         || message.contains("single PostgreSQL host and port")
+        || message.contains("cannot combine a PostgreSQL Unix socket with hostaddr")
         || message.contains("explicit remote PostgreSQL Unix socket"))
 }
 

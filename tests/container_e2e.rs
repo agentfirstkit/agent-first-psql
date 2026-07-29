@@ -154,9 +154,14 @@ fn docker_container_transport_select_one() {
     };
     assert!(!write.status.success());
     assert!(
-        String::from_utf8_lossy(&write.stdout).contains(r#""code":"invalid_request""#),
-        "stdout: {}",
+        String::from_utf8_lossy(&write.stdout).trim().is_empty(),
+        "default split routing wrote an error to stdout: {}",
         String::from_utf8_lossy(&write.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&write.stderr).contains(r#""code":"invalid_request""#),
+        "stderr: {}",
+        String::from_utf8_lossy(&write.stderr)
     );
     assert_readonly_reaches_runtime(
         [
@@ -264,10 +269,10 @@ fn assert_readonly_reaches_runtime<const N: usize>(args: [&str; N], context: &st
         .output()
         .expect("run readonly runtime case");
     assert!(!output.status.success(), "{context} unexpectedly succeeded");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains(r#""kind":"error""#) && !stdout.contains(r#""code":"invalid_request""#),
-        "{context} was rejected by policy instead of reaching the runtime: {stdout}"
+        stderr.contains(r#""kind":"error""#) && !stderr.contains(r#""code":"invalid_request""#),
+        "{context} was rejected by policy instead of reaching the runtime: {stderr}"
     );
 }
 

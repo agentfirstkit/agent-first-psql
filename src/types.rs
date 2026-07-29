@@ -369,6 +369,14 @@ pub struct SessionConfig {
     pub password_secret: Option<String>,
     pub ssh: SshConfig,
     pub container: ContainerConfig,
+    /// Set only when an administrator-locked readonly profile supplied this
+    /// session, meaning the endpoint is the administrator's and environment
+    /// variables must not redirect it.
+    ///
+    /// Deliberately absent from `SessionConfigFlat`, so it can never be set by
+    /// profile JSON or by a pipe session patch — only by the code path that
+    /// loads a locked profile.
+    pub profile_pinned: bool,
 }
 
 #[derive(Serialize)]
@@ -554,6 +562,7 @@ struct SessionConfigFlat {
 impl From<SessionConfigFlat> for SessionConfig {
     fn from(flat: SessionConfigFlat) -> Self {
         Self {
+            profile_pinned: false,
             dsn_secret: flat.dsn_secret,
             conninfo_secret: flat.conninfo_secret,
             host: flat.host,

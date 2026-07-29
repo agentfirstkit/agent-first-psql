@@ -53,19 +53,13 @@ jobs:
       - name: Validate Agent Skill
         run: afdata skill validate skills/agent-first-psql
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Unit
-        run: cargo test --bin afpsql
+      # Use the fixed test entrypoint rather than a hand-written command list,
+      # so CI and the local release gate cannot drift apart.
+      - name: Static and integration
+        run: ./scripts/test.sh all
 
       - name: PostgreSQL smoke
         run: cargo run -- --dsn-secret "$AFPSQL_TEST_DSN_SECRET" --sql "select 1 as n"
-
-      - name: Integration
-        run: |
-          cargo build
-          cargo test --tests
 
   container-e2e:
     runs-on: ubuntu-latest
@@ -107,4 +101,4 @@ jobs:
           docker version
           docker pull postgres:16
           docker pull ubuntu:22.04
-          cargo test --test container_e2e -- --ignored --nocapture
+          ./scripts/test.sh container

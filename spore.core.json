@@ -15,13 +15,16 @@
   "mutations": [
     "Accept --dsn-secret and --conninfo-secret with --ssh and --container: afpsql parses the connection string locally in-process and derives the transport's internal PostgreSQL endpoint from it, so agents never split or reveal a DSN in shell code",
     "Preserve the full parsed connection across an SSH tunnel — authentication, database, startup options, timeouts, keepalives, channel binding and TLS settings survive the local port forward, with the original hostname retained for PostgreSQL TLS",
-    "Encrypt the SSH stdio bridge connection with the same supported TLS modes instead of forcing an unencrypted connection",
+    "Encrypt both the SSH and container stdio bridges with the supported TLS modes instead of forcing an unencrypted connection, deriving a non-empty TLS server name from the resolved endpoint so a hostless DSN cannot fail the handshake",
     "Reject a DSN or conninfo that resolves to a multi-host failover list under SSH/container transport with an explicit single-endpoint error and a recovery hint instead of silently picking one target",
-    "Add --output-to split|stdout|stderr, defaulting to split (results on stdout; errors, logs and progress on stderr), resolved before argument parsing so startup failures, --help and --version honor it too",
+    "Route events by consumption mode: a finite query sends its result to stdout and diagnostics to stderr, while --mode pipe and --stream-rows keep their whole ordered event stream on stdout so streamed row batches are never stranded on the diagnostic stream",
+    "Add --output-to split|stdout|stderr to override the event destination, resolved before argument parsing so startup failures, --help and --version honor it, and reject split for a streaming invocation rather than silently reordering it",
+    "Stop a locked readonly profile from reading connection environment variables, so an administrator-pinned endpoint can no longer be redirected by AFPSQL_DSN_SECRET or PGHOST, nor have its TLS downgraded by PGSSLMODE",
     "Drop short aliases from the canonical CLI surface (-h, -V, -o), confining psql-compatible shorts to --mode psql and the managed psql wrapper",
     "Reject psql's -o and --output output-file flags in psql mode instead of silently reinterpreting them as afpsql's rendering format",
     "Delegate --help and --version to Agent-First Data's unified handler, emitting a structured version event and removing the auto-generated help subcommand",
     "Rename runtime config secret metadata fields to config_file_path and dot_path to match the Agent-First Data naming convention",
+    "Move the test entrypoint into the project as scripts/test.sh so CI and the release gate run the same modes, and widen both to exercise the live-PostgreSQL suite that CI previously skipped",
     "Upgrade to agent-first-data 0.26.1"
   ],
   "bonds": [

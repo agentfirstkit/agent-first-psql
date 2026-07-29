@@ -345,7 +345,7 @@ pub async fn connect_stdio_bridge(
     let tls =
         <postgres_native_tls::MakeTlsConnector as MakeTlsConnect<SshStdioStream>>::make_tls_connect(
             &mut tls,
-            postgres_tls_server_name(pg_cfg),
+            &postgres_tls_server_name(&endpoint),
         )
         .map_err(|e| format!("create PostgreSQL TLS stream failed: {e}"))?;
     let (client, connection) = match pg_cfg.connect_raw(stream, tls).await {

@@ -119,6 +119,61 @@ fn canonical_mode_rejects_psql_compatibility_shorts() {
 }
 
 #[test]
+fn streaming_modes_reject_explicit_split_routing() {
+    // An ordered event stream must stay on one stream; splitting it across
+    // stdout and stderr would lose the ordering that makes it a stream.
+    for args in [
+        vec!["--stream-rows", "--output-to", "split", "--sql", "select 1"],
+        vec!["--mode", "pipe", "--output-to", "split"],
+        vec!["--mode=pipe", "--output-to=split"],
+    ] {
+        let out = Command::new(bin())
+            .args(&args)
+            .output()
+            .expect("run afpsql streaming split rejection");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let value = split_error_event(&out);
+        assert_eq!(value["error"]["code"], "invalid_request", "{args:?}");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must stay on one stream"),
+            "{args:?}: {value}"
+        );
+    }
+}
+
+#[test]
+fn hyphen_valued_sql_is_not_mistaken_for_a_streaming_flag() {
+    // `--sql` accepts hyphen values, so SQL that is exactly `--stream-rows`
+    // (a SQL comment) must not flip the invocation into event-stream mode.
+    let out = Command::new(bin())
+        .args(["--sql", "--stream-rows", "--output-to", "split"])
+        .output()
+        .expect("run afpsql hyphen-valued sql");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("must stay on one stream"),
+        "SQL text was scanned as a streaming flag: {stderr}"
+    );
+}
+
+#[test]
+fn usage_errors_after_a_subcommand_stay_off_stdout() {
+    // `--stream-rows` is top-level only, so clap rejects it here. The scan must
+    // not treat it as a streaming request, or the usage error would be written
+    // to the result stream a caller captures.
+    let out = Command::new(bin())
+        .args(["inspect", "tables", "--stream-rows"])
+        .output()
+        .expect("run afpsql subcommand usage error");
+    assert_eq!(out.status.code(), Some(2));
+    let value = split_error_event(&out);
+    assert_eq!(value["error"]["code"], "invalid_request");
+}
+
+#[test]
 fn psql_mode_rejects_output_flags_with_conflicting_psql_semantics() {
     for args in [
         vec![

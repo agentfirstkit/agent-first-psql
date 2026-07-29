@@ -373,6 +373,7 @@ fn apply_update_can_clear_session_fields_with_null() {
     cfg.sessions.insert(
         "s1".to_string(),
         SessionConfig {
+            profile_pinned: false,
             dsn_secret: Some("postgresql://localhost/postgres".to_string()),
             conninfo_secret: Some("host=localhost user=roger dbname=postgres".to_string()),
             host: Some("localhost".to_string()),

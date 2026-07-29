@@ -66,7 +66,13 @@ pub async fn run(capability: Capability, bin_name: &str) {
         }
         if let Some(name) = profile_name {
             locked_profile = match readonly_policy::load_locked_profile(&name) {
-                Ok(profile) => Some(profile),
+                // Pin at load time so every consumer of the profile inherits it:
+                // the administrator's endpoint must not be redirected by the
+                // environment, the way connection flags are already refused.
+                Ok(mut profile) => {
+                    profile.profile_pinned = true;
+                    Some(profile)
+                }
                 Err(error) => reject_readonly(&error, readonly_local_capability_hint()),
             };
         }

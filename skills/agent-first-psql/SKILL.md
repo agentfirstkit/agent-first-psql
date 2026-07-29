@@ -16,11 +16,14 @@ skill covers behavior, decisions, and recovery only.
 
 ## Core Rules
 
-- Parse strict Agent-First Data envelopes by top-level `kind`. The default
-  `--output-to split` sends results to stdout and errors/logs/progress to
-  stderr; use `--output-to stdout` for one ordered pipe stream. Business result
+- Parse strict Agent-First Data envelopes by top-level `kind`. Business result
   codes stay at `result.code`; failures use `error.code`, `error.message`, and
   `error.retryable`.
+- Read the stream the invocation actually uses. A finite query splits by kind,
+  so capture the result from stdout and read diagnostics from stderr. `--mode
+  pipe` and `--stream-rows` are ordered event streams and put every event on
+  stdout, so read one stream and branch on `kind`. Only pass `--output-to` to
+  override this; it cannot split a stream.
 - When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
   It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
   transaction-control SQL, and psql translation. It still permits SQL/config

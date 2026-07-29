@@ -6,9 +6,13 @@ line is an Agent-First Data envelope tagged by a top-level `kind`; see
 
 - pipe mode: full protocol with `id` correlation
 - CLI mode: same event schema, `id` may be omitted in display output
-- `--output-to split` sends results to stdout and errors/logs/progress to stderr
-- `--output-to stdout|stderr` sends every event to one ordered stream; use a
-  unified stream for pipe mode when cross-kind ordering matters
+- a finite query splits by kind: `result` to stdout, `error`/`log`/`progress`
+  to stderr, so a shell capture never mistakes a failure for data
+- pipe mode and `--stream-rows` are ordered event streams: every event goes to
+  stdout, because splitting a stream across two process streams would lose the
+  ordering that makes it a stream
+- `--output-to split|stdout|stderr` overrides the destination; `split` is
+  rejected for a stream rather than silently reordering it
 
 ## Interface Boundary
 
@@ -94,7 +98,17 @@ The file uses the flat session fields documented for pipe config. Because this
 is administrator-controlled configuration, it may contain custom container
 runtimes or SSH options such as `IdentityFile`/`ProxyCommand`. A locked profile executable
 rejects all connection/transport flags and all pipe `sessions` patches before
-they can replace the profile. Hosts needing a single target should authorize
+they can replace the profile.
+
+A locked profile is also the whole connection: it reads none of the connection
+environment variables that the ordinary readonly executable falls back to —
+`AFPSQL_DSN_SECRET`, `AFPSQL_CONNINFO_SECRET`, `AFPSQL_HOST`/`PGHOST`,
+`AFPSQL_PORT`/`PGPORT`, `AFPSQL_USER`/`PGUSER`, `AFPSQL_DBNAME`/`PGDATABASE`,
+`AFPSQL_PASSWORD_SECRET`/`PGPASSWORD`, and `PGSSLMODE`. Otherwise a caller who
+may only choose SQL could still move the endpoint, or downgrade its TLS, through
+the environment. Put every connection field the profile needs — including the
+password and any `sslmode` — in the profile file itself; use `dsn_secret` there
+when you need `sslmode`. Hosts needing a single target should authorize
 this distinct executable name, not infer a target by parsing shell arguments.
 
 Locked profiles currently require Unix owner/mode checks. On other platforms,

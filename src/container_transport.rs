@@ -1,4 +1,7 @@
-use crate::conn::{PostgresEndpoint, resolve_pg_config, resolve_single_postgres_endpoint};
+use crate::conn::{
+    PostgresEndpoint, make_supported_tls, postgres_tls_server_name, resolve_pg_config,
+    resolve_single_postgres_endpoint,
+};
 use crate::db::ConnectError;
 use crate::types::SessionConfig;
 use std::pin::Pin;
@@ -10,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::oneshot;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
+use tokio_postgres::tls::MakeTlsConnect;
 
 const DEFAULT_DRIVER: &str = "docker";
 const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
@@ -314,7 +318,18 @@ pub async fn connect_stdio_bridge(
     let stream = ContainerStdioStream { stdout, stdin };
     let pg_cfg = resolve_pg_config(cfg)
         .map_err(|e| ConnectError::new(format!("invalid container connection config: {e}")))?;
-    let (client, connection) = match pg_cfg.connect_raw(stream, NoTls).await {
+    // The container transport parses a full DSN, so it must honor the same
+    // sslmode range as every other path; NoTls here made sslmode=require fail.
+    let endpoint = resolve_single_postgres_endpoint(&pg_cfg, "container transport")
+        .map_err(ConnectError::new)?;
+    let mut tls_connector = make_supported_tls()
+        .map_err(|e| ConnectError::new(format!("create TLS connector failed: {e}")))?;
+    let tls = <postgres_native_tls::MakeTlsConnector as MakeTlsConnect<ContainerStdioStream>>::make_tls_connect(
+        &mut tls_connector,
+        &postgres_tls_server_name(&endpoint),
+    )
+    .map_err(|e| ConnectError::new(format!("create PostgreSQL TLS stream failed: {e}")))?;
+    let (client, connection) = match pg_cfg.connect_raw(stream, tls).await {
         Ok(connection) => connection,
         Err(e) => {
             let status = match tokio::time::timeout(Duration::from_millis(100), child.wait()).await

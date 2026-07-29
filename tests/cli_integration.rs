@@ -26,6 +26,117 @@ fn bin() -> PathBuf {
     ignore = "requires PostgreSQL test database"
 )]
 #[test]
+fn stream_rows_keeps_the_whole_result_stream_on_stdout() {
+    // A streamed query is an ordered event stream: the row batches carry the
+    // payload the caller captures, so they must not land on the diagnostic
+    // stream while only the terminator reaches stdout.
+    let out = Command::new(bin())
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .arg("--stream-rows")
+        .arg("--sql")
+        .arg("select generate_series(1,3) as n")
+        .output()
+        .expect("run afpsql stream-rows");
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "streaming split the event stream onto stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let events = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("json event"))
+        .collect::<Vec<_>>();
+    for event in &events {
+        agent_first_data::validate_protocol_event(event, true).expect("strict AFDATA event");
+    }
+
+    let rows = events
+        .iter()
+        .filter(|event| event["progress"]["code"] == "result_rows")
+        .flat_map(|event| {
+            event["progress"]["rows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3, "row batches missing from stdout: {text}");
+
+    // Exactly one terminal event, and it comes last.
+    let terminal = events
+        .iter()
+        .filter(|event| event["kind"] == "result" || event["kind"] == "error")
+        .count();
+    assert_eq!(terminal, 1, "{text}");
+    assert_eq!(
+        events.last().expect("events")["result"]["code"],
+        "result_end"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn pipe_mode_keeps_failures_in_stream_order_on_stdout() {
+    // A consumer reading the pipe stream must see a failed request in its
+    // original position, not lose it to a second stream.
+    let payload = [
+        serde_json::json!({"code":"query","id":"q1","sql":"select 1 as n"}).to_string(),
+        serde_json::json!({"code":"query","id":"q2","sql":"select bad_col"}).to_string(),
+        serde_json::json!({"code":"query","id":"q3","sql":"select 3 as n"}).to_string(),
+        serde_json::json!({"code":"close"}).to_string(),
+    ]
+    .join("\n")
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn-secret")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait output");
+
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "pipe mode split the event stream onto stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("utf8");
+    let ids = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("json event"))
+        .filter_map(|event| {
+            event["result"]["id"]
+                .as_str()
+                .or_else(|| event["error"]["id"].as_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["q1", "q2", "q3"], "{text}");
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
 fn afd_cli_param_binding_query() {
     let out = Command::new(bin())
         .arg("--dsn-secret")
