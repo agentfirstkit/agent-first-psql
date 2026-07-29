@@ -84,7 +84,9 @@ case "$MODE" in
   container)     run_container ;;
   e2e)           run_integration; run_container ;;
   release-smoke) run_release_smoke ;;
-  all)           run_static; run_integration ;;
+  # `all` is the release gate. It includes the release smoke because that script
+  # otherwise runs only inside the Release workflow, i.e. after publishing.
+  all)           run_static; run_integration; run_release_smoke ;;
   full)          run_static; run_integration; run_container; run_release_smoke ;;
   *)
     echo "Usage: $0 [static|unit|integration|container|e2e|release-smoke|all|full] [FILTER]" >&2

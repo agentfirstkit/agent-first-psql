@@ -11,16 +11,35 @@ if [ ! -x "$READONLY" ]; then
   exit 1
 fi
 
+# A finite query splits by kind, so these checks must read the stream the event
+# actually lands on. Capturing only stdout would make every assertion below pass
+# vacuously against an empty string — including the secret-leak check.
+OUT=""
+ERR=""
+STATUS=0
+run_readonly() {
+  local out_file err_file
+  out_file="$(mktemp)"
+  err_file="$(mktemp)"
+  set +e
+  "$READONLY" "$@" >"$out_file" 2>"$err_file"
+  STATUS=$?
+  set -e
+  OUT="$(cat "$out_file")"
+  ERR="$(cat "$err_file")"
+  rm -f "$out_file" "$err_file"
+}
+
 expect_invalid_request() {
   local label="$1"
   shift
-  local output status
-  set +e
-  output="$($READONLY "$@")"
-  status=$?
-  set -e
-  if [ "$status" -eq 0 ] || ! grep -q '"code":"invalid_request"' <<<"$output"; then
-    echo "$label was not rejected before execution: $output" >&2
+  run_readonly "$@"
+  if [ "$STATUS" -eq 0 ] || ! grep -q '"code":"invalid_request"' <<<"$ERR"; then
+    echo "$label was not rejected before execution: stdout=$OUT stderr=$ERR" >&2
+    exit 1
+  fi
+  if [ -n "$(tr -d '[:space:]' <<<"$OUT")" ]; then
+    echo "$label wrote a rejection to the result stream: $OUT" >&2
     exit 1
   fi
 }
@@ -28,13 +47,9 @@ expect_invalid_request() {
 expect_runtime_failure() {
   local label="$1"
   shift
-  local output status
-  set +e
-  output="$($READONLY "$@")"
-  status=$?
-  set -e
-  if [ "$status" -eq 0 ] || grep -q 'unavailable in afpsql-readonly' <<<"$output"; then
-    echo "$label did not reach ordinary readonly runtime semantics: $output" >&2
+  run_readonly "$@"
+  if [ "$STATUS" -eq 0 ] || grep -q 'unavailable in afpsql-readonly' <<<"$ERR"; then
+    echo "$label did not reach ordinary readonly runtime semantics: stderr=$ERR" >&2
     exit 1
   fi
 }
@@ -50,22 +65,36 @@ trap 'rm -rf "$tmp_dir"' EXIT
 sql_path="$tmp_dir/query.sql"
 printf '%s\n' 'select 1' >"$sql_path"
 
-# Stream redirection (`--stdout-file`) is a Unix-only capability; on Windows
-# afpsql rejects it outright ("stream redirection is only supported on Unix
-# platforms"), so the redirect smoke checks below only apply on Unix.
+# Stream redirection (`--stdout-file`/`--stderr-file`) is a Unix-only capability;
+# on Windows afpsql rejects it outright ("stream redirection is only supported on
+# Unix platforms"), so the redirect smoke checks below only apply on Unix.
 case "$(uname -s 2>/dev/null || echo unknown)" in
 MINGW* | MSYS* | CYGWIN* | *NT*)
   echo "skipping Unix-only stream-redirect checks on this platform"
   ;;
 *)
+  # The runtime error is a diagnostic, so it is `--stderr-file` that must
+  # receive it under the default split routing.
   redirect_path="$tmp_dir/output"
   printf '%s' 'preserve-me' >"$redirect_path"
   set +e
-  "$READONLY" --stdout-file "$redirect_path" --sql "select 1"
+  "$READONLY" --stderr-file "$redirect_path" --sql "select 1" >/dev/null
   redirect_status=$?
   set -e
   if [ "$redirect_status" -eq 0 ] || ! grep -q 'connect_failed' "$redirect_path"; then
     echo "readonly redirect did not receive the runtime error" >&2
+    exit 1
+  fi
+
+  # Collapsing the stream onto stdout must route the same error into
+  # `--stdout-file` instead.
+  collapsed_path="$tmp_dir/collapsed"
+  set +e
+  "$READONLY" --output-to stdout --stdout-file "$collapsed_path" --sql "select 1"
+  collapsed_status=$?
+  set -e
+  if [ "$collapsed_status" -eq 0 ] || ! grep -q 'connect_failed' "$collapsed_path"; then
+    echo "readonly --output-to stdout did not reach the redirected result stream" >&2
     exit 1
   fi
 
@@ -74,7 +103,7 @@ MINGW* | MSYS* | CYGWIN* | *NT*)
   # Ordinary readonly deliberately grants this same host capability as afpsql.
   smuggled_path="$tmp_dir/smuggled"
   set +e
-  "$READONLY" --sql "--stdout-file=$smuggled_path"
+  "$READONLY" --sql "--stdout-file=$smuggled_path" >/dev/null 2>&1
   smuggled_status=$?
   set -e
   if [ "$smuggled_status" -eq 0 ] || [ ! -e "$smuggled_path" ]; then
@@ -89,12 +118,15 @@ expect_runtime_failure "local SQL file" --sql-file "$sql_path"
 config_path="$tmp_dir/config.env"
 canary="AFPSQL_RELEASE_SMOKE_SECRET_CANARY"
 printf '%s\n' "DATABASE_URL=postgresql://user:$canary@127.0.0.1:1/db" >"$config_path"
-set +e
-config_output="$($READONLY --dsn-secret-config "$config_path" DATABASE_URL --sql 'select 1')"
-config_status=$?
-set -e
-if [ "$config_status" -eq 0 ] || grep -q "$canary" <<<"$config_output"; then
-  echo "readonly config secret smoke failed or leaked secret: $config_output" >&2
+run_readonly --dsn-secret-config "$config_path" DATABASE_URL --sql 'select 1'
+if [ "$STATUS" -eq 0 ]; then
+  echo "readonly config secret smoke unexpectedly succeeded" >&2
+  exit 1
+fi
+# The secret must not appear on either stream, not merely on the one the
+# failure happened to avoid.
+if grep -q "$canary" <<<"$OUT" || grep -q "$canary" <<<"$ERR"; then
+  echo "readonly config secret leaked: stdout=$OUT stderr=$ERR" >&2
   exit 1
 fi
 expect_invalid_request "config-backed write permission" \
