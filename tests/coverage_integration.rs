@@ -45,7 +45,7 @@ fn psql_mode_all_translation_paths() {
     let mut cmd = Command::new(bin());
     cmd.arg("--mode")
         .arg("psql")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("-f")
         .arg(path.to_string_lossy().to_string())
@@ -146,17 +146,14 @@ fn conn_via_env_fallback() {
 #[test]
 fn has_session_override_each_field_in_pipe_mode() {
     for args in [
-        vec!["--dsn-secret", &test_dsn()],
-        vec![
-            "--conninfo-secret",
-            "host=localhost user=roger dbname=postgres",
-        ],
+        vec!["--dsn", &test_dsn()],
+        vec!["--conninfo", "host=localhost user=roger dbname=postgres"],
         vec!["--host", "localhost"],
         vec!["--port", "5432"],
         vec!["--user", "roger"],
         vec!["--dbname", "postgres"],
-        vec!["--password-secret", "pw"],
-        vec!["--container", "pg"],
+        vec!["--password", "pw"],
+        vec!["--container-docker-name", "pg"],
     ] {
         let payload = serde_json::json!({"code":"close"}).to_string() + "\n";
         let mut cmd = Command::new(bin());
@@ -188,7 +185,7 @@ fn cli_emits_structured_log_events_on_the_diagnostic_stream() {
     // A finite query splits by kind: the result payload is what the caller
     // captures from stdout, while logs are diagnostics and stay off it.
     let mut cmd = Command::new(bin());
-    cmd.arg("--dsn-secret")
+    cmd.arg("--dsn")
         .arg(test_dsn())
         .arg("--log")
         .arg("query.result")
@@ -212,7 +209,7 @@ fn cli_emits_structured_log_events_on_the_diagnostic_stream() {
 #[test]
 fn handler_param_types_and_empty_rows() {
     let mut cmd = Command::new(bin());
-    cmd.arg("--dsn-secret")
+    cmd.arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select $1::text as a, $2::boolean as b, $3::double precision as c, $4::jsonb as d, $5::jsonb as e")
@@ -234,7 +231,7 @@ fn handler_param_types_and_empty_rows() {
 
     let mut empty = Command::new(bin());
     empty
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select 1 as n where false");

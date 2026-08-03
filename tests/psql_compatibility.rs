@@ -82,7 +82,7 @@ fn canonical_long_version_emits_structured_version_event() {
 }
 
 #[test]
-fn canonical_help_exposes_long_only_control_flags() {
+fn canonical_help_is_one_complete_answer_with_no_short_spellings() {
     let out = Command::new(bin())
         .arg("--help")
         .output()
@@ -90,18 +90,43 @@ fn canonical_help_exposes_long_only_control_flags() {
     assert!(out.status.success());
     let value: Value = serde_json::from_slice(&out.stdout).expect("JSON help event");
     assert_strict_event(&value);
-    let arguments = value["result"]["help"]["arguments"]
-        .as_array()
-        .expect("root help arguments");
-    for name in ["--help", "--version", "--host", "--output"] {
-        let argument = arguments
-            .iter()
-            .find(|argument| argument["name"] == name)
-            .unwrap_or_else(|| panic!("missing {name} from canonical help"));
+    let help = &value["result"]["help"];
+    assert_eq!(help["schema"], "cli-help-v2");
+    assert_eq!(help["command_path"], "afpsql");
+
+    let shapes = help["shapes"].as_array().expect("root shapes");
+    let ids: Vec<&str> = shapes
+        .iter()
+        .filter_map(|shape| shape["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "query-inline",
+            "query-file",
+            "query-inline-stream",
+            "query-file-stream",
+            "pipe",
+            "psql-translation",
+        ]
+    );
+    // One round trip: the connecting arguments and the injected output
+    // arguments are in the same answer as the shape that accepts them.
+    let inline = shapes[0]["usage"].as_str().unwrap_or_default();
+    for expected in [
+        "afpsql --sql <SQL>",
+        "[--host <HOST>]",
+        "[--output <json|yaml|plain>]",
+    ] {
         assert!(
-            argument.get("short").is_none(),
-            "{name} unexpectedly exposes a short alias"
+            inline.contains(expected),
+            "{expected} missing from {inline}"
         );
+    }
+    // There is no short syntax anywhere in the registry to advertise.
+    let rendered = help.to_string();
+    for short in ["\"-h\"", "\"-V\"", "\"-o\""] {
+        assert!(!rendered.contains(short), "{short} appears in {rendered}");
     }
 }
 
@@ -114,14 +139,21 @@ fn canonical_mode_rejects_psql_compatibility_shorts() {
             .expect("run afpsql compatibility short");
         assert_eq!(out.status.code(), Some(2));
         let value = split_error_event(&out);
-        assert_eq!(value["error"]["code"], "invalid_request");
+        // Not a rejected alias — the registry has no short syntax at all.
+        assert_eq!(value["error"]["code"], "cli_unknown_argument");
+        assert_eq!(
+            value["error"]["message"],
+            format!("unknown argument `{short}`")
+        );
     }
 }
 
 #[test]
-fn streaming_modes_reject_explicit_split_routing() {
+fn streaming_modes_have_no_split_routing_to_ask_for() {
     // An ordered event stream must stay on one stream; splitting it across
-    // stdout and stderr would lose the ordering that makes it a stream.
+    // stdout and stderr would lose the ordering that makes it a stream. That is
+    // the streaming shapes' output contract, not a check they run once started,
+    // so `split` is simply not one of their destinations.
     for args in [
         vec!["--stream-rows", "--output-to", "split", "--sql", "select 1"],
         vec!["--mode", "pipe", "--output-to", "split"],
@@ -133,44 +165,59 @@ fn streaming_modes_reject_explicit_split_routing() {
             .expect("run afpsql streaming split rejection");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let value = split_error_event(&out);
-        assert_eq!(value["error"]["code"], "invalid_request", "{args:?}");
+        assert_eq!(
+            value["error"]["code"], "cli_invalid_argument_value",
+            "{args:?}"
+        );
         assert!(
             value["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("must stay on one stream"),
+                .contains("expected one of stdout, stderr"),
             "{args:?}: {value}"
         );
     }
 }
 
 #[test]
-fn hyphen_valued_sql_is_not_mistaken_for_a_streaming_flag() {
-    // `--sql` accepts hyphen values, so SQL that is exactly `--stream-rows`
-    // (a SQL comment) must not flip the invocation into event-stream mode.
+fn hyphen_valued_sql_is_written_inline_and_stays_a_value() {
+    // A value is never taken from a token that starts with `-`, so SQL that
+    // looks like a flag is written `--sql=<value>` and cannot flip the
+    // invocation into event-stream mode.
     let out = Command::new(bin())
-        .args(["--sql", "--stream-rows", "--output-to", "split"])
+        .args(["--sql=--stream-rows", "--output-to", "split", "--dry-run"])
         .output()
         .expect("run afpsql hyphen-valued sql");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("must stay on one stream"),
-        "SQL text was scanned as a streaming flag: {stderr}"
+        !stderr.contains("expected one of stdout, stderr"),
+        "SQL text was read as a streaming flag: {stderr}"
+    );
+
+    // Spelled with a space it is a missing value, not a swallowed flag.
+    let out = Command::new(bin())
+        .args(["--sql", "--stream-rows"])
+        .output()
+        .expect("run afpsql space-form hyphen value");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        split_error_event(&out)["error"]["code"],
+        "cli_missing_argument_value"
     );
 }
 
 #[test]
 fn usage_errors_after_a_subcommand_stay_off_stdout() {
-    // `--stream-rows` is top-level only, so clap rejects it here. The scan must
-    // not treat it as a streaming request, or the usage error would be written
-    // to the result stream a caller captures.
+    // `--stream-rows` belongs to the root query shapes, so it is not an
+    // argument of `inspect tables` at all. The rejection leaves stdout empty,
+    // because a caller capturing the result stream must not find an error in it.
     let out = Command::new(bin())
         .args(["inspect", "tables", "--stream-rows"])
         .output()
         .expect("run afpsql subcommand usage error");
     assert_eq!(out.status.code(), Some(2));
     let value = split_error_event(&out);
-    assert_eq!(value["error"]["code"], "invalid_request");
+    assert_eq!(value["error"]["code"], "cli_unknown_argument");
 }
 
 #[test]
@@ -251,7 +298,7 @@ fn psql_mode_stdout_and_stderr_files_redirect_process_streams() {
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg("postgresql://127.0.0.1:1/postgres")
         .arg("--stdout-file")
         .arg(&out_path)
@@ -281,7 +328,7 @@ fn ssh_transport_accepts_dsn_and_reports_precise_multi_host_error() {
     let out = Command::new(bin())
         .arg("--ssh")
         .arg("user@example.invalid")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg("postgresql://user:SSH_DSN_CANARY@db1:5432,db2:5433/postgres")
         .arg("--sql")
         .arg("select 1")
@@ -336,7 +383,7 @@ fn psql_mode_translates_supported_cli_flags() {
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("-c")
         .arg("select $1::int as n")
@@ -374,7 +421,7 @@ fn psql_mode_keeps_write_compatible_default() {
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("-c")
         .arg("create temp table afpsql_psql_write_default(n int)")
@@ -395,5 +442,5 @@ fn afd_mode_rejects_psql_short_flags() {
         .expect("run afpsql");
     assert_eq!(out.status.code(), Some(2));
     let v = split_error_event(&out);
-    assert_eq!(v["error"]["code"], "invalid_request");
+    assert_eq!(v["error"]["code"], "cli_unknown_argument");
 }

@@ -50,17 +50,15 @@ fn locked_profile_override_error(flag: &str) -> String {
     format!("{flag} cannot override an administrator-locked afpsql-readonly profile")
 }
 
-/// Reject stdout/stderr redirection by mirroring the exact scanner the redirect
-/// installer runs.
+/// Reject stdout/stderr redirection before the argv is parsed at all.
 ///
-/// `stream_redirect::install_from_raw_args` scans the raw argv independently of
-/// the CLI parser's value consumption, so it acts on a `--stdout-file` that a
-/// value-skipping walk treats as another flag's argument (for example
-/// `--sql --stdout-file=/path`). That install creates or appends to a local
-/// file before any capability check runs. Detecting the redirect with the same
-/// parser that would install it — and failing closed on its errors — guarantees
-/// the two never diverge, so no redirect target can be smuggled past this guard
-/// as an opaque flag value.
+/// A locked profile fixes the endpoint and the transport, so it must also refuse
+/// to create local files. This runs ahead of the registry rather than reading
+/// the resolved output plan, because failing closed here needs no agreement with
+/// the parser about which token is a flag: any `--stdout-file`/`--stderr-file`
+/// anywhere in argv — including where a value-skipping walk would read it as
+/// another argument's value — is refused. The redirect itself is installed only
+/// from a resolved plan, well after this guard has had its say.
 fn reject_stream_redirect(args: &[String]) -> Result<(), String> {
     match agent_first_data::stream_redirect::config_from_raw_args(args.iter().cloned()) {
         Ok(None) => Ok(()),
@@ -74,35 +72,38 @@ fn reject_stream_redirect(args: &[String]) -> Result<(), String> {
 fn is_connection_or_transport_flag(flag: &str) -> bool {
     matches!(
         flag,
-        "--dsn-secret"
-            | "--dsn-secret-env"
-            | "--dsn-secret-config"
-            | "--conninfo-secret"
-            | "--conninfo-secret-env"
-            | "--conninfo-secret-config"
+        "--dsn"
+            | "--conninfo"
             | "--host"
             | "--port"
             | "--user"
             | "--dbname"
-            | "--password-secret"
-            | "--password-secret-env"
-            | "--password-secret-config"
+            | "--password"
             | "--ssh"
             | "--ssh-via"
             | "--ssh-option"
-            | "--ssh-local-host"
-            | "--ssh-local-port"
             | "--ssh-remote-socket"
             | "--ssh-sudo-user"
-            | "--container"
-            | "--container-driver"
-            | "--container-runtime"
-            | "--container-user"
-            | "--container-namespace"
-            | "--container-context"
+            | "--container-docker-name"
+            | "--container-docker-user"
+            | "--container-docker-context"
+            | "--container-docker-runtime"
+            | "--container-podman-name"
+            | "--container-podman-user"
+            | "--container-podman-runtime"
+            | "--container-nerdctl-name"
+            | "--container-nerdctl-user"
+            | "--container-nerdctl-runtime"
+            | "--container-compose-service"
+            | "--container-compose-user"
             | "--container-compose-file"
             | "--container-compose-project"
-            | "--container-pod-container"
+            | "--container-compose-runtime"
+            | "--container-kubectl-pod"
+            | "--container-kubectl-container"
+            | "--container-kubectl-namespace"
+            | "--container-kubectl-context"
+            | "--container-kubectl-runtime"
     )
 }
 
@@ -186,9 +187,9 @@ fn is_opaque_value_flag(flag: &str) -> bool {
         flag,
         "--sql"
             | "--param"
-            | "--dsn-secret"
-            | "--conninfo-secret"
-            | "--password-secret"
+            | "--dsn"
+            | "--conninfo"
+            | "--password"
             | "--host"
             | "--port"
             | "--user"
@@ -196,19 +197,25 @@ fn is_opaque_value_flag(flag: &str) -> bool {
             | "--ssh"
             | "--ssh-via"
             | "--ssh-option"
-            | "--ssh-local-host"
-            | "--ssh-local-port"
             | "--ssh-remote-socket"
             | "--ssh-sudo-user"
-            | "--container"
-            | "--container-driver"
-            | "--container-user"
-            | "--container-namespace"
-            | "--container-context"
+            | "--container-docker-name"
+            | "--container-docker-user"
+            | "--container-docker-context"
+            | "--container-podman-name"
+            | "--container-podman-user"
+            | "--container-nerdctl-name"
+            | "--container-nerdctl-user"
+            | "--container-compose-service"
+            | "--container-compose-user"
             | "--container-compose-file"
             | "--container-compose-project"
-            | "--container-pod-container"
+            | "--container-kubectl-pod"
+            | "--container-kubectl-container"
+            | "--container-kubectl-namespace"
+            | "--container-kubectl-context"
             | "--permission"
+            | "--explain"
             | "--mode"
             | "--output"
             | "--log"
@@ -232,15 +239,20 @@ fn is_opaque_value_flag(flag: &str) -> bool {
 fn is_value_flag(flag: &str) -> bool {
     matches!(
         flag,
-        "--stdout-file"
-            | "--stderr-file"
-            | "--sql-file"
-            | "--file"
-            | "-f"
-            | "--container-runtime"
-            | "--dsn-secret-env"
-            | "--conninfo-secret-env"
-            | "--password-secret-env"
+        "--stdout-file" | "--stderr-file" | "--sql-file" | "--file" | "-f"
+    ) || is_container_runtime_flag(flag)
+}
+
+/// Every driver family's runtime override: naming the executable is what makes
+/// container transport able to run an arbitrary command.
+fn is_container_runtime_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--container-docker-runtime"
+            | "--container-podman-runtime"
+            | "--container-nerdctl-runtime"
+            | "--container-compose-runtime"
+            | "--container-kubectl-runtime"
     )
 }
 
@@ -252,20 +264,9 @@ fn validate_raw_value(flag: &str, value: &str) -> Result<(), String> {
         "--sql-file" | "--file" | "-f" if value != "-" => Err(format!(
             "{flag} only accepts `-` in afpsql-readonly; use inline SQL or stdin"
         )),
-        "--container-runtime" => Err(
-            "--container-runtime is unavailable in afpsql-readonly; select a typed --container-driver with its fixed runtime"
-                .to_string(),
-        ),
-        "--dsn-secret-env" if !matches!(value, "DATABASE_URL" | "AFPSQL_DSN_SECRET") => {
-            Err("--dsn-secret-env in afpsql-readonly only accepts DATABASE_URL or AFPSQL_DSN_SECRET".to_string())
-        }
-        "--conninfo-secret-env" if value != "AFPSQL_CONNINFO_SECRET" => Err(
-            "--conninfo-secret-env in afpsql-readonly only accepts AFPSQL_CONNINFO_SECRET"
-                .to_string(),
-        ),
-        "--password-secret-env" if !matches!(value, "PGPASSWORD" | "AFPSQL_PASSWORD_SECRET") => {
-            Err("--password-secret-env in afpsql-readonly only accepts PGPASSWORD or AFPSQL_PASSWORD_SECRET".to_string())
-        }
+        _ if is_container_runtime_flag(flag) => Err(format!(
+            "{flag} is unavailable in afpsql-readonly; each container driver family runs its own fixed runtime"
+        )),
         _ => Ok(()),
     }
 }
@@ -275,14 +276,40 @@ pub fn validate_session(session: &SessionConfig) -> Result<(), String> {
 }
 
 pub fn validate_session_with_trust(
-    _session: &SessionConfig,
-    _trusted_profile: bool,
+    session: &SessionConfig,
+    trusted_profile: bool,
 ) -> Result<(), String> {
+    if session.container.runtime_override().is_some() && !trusted_profile {
+        return Err(
+            "custom container runtime is unavailable in afpsql-readonly; use a container driver family with its fixed runtime"
+                .to_string(),
+        );
+    }
+    for option in &session.ssh.options {
+        let key = option
+            .split_once('=')
+            .map_or(option.as_str(), |(key, _)| key)
+            .trim();
+        if !matches!(
+            key.to_ascii_lowercase().as_str(),
+            "connectionattempts"
+                | "connecttimeout"
+                | "port"
+                | "proxyjump"
+                | "serveralivecountmax"
+                | "serveraliveinterval"
+                | "tcpkeepalive"
+        ) {
+            return Err(format!(
+                "SSH option `{key}` is unavailable in afpsql-readonly; allowed options are ConnectionAttempts, ConnectTimeout, Port, ProxyJump, ServerAliveCountMax, ServerAliveInterval, and TCPKeepAlive"
+            ));
+        }
+    }
     Ok(())
 }
 
 pub fn validate_sql(sql: &str) -> Result<(), String> {
-    let keywords = leading_keywords(sql, 3);
+    let keywords = leading_keywords(sql, 4);
     let is_transaction_control = matches!(
         keywords.first().map(String::as_str),
         Some("begin" | "commit" | "end" | "rollback" | "abort" | "savepoint" | "release")
@@ -291,7 +318,10 @@ pub fn validate_sql(sql: &str) -> Result<(), String> {
                 || (first == "prepare" && second == "transaction")
                 || (first == "set" && second == "transaction"))
         || matches!(keywords.as_slice(), [first, second, third, ..]
-            if first == "set" && second == "session" && third == "characteristics");
+            if first == "set"
+                && ((second == "session" && third == "characteristics")
+                    || (matches!(second.as_str(), "local" | "session")
+                        && third == "transaction")));
     if is_transaction_control {
         Err(
             "transaction control SQL is unavailable in afpsql-readonly; use pipe begin/commit/rollback requests so the readonly state machine remains authoritative"
@@ -374,7 +404,11 @@ mod tests {
             // `--sql-file` has no scanner independent of the CLI parser, so an
             // inert value that merely looks like a flag stays inert.
             vec!["afpsql-readonly", "-c", "--sql-file=/tmp/not-a-flag"],
-            vec!["afpsql-readonly", "--param", "1=--container-runtime=touch"],
+            vec![
+                "afpsql-readonly",
+                "--param",
+                "1=--container-docker-runtime=touch",
+            ],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(validate_raw_args(&args).is_ok(), "rejected value {args:?}");
@@ -385,11 +419,8 @@ mod tests {
     fn ordinary_raw_policy_allows_arbitrary_explicit_secret_env_names() {
         for name in ["DATABASE_URL", "AFPSQL_DSN_SECRET", "AWS_SECRET_ACCESS_KEY"] {
             assert!(
-                validate_raw_args(&[
-                    "afpsql-readonly".to_string(),
-                    format!("--dsn-secret-env={name}")
-                ])
-                .is_ok()
+                validate_raw_args(&["afpsql-readonly".to_string(), format!("--dsn=env:{name}")])
+                    .is_ok()
             );
         }
     }
@@ -399,8 +430,9 @@ mod tests {
         for prohibited in [
             vec!["--stdout-file", "/tmp/out"],
             vec!["--sql-file", "/tmp/query.sql"],
-            vec!["--container-runtime", "custom-runtime"],
-            vec!["--dsn-secret-env", "AWS_SECRET_ACCESS_KEY"],
+            vec!["--container-docker-runtime", "custom-runtime"],
+            vec!["--container-kubectl-runtime", "custom-runtime"],
+            vec!["--dsn", "env:AWS_SECRET_ACCESS_KEY"],
         ] {
             for args in [
                 [
@@ -425,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_session_policy_allows_ssh_options_and_custom_runtime() {
+    fn readonly_session_policy_allows_only_safe_ssh_options_and_fixed_runtimes() {
         let allowed = SessionConfig {
             ssh: SshConfig {
                 options: vec![
@@ -450,17 +482,18 @@ mod tests {
                 },
                 ..Default::default()
             };
-            assert!(validate_session(&session).is_ok(), "rejected {option}");
+            assert!(validate_session(&session).is_err(), "accepted {option}");
         }
 
         let custom_runtime = SessionConfig {
             container: ContainerConfig {
-                runtime: Some("touch".to_string()),
+                compose_runtime: Some("touch".to_string()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert!(validate_session(&custom_runtime).is_ok());
+        assert!(validate_session(&custom_runtime).is_err());
+        assert!(validate_session_with_trust(&custom_runtime, true).is_ok());
     }
 
     #[test]
@@ -474,6 +507,8 @@ mod tests {
             "RELEASE SAVEPOINT s",
             "PREPARE TRANSACTION 'x'",
             "SET TRANSACTION READ WRITE",
+            "SET LOCAL TRANSACTION READ WRITE",
+            "SET SESSION TRANSACTION READ WRITE",
             "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
         ] {
             assert!(validate_sql(sql).is_err(), "accepted {sql}");
@@ -502,9 +537,9 @@ mod tests {
         for flag in [
             "--host",
             "--ssh",
-            "--container-runtime",
-            "--password-secret-env",
-            "--dsn-secret-config",
+            "--container-docker-runtime",
+            "--password",
+            "--dsn",
         ] {
             let args = vec![
                 "afpsql-readonly-production".to_string(),

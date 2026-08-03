@@ -61,9 +61,10 @@ pub enum Input {
         id: Option<String>,
         #[serde(default)]
         session: Option<String>,
-        /// When true, send `BEGIN READ ONLY`. Default is read-write so the
-        /// caller can run writes; per-query permission still gates the SQL.
-        #[serde(default)]
+        /// When true, send `BEGIN READ ONLY`. Read-only is the default;
+        /// read-write transactions require an explicit false value and a
+        /// matching write permission.
+        #[serde(default = "default_true")]
         read_only: bool,
         /// Pass `--permission write` (or matching ssh-write/container-write)
         /// to allow `BEGIN` on a session that defaults to read-only. Without
@@ -87,7 +88,7 @@ pub enum Input {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Permission {
     #[serde(rename = "read")]
     Read,
@@ -128,6 +129,10 @@ impl Permission {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl std::str::FromStr for Permission {
     type Err = String;
 
@@ -148,7 +153,6 @@ impl std::str::FromStr for Permission {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct QueryOptions {
     #[serde(default)]
     pub stream_rows: bool,
@@ -221,6 +225,7 @@ pub enum Output {
         hint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<String>,
+        retryable: bool,
         trace: Trace,
     },
     #[serde(rename = "error")]
@@ -459,53 +464,243 @@ impl SshConfig {
     }
 }
 
+/// The five container exec drivers.
+///
+/// A driver is never named directly. It is inferred from which
+/// `--container-<driver>-*` flag family (or matching session field family) the
+/// caller used, so an option a driver cannot express has no spelling at all
+/// rather than a runtime rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerDriver {
+    Docker,
+    Podman,
+    Nerdctl,
+    Compose,
+    Kubectl,
+}
+
+impl ContainerDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::Nerdctl => "nerdctl",
+            Self::Compose => "compose",
+            Self::Kubectl => "kubectl",
+        }
+    }
+
+    /// The command a driver execs through when the caller sets no runtime.
+    pub fn default_runtime(self) -> &'static str {
+        match self {
+            Self::Docker | Self::Compose => "docker",
+            Self::Podman => "podman",
+            Self::Nerdctl => "nerdctl",
+            Self::Kubectl => "kubectl",
+        }
+    }
+
+    /// The flag that names this driver's exec target.
+    pub fn target_flag(self) -> &'static str {
+        match self {
+            Self::Docker => "--container-docker-name",
+            Self::Podman => "--container-podman-name",
+            Self::Nerdctl => "--container-nerdctl-name",
+            Self::Compose => "--container-compose-service",
+            Self::Kubectl => "--container-kubectl-pod",
+        }
+    }
+
+    /// How to spell this driver's whole flag family in a message.
+    pub fn flag_family(self) -> &'static str {
+        match self {
+            Self::Docker => "--container-docker-*",
+            Self::Podman => "--container-podman-*",
+            Self::Nerdctl => "--container-nerdctl-*",
+            Self::Compose => "--container-compose-*",
+            Self::Kubectl => "--container-kubectl-*",
+        }
+    }
+}
+
+/// One flag family per driver, one field per (driver, option) pair.
+///
+/// Which options a driver supports is expressed by the field names themselves:
+/// there is no `kubectl_user` because `kubectl exec` has no exec-as-user
+/// option, and no `podman_context` because Podman has no context selection.
+/// The only combination left to check is that a caller stayed inside one family.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ContainerConfig {
-    #[serde(rename = "container", skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    #[serde(rename = "container_driver", skip_serializing_if = "Option::is_none")]
-    pub driver: Option<String>,
-    #[serde(rename = "container_runtime", skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
-    #[serde(rename = "container_user", skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(
-        rename = "container_namespace",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub namespace: Option<String>,
-    #[serde(rename = "container_context", skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
-    #[serde(
-        rename = "container_compose_files",
-        default,
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub podman_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub podman_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub podman_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nerdctl_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nerdctl_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nerdctl_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compose_files: Vec<String>,
-    #[serde(
-        rename = "container_compose_project",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_project: Option<String>,
-    #[serde(
-        rename = "container_pod_container",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub pod_container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_pod: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubectl_runtime: Option<String>,
 }
 
 impl ContainerConfig {
     pub fn has_transport_fields(&self) -> bool {
-        self.target.is_some()
-            || self.driver.is_some()
-            || self.runtime.is_some()
-            || self.user.is_some()
-            || self.namespace.is_some()
-            || self.context.is_some()
-            || !self.compose_files.is_empty()
-            || self.compose_project.is_some()
-            || self.pod_container.is_some()
+        self.family_flags().iter().any(|(_, flag)| flag.is_some())
     }
+
+    /// Which driver family the caller used, or `None` for no container
+    /// transport at all.
+    ///
+    /// Two families at once is the one combination this surface still has to
+    /// reject, and the error names both offending flags.
+    pub fn selected_driver(&self) -> Result<Option<ContainerDriver>, String> {
+        let mut selected: Option<(ContainerDriver, &'static str)> = None;
+        for (driver, flag) in self.family_flags() {
+            let Some(flag) = flag else { continue };
+            match selected {
+                None => selected = Some((driver, flag)),
+                Some((_, first)) => {
+                    return Err(format!(
+                        "{first} cannot be combined with {flag}; each container driver has its own flag family"
+                    ));
+                }
+            }
+        }
+        Ok(selected.map(|(driver, _)| driver))
+    }
+
+    /// The container, service, or pod this session execs into, whichever family
+    /// named it.
+    pub fn target_name(&self) -> Option<&str> {
+        self.docker_name
+            .as_deref()
+            .or(self.podman_name.as_deref())
+            .or(self.nerdctl_name.as_deref())
+            .or(self.compose_service.as_deref())
+            .or(self.kubectl_pod.as_deref())
+    }
+
+    /// The runtime command override, whichever family named it.
+    pub fn runtime_override(&self) -> Option<&str> {
+        self.docker_runtime
+            .as_deref()
+            .or(self.podman_runtime.as_deref())
+            .or(self.nerdctl_runtime.as_deref())
+            .or(self.compose_runtime.as_deref())
+            .or(self.kubectl_runtime.as_deref())
+    }
+
+    /// For each driver, the first flag of its family the caller set.
+    fn family_flags(&self) -> [(ContainerDriver, Option<&'static str>); 5] {
+        [
+            (
+                ContainerDriver::Docker,
+                first_present(&[
+                    ("--container-docker-name", self.docker_name.is_some()),
+                    ("--container-docker-user", self.docker_user.is_some()),
+                    ("--container-docker-context", self.docker_context.is_some()),
+                    ("--container-docker-runtime", self.docker_runtime.is_some()),
+                ]),
+            ),
+            (
+                ContainerDriver::Podman,
+                first_present(&[
+                    ("--container-podman-name", self.podman_name.is_some()),
+                    ("--container-podman-user", self.podman_user.is_some()),
+                    ("--container-podman-runtime", self.podman_runtime.is_some()),
+                ]),
+            ),
+            (
+                ContainerDriver::Nerdctl,
+                first_present(&[
+                    ("--container-nerdctl-name", self.nerdctl_name.is_some()),
+                    ("--container-nerdctl-user", self.nerdctl_user.is_some()),
+                    (
+                        "--container-nerdctl-runtime",
+                        self.nerdctl_runtime.is_some(),
+                    ),
+                ]),
+            ),
+            (
+                ContainerDriver::Compose,
+                first_present(&[
+                    (
+                        "--container-compose-service",
+                        self.compose_service.is_some(),
+                    ),
+                    ("--container-compose-user", self.compose_user.is_some()),
+                    ("--container-compose-file", !self.compose_files.is_empty()),
+                    (
+                        "--container-compose-project",
+                        self.compose_project.is_some(),
+                    ),
+                    (
+                        "--container-compose-runtime",
+                        self.compose_runtime.is_some(),
+                    ),
+                ]),
+            ),
+            (
+                ContainerDriver::Kubectl,
+                first_present(&[
+                    ("--container-kubectl-pod", self.kubectl_pod.is_some()),
+                    (
+                        "--container-kubectl-container",
+                        self.kubectl_container.is_some(),
+                    ),
+                    (
+                        "--container-kubectl-namespace",
+                        self.kubectl_namespace.is_some(),
+                    ),
+                    (
+                        "--container-kubectl-context",
+                        self.kubectl_context.is_some(),
+                    ),
+                    (
+                        "--container-kubectl-runtime",
+                        self.kubectl_runtime.is_some(),
+                    ),
+                ]),
+            ),
+        ]
+    }
+}
+
+fn first_present(fields: &[(&'static str, bool)]) -> Option<&'static str> {
+    fields
+        .iter()
+        .find(|(_, present)| *present)
+        .map(|(flag, _)| *flag)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -540,23 +735,45 @@ struct SessionConfigFlat {
     #[serde(default)]
     ssh_sudo_user: Option<String>,
     #[serde(default)]
-    container: Option<String>,
+    docker_name: Option<String>,
     #[serde(default)]
-    container_driver: Option<String>,
+    docker_user: Option<String>,
     #[serde(default)]
-    container_runtime: Option<String>,
+    docker_context: Option<String>,
     #[serde(default)]
-    container_user: Option<String>,
+    docker_runtime: Option<String>,
     #[serde(default)]
-    container_namespace: Option<String>,
+    podman_name: Option<String>,
     #[serde(default)]
-    container_context: Option<String>,
+    podman_user: Option<String>,
     #[serde(default)]
-    container_compose_files: Vec<String>,
+    podman_runtime: Option<String>,
     #[serde(default)]
-    container_compose_project: Option<String>,
+    nerdctl_name: Option<String>,
     #[serde(default)]
-    container_pod_container: Option<String>,
+    nerdctl_user: Option<String>,
+    #[serde(default)]
+    nerdctl_runtime: Option<String>,
+    #[serde(default)]
+    compose_service: Option<String>,
+    #[serde(default)]
+    compose_user: Option<String>,
+    #[serde(default)]
+    compose_files: Vec<String>,
+    #[serde(default)]
+    compose_project: Option<String>,
+    #[serde(default)]
+    compose_runtime: Option<String>,
+    #[serde(default)]
+    kubectl_pod: Option<String>,
+    #[serde(default)]
+    kubectl_container: Option<String>,
+    #[serde(default)]
+    kubectl_namespace: Option<String>,
+    #[serde(default)]
+    kubectl_context: Option<String>,
+    #[serde(default)]
+    kubectl_runtime: Option<String>,
 }
 
 impl From<SessionConfigFlat> for SessionConfig {
@@ -580,15 +797,26 @@ impl From<SessionConfigFlat> for SessionConfig {
                 sudo_user: flat.ssh_sudo_user,
             },
             container: ContainerConfig {
-                target: flat.container,
-                driver: flat.container_driver,
-                runtime: flat.container_runtime,
-                user: flat.container_user,
-                namespace: flat.container_namespace,
-                context: flat.container_context,
-                compose_files: flat.container_compose_files,
-                compose_project: flat.container_compose_project,
-                pod_container: flat.container_pod_container,
+                docker_name: flat.docker_name,
+                docker_user: flat.docker_user,
+                docker_context: flat.docker_context,
+                docker_runtime: flat.docker_runtime,
+                podman_name: flat.podman_name,
+                podman_user: flat.podman_user,
+                podman_runtime: flat.podman_runtime,
+                nerdctl_name: flat.nerdctl_name,
+                nerdctl_user: flat.nerdctl_user,
+                nerdctl_runtime: flat.nerdctl_runtime,
+                compose_service: flat.compose_service,
+                compose_user: flat.compose_user,
+                compose_files: flat.compose_files,
+                compose_project: flat.compose_project,
+                compose_runtime: flat.compose_runtime,
+                kubectl_pod: flat.kubectl_pod,
+                kubectl_container: flat.kubectl_container,
+                kubectl_namespace: flat.kubectl_namespace,
+                kubectl_context: flat.kubectl_context,
+                kubectl_runtime: flat.kubectl_runtime,
             },
         }
     }
@@ -613,14 +841,19 @@ impl SessionConfig {
     }
 
     pub fn transport_kind(&self) -> Result<TransportKind, String> {
+        // Two driver families name two drivers, so the session has no container
+        // transport to select until one of them goes. Rejected here so a pipe
+        // session fails on the request rather than at connect time.
+        self.container.selected_driver()?;
         let uses_ssh = self.uses_ssh_transport();
         let uses_container = self.uses_container_transport();
         match (uses_ssh, uses_container) {
             (false, false) => Ok(TransportKind::Direct),
             (true, false) => Ok(TransportKind::Ssh),
             (false, true) => Ok(TransportKind::Container),
-            // --ssh + --container means "run container exec on that remote host".
-            // The PostgreSQL connection still crosses the container boundary.
+            // --ssh plus a container driver family means "run container exec on
+            // that remote host". The PostgreSQL connection still crosses the
+            // container boundary.
             (true, true) => Ok(TransportKind::Container),
         }
     }
@@ -744,15 +977,26 @@ pub struct SshConfigPatch {
 
 #[derive(Debug, Default)]
 pub struct ContainerConfigPatch {
-    pub target: PatchField<String>,
-    pub driver: PatchField<String>,
-    pub runtime: PatchField<String>,
-    pub user: PatchField<String>,
-    pub namespace: PatchField<String>,
-    pub context: PatchField<String>,
+    pub docker_name: PatchField<String>,
+    pub docker_user: PatchField<String>,
+    pub docker_context: PatchField<String>,
+    pub docker_runtime: PatchField<String>,
+    pub podman_name: PatchField<String>,
+    pub podman_user: PatchField<String>,
+    pub podman_runtime: PatchField<String>,
+    pub nerdctl_name: PatchField<String>,
+    pub nerdctl_user: PatchField<String>,
+    pub nerdctl_runtime: PatchField<String>,
+    pub compose_service: PatchField<String>,
+    pub compose_user: PatchField<String>,
     pub compose_files: PatchField<Vec<String>>,
     pub compose_project: PatchField<String>,
-    pub pod_container: PatchField<String>,
+    pub compose_runtime: PatchField<String>,
+    pub kubectl_pod: PatchField<String>,
+    pub kubectl_container: PatchField<String>,
+    pub kubectl_namespace: PatchField<String>,
+    pub kubectl_context: PatchField<String>,
+    pub kubectl_runtime: PatchField<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -787,23 +1031,45 @@ struct SessionConfigPatchFlat {
     #[serde(default)]
     ssh_sudo_user: PatchField<String>,
     #[serde(default)]
-    container: PatchField<String>,
+    docker_name: PatchField<String>,
     #[serde(default)]
-    container_driver: PatchField<String>,
+    docker_user: PatchField<String>,
     #[serde(default)]
-    container_runtime: PatchField<String>,
+    docker_context: PatchField<String>,
     #[serde(default)]
-    container_user: PatchField<String>,
+    docker_runtime: PatchField<String>,
     #[serde(default)]
-    container_namespace: PatchField<String>,
+    podman_name: PatchField<String>,
     #[serde(default)]
-    container_context: PatchField<String>,
+    podman_user: PatchField<String>,
     #[serde(default)]
-    container_compose_files: PatchField<Vec<String>>,
+    podman_runtime: PatchField<String>,
     #[serde(default)]
-    container_compose_project: PatchField<String>,
+    nerdctl_name: PatchField<String>,
     #[serde(default)]
-    container_pod_container: PatchField<String>,
+    nerdctl_user: PatchField<String>,
+    #[serde(default)]
+    nerdctl_runtime: PatchField<String>,
+    #[serde(default)]
+    compose_service: PatchField<String>,
+    #[serde(default)]
+    compose_user: PatchField<String>,
+    #[serde(default)]
+    compose_files: PatchField<Vec<String>>,
+    #[serde(default)]
+    compose_project: PatchField<String>,
+    #[serde(default)]
+    compose_runtime: PatchField<String>,
+    #[serde(default)]
+    kubectl_pod: PatchField<String>,
+    #[serde(default)]
+    kubectl_container: PatchField<String>,
+    #[serde(default)]
+    kubectl_namespace: PatchField<String>,
+    #[serde(default)]
+    kubectl_context: PatchField<String>,
+    #[serde(default)]
+    kubectl_runtime: PatchField<String>,
 }
 
 impl From<SessionConfigPatchFlat> for SessionConfigPatch {
@@ -826,15 +1092,26 @@ impl From<SessionConfigPatchFlat> for SessionConfigPatch {
                 sudo_user: flat.ssh_sudo_user,
             },
             container: ContainerConfigPatch {
-                target: flat.container,
-                driver: flat.container_driver,
-                runtime: flat.container_runtime,
-                user: flat.container_user,
-                namespace: flat.container_namespace,
-                context: flat.container_context,
-                compose_files: flat.container_compose_files,
-                compose_project: flat.container_compose_project,
-                pod_container: flat.container_pod_container,
+                docker_name: flat.docker_name,
+                docker_user: flat.docker_user,
+                docker_context: flat.docker_context,
+                docker_runtime: flat.docker_runtime,
+                podman_name: flat.podman_name,
+                podman_user: flat.podman_user,
+                podman_runtime: flat.podman_runtime,
+                nerdctl_name: flat.nerdctl_name,
+                nerdctl_user: flat.nerdctl_user,
+                nerdctl_runtime: flat.nerdctl_runtime,
+                compose_service: flat.compose_service,
+                compose_user: flat.compose_user,
+                compose_files: flat.compose_files,
+                compose_project: flat.compose_project,
+                compose_runtime: flat.compose_runtime,
+                kubectl_pod: flat.kubectl_pod,
+                kubectl_container: flat.kubectl_container,
+                kubectl_namespace: flat.kubectl_namespace,
+                kubectl_context: flat.kubectl_context,
+                kubectl_runtime: flat.kubectl_runtime,
             },
         }
     }
@@ -850,7 +1127,6 @@ impl<'de> Deserialize<'de> for SessionConfigPatch {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ResolvedOptions {
     pub stream_rows: bool,
     pub batch_rows: usize,

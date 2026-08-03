@@ -4,6 +4,11 @@ use agent_first_data::cli_parse_log_filters;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl RuntimeConfig {
+    #[cfg(test)]
+    pub fn resolve_options(&self, q: &QueryOptions) -> ResolvedOptions {
+        self.resolve_options_with_permission(q, q.permission.unwrap_or(Permission::Read))
+    }
+
     pub fn apply_update(&mut self, patch: ConfigPatch) {
         if let Some(v) = patch.default_session {
             self.default_session = v;
@@ -68,44 +73,68 @@ impl RuntimeConfig {
                 if let Some(v) = s.ssh.sudo_user.into_update() {
                     entry.ssh.sudo_user = v;
                 }
-                if let Some(v) = s.container.target.into_update() {
-                    entry.container.target = v;
-                }
-                if let Some(v) = s.container.driver.into_update() {
-                    entry.container.driver = v;
-                }
-                if let Some(v) = s.container.runtime.into_update() {
-                    entry.container.runtime = v;
-                }
-                if let Some(v) = s.container.user.into_update() {
-                    entry.container.user = v;
-                }
-                if let Some(v) = s.container.namespace.into_update() {
-                    entry.container.namespace = v;
-                }
-                if let Some(v) = s.container.context.into_update() {
-                    entry.container.context = v;
-                }
-                if let Some(v) = s.container.compose_files.into_update() {
+                let container = s.container;
+                apply_patch(&mut entry.container.docker_name, container.docker_name);
+                apply_patch(&mut entry.container.docker_user, container.docker_user);
+                apply_patch(
+                    &mut entry.container.docker_context,
+                    container.docker_context,
+                );
+                apply_patch(
+                    &mut entry.container.docker_runtime,
+                    container.docker_runtime,
+                );
+                apply_patch(&mut entry.container.podman_name, container.podman_name);
+                apply_patch(&mut entry.container.podman_user, container.podman_user);
+                apply_patch(
+                    &mut entry.container.podman_runtime,
+                    container.podman_runtime,
+                );
+                apply_patch(&mut entry.container.nerdctl_name, container.nerdctl_name);
+                apply_patch(&mut entry.container.nerdctl_user, container.nerdctl_user);
+                apply_patch(
+                    &mut entry.container.nerdctl_runtime,
+                    container.nerdctl_runtime,
+                );
+                apply_patch(
+                    &mut entry.container.compose_service,
+                    container.compose_service,
+                );
+                apply_patch(&mut entry.container.compose_user, container.compose_user);
+                if let Some(v) = container.compose_files.into_update() {
                     entry.container.compose_files = v.unwrap_or_default();
                 }
-                if let Some(v) = s.container.compose_project.into_update() {
-                    entry.container.compose_project = v;
-                }
-                if let Some(v) = s.container.pod_container.into_update() {
-                    entry.container.pod_container = v;
-                }
+                apply_patch(
+                    &mut entry.container.compose_project,
+                    container.compose_project,
+                );
+                apply_patch(
+                    &mut entry.container.compose_runtime,
+                    container.compose_runtime,
+                );
+                apply_patch(&mut entry.container.kubectl_pod, container.kubectl_pod);
+                apply_patch(
+                    &mut entry.container.kubectl_container,
+                    container.kubectl_container,
+                );
+                apply_patch(
+                    &mut entry.container.kubectl_namespace,
+                    container.kubectl_namespace,
+                );
+                apply_patch(
+                    &mut entry.container.kubectl_context,
+                    container.kubectl_context,
+                );
+                apply_patch(
+                    &mut entry.container.kubectl_runtime,
+                    container.kubectl_runtime,
+                );
             }
         }
         if !self.sessions.contains_key(&self.default_session) {
             self.sessions
                 .insert(self.default_session.clone(), SessionConfig::default());
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn resolve_options(&self, q: &QueryOptions) -> ResolvedOptions {
-        self.resolve_options_with_permission(q, q.permission.unwrap_or(Permission::Read))
     }
 
     pub fn resolve_options_for_session(
@@ -149,6 +178,21 @@ impl RuntimeConfig {
         Ok(self.resolve_options_with_permission(q, permission))
     }
 
+    pub fn resolve_write_options_for_session(
+        &self,
+        q: &QueryOptions,
+        session: &SessionConfig,
+    ) -> Result<ResolvedOptions, String> {
+        let resolved = self.resolve_options_for_session(q, session)?;
+        if resolved.read_only {
+            return Err(
+                "read-write transaction requires an explicit write permission matching the session transport"
+                    .to_string(),
+            );
+        }
+        Ok(resolved)
+    }
+
     fn resolve_options_with_permission(
         &self,
         q: &QueryOptions,
@@ -164,6 +208,13 @@ impl RuntimeConfig {
             inline_max_rows: q.inline_max_rows.unwrap_or(self.inline_max_rows),
             inline_max_bytes: q.inline_max_bytes.unwrap_or(self.inline_max_bytes),
         }
+    }
+}
+
+/// Apply one patch field in place: absent leaves the value, null clears it.
+fn apply_patch<T>(field: &mut Option<T>, patch: PatchField<T>) {
+    if let Some(update) = patch.into_update() {
+        *field = update;
     }
 }
 

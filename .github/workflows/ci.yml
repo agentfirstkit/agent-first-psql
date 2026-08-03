@@ -31,6 +31,11 @@ jobs:
       AFPSQL_TEST_DSN_SECRET: postgresql://test:test@localhost:5432/test?sslmode=disable
       DATABASE_URL: postgresql://test:test@localhost:5432/test?sslmode=disable
       PGSSLMODE: disable
+      # `all` is the release gate and includes the container e2e, which runs
+      # only when this is set. The service container above covers the
+      # integration suites; the e2e builds its own PostgreSQL on a private
+      # Docker network and does not use it.
+      AFPSQL_E2E: "1"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -53,35 +58,9 @@ jobs:
       - name: Validate Agent Skill
         run: afdata skill validate skills/agent-first-psql
 
-      # Use the fixed test entrypoint rather than a hand-written command list,
-      # so CI and the local release gate cannot drift apart.
-      - name: Static and integration
-        run: ./scripts/test.sh all
-
-      - name: PostgreSQL smoke
-        run: cargo run -- --dsn-secret "$AFPSQL_TEST_DSN_SECRET" --sql "select 1 as n"
-
-  container-e2e:
-    runs-on: ubuntu-latest
-
-    env:
-      AFPSQL_E2E: "1"
-
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
+      # The container e2e exercises the SSH transport too when these are set.
+      # They are optional in the test, so without this fixture the SSH
+      # assertions would silently not run.
       - name: Configure SSH transport fixture
         run: |
           sudo apt-get update
@@ -96,9 +75,18 @@ jobs:
           echo "AFPSQL_E2E_SSH=$USER@localhost" >> "$GITHUB_ENV"
           echo "AFPSQL_E2E_SSH_PROXY_JUMP=$USER@127.0.0.1" >> "$GITHUB_ENV"
 
-      - name: Docker container transport
+      - name: Prefetch container e2e images
         run: |
           docker version
           docker pull postgres:16
           docker pull ubuntu:22.04
-          ./scripts/test.sh container
+
+      # Run the release gate itself, not a hand-written command list: Step 0 of
+      # the release is `projects.sh test agent-first-psql all`, so anything that
+      # can fail a release fails here first. `all` covers static, integration
+      # against the service container, the container e2e, and the release smoke.
+      - name: Release gate
+        run: ./scripts/test.sh all
+
+      - name: PostgreSQL smoke
+        run: cargo run -- --dsn "$AFPSQL_TEST_DSN_SECRET" --sql "select 1 as n"

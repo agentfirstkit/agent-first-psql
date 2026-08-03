@@ -19,6 +19,10 @@ fn readonly() -> &'static str {
     env!("CARGO_BIN_EXE_afpsql-readonly")
 }
 
+fn config_source(flag: &str, file: &str, dot_path: &str) -> [String; 2] {
+    [flag.to_string(), format!("file:{file}#{dot_path}")]
+}
+
 fn temp_config(name: &str, extension: &str, content: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "afpsql-config-source-{name}-{}.{extension}",
@@ -70,16 +74,18 @@ fn canonical_config_sources_resolve_before_all_cli_paths_without_leaking() {
         ),
     );
     let path_text = path.to_str().expect("utf8 path");
-    for suffix in [
+    // A command path is a prefix of argv, so a subcommand comes before its
+    // arguments; there are no globals to hoist in front of it.
+    for prefix in [
         vec!["--sql", "select 1"],
         vec!["inspect", "schemas"],
         vec!["--dry-run", "--sql", "select 1"],
-        vec!["--explain", "--sql", "select 1"],
-        vec!["--explain-analyze", "--sql", "select 1"],
+        vec!["--explain", "plan", "--sql", "select 1"],
+        vec!["--explain", "analyze", "--sql", "select 1"],
     ] {
         let output = Command::new(afpsql())
-            .args(["--dsn-secret-config", path_text, "database.url"])
-            .args(suffix)
+            .args(prefix)
+            .args(config_source("--dsn", path_text, "database.url"))
             .output()
             .expect("run canonical config source");
         assert!(!output.status.success());
@@ -88,11 +94,11 @@ fn canonical_config_sources_resolve_before_all_cli_paths_without_leaking() {
     }
 
     for (flag, dot_path) in [
-        ("--conninfo-secret-config", "database.conninfo"),
-        ("--password-secret-config", "database.password"),
+        ("--conninfo", "database.conninfo"),
+        ("--password", "database.password"),
     ] {
         let output = Command::new(afpsql())
-            .args([flag, path_text, dot_path])
+            .args(config_source(flag, path_text, dot_path))
             .args(["--host", "127.0.0.1", "--port", "1", "--sql", "select 1"])
             .output()
             .expect("run config secret slot");
@@ -110,13 +116,13 @@ fn pipe_startup_config_is_read_once_and_serializes_only_redaction() {
         &format!("DATABASE_URL=postgresql://user:{DSN_CANARY}@127.0.0.1:1/db\n"),
     );
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#DATABASE_URL");
     let mut child = Command::new(afpsql())
         .args([
             "--mode",
             "pipe",
-            "--dsn-secret-config",
-            path_text,
-            "DATABASE_URL",
+            "--dsn",
+            &source,
             "--log",
             "startup",
             "--output-to",
@@ -168,23 +174,10 @@ fn psql_translation_accepts_space_form_on_both_sides_of_command_only() {
         &format!("DATABASE_URL=postgresql://user:{DSN_CANARY}@127.0.0.1:1/db\n"),
     );
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#DATABASE_URL");
     for args in [
-        vec![
-            "--mode=psql",
-            "--dsn-secret-config",
-            path_text,
-            "DATABASE_URL",
-            "-c",
-            "select 1",
-        ],
-        vec![
-            "--mode=psql",
-            "-c",
-            "select 1",
-            "--dsn-secret-config",
-            path_text,
-            "DATABASE_URL",
-        ],
+        vec!["--mode=psql", "--dsn", &source, "-c", "select 1"],
+        vec!["--mode=psql", "-c", "select 1", "--dsn", &source],
     ] {
         let output = Command::new(afpsql())
             .args(args)
@@ -195,11 +188,17 @@ fn psql_translation_accepts_space_form_on_both_sides_of_command_only() {
         assert_no_canaries(&output);
     }
 
-    let equals = format!("--dsn-secret-config={path_text}");
+    // A malformed typed source is rejected in psql mode too.
     let output = Command::new(afpsql())
-        .args(["--mode=psql", &equals, "DATABASE_URL", "-c", "select 1"])
+        .args([
+            "--mode=psql",
+            "--dsn",
+            "file:missing-path-separator",
+            "-c",
+            "select 1",
+        ])
         .output()
-        .expect("run rejected equals form");
+        .expect("run half a config source");
     assert_eq!(output.status.code(), Some(2));
     std::fs::remove_file(path).expect("remove config source");
 }
@@ -212,14 +211,9 @@ fn ordinary_readonly_accepts_config_and_arbitrary_env_but_still_rejects_write() 
         &format!("database:\n  url: postgresql://user:{DSN_CANARY}@127.0.0.1:1/db\n"),
     );
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#database.url");
     let read = Command::new(readonly())
-        .args([
-            "--dsn-secret-config",
-            path_text,
-            "database.url",
-            "--sql",
-            "select 1",
-        ])
+        .args(["--dsn", &source, "--sql", "select 1"])
         .output()
         .expect("run readonly config source");
     assert_eq!(first_event(&read)["error"]["code"], "connect_failed");
@@ -227,9 +221,8 @@ fn ordinary_readonly_accepts_config_and_arbitrary_env_but_still_rejects_write() 
 
     let write = Command::new(readonly())
         .args([
-            "--dsn-secret-config",
-            path_text,
-            "database.url",
+            "--dsn",
+            &source,
             "--permission",
             "write",
             "--sql",
@@ -247,8 +240,8 @@ fn ordinary_readonly_accepts_config_and_arbitrary_env_but_still_rejects_write() 
             format!("postgresql://user:{DSN_CANARY}@127.0.0.1:1/db"),
         )
         .args([
-            "--dsn-secret-env",
-            "CUSTOM_APPLICATION_DATABASE_URL",
+            "--dsn",
+            "env:CUSTOM_APPLICATION_DATABASE_URL",
             "--sql",
             "select 1",
         ])
@@ -284,14 +277,9 @@ fn config_source_errors_are_exit_two_and_never_include_source_values() {
         ("unknown", "txt", &format!("value={DSN_CANARY}"), "value"),
     ] {
         let config = temp_config(name, extension, content);
+        let source = format!("file:{}#{path}", config.to_str().expect("utf8 path"));
         let output = Command::new(afpsql())
-            .args([
-                "--dsn-secret-config",
-                config.to_str().expect("utf8 path"),
-                path,
-                "--sql",
-                "select 1",
-            ])
+            .args(["--dsn", &source, "--sql", "select 1"])
             .output()
             .expect("run invalid config source");
         assert_eq!(
@@ -309,14 +297,9 @@ fn config_source_errors_are_exit_two_and_never_include_source_values() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&missing);
+    let source = format!("file:{}#value", missing.to_str().expect("utf8 path"));
     let output = Command::new(afpsql())
-        .args([
-            "--dsn-secret-config",
-            missing.to_str().expect("utf8 path"),
-            "value",
-            "--sql",
-            "select 1",
-        ])
+        .args(["--dsn", &source, "--sql", "select 1"])
         .output()
         .expect("run missing config source");
     assert_eq!(output.status.code(), Some(2));
@@ -330,15 +313,10 @@ fn explicit_config_source_overrides_afpsql_environment_fallback() {
         "toml",
         &format!("[database]\nurl = 'postgresql://user:{DSN_CANARY}@127.0.0.1:1/db'\n"),
     );
+    let source = format!("file:{}#database.url", path.to_str().expect("utf8 path"));
     let output = Command::new(afpsql())
         .env("AFPSQL_DSN_SECRET", "not-a-valid-postgresql-dsn")
-        .args([
-            "--dsn-secret-config",
-            path.to_str().expect("utf8 path"),
-            "database.url",
-            "--sql",
-            "select 1",
-        ])
+        .args(["--dsn", &source, "--sql", "select 1"])
         .output()
         .expect("run source precedence");
     assert_eq!(first_event(&output)["error"]["code"], "connect_failed");
@@ -354,17 +332,23 @@ fn resolved_config_secret_reaches_ssh_container_and_combined_transports() {
         &format!("PGPASSWORD={PASSWORD_CANARY}\n"),
     );
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#PGPASSWORD");
     for transport in [
         vec!["--ssh", "invalid", "--ssh-option", "ConnectTimeout=1"],
-        vec!["--container", "invalid", "--container-runtime", "false"],
+        vec![
+            "--container-docker-name",
+            "invalid",
+            "--container-docker-runtime",
+            "false",
+        ],
         vec![
             "--ssh",
             "invalid",
             "--ssh-option",
             "ConnectTimeout=1",
-            "--container",
+            "--container-docker-name",
             "invalid",
-            "--container-runtime",
+            "--container-docker-runtime",
             "false",
         ],
     ] {
@@ -378,9 +362,8 @@ fn resolved_config_secret_reaches_ssh_container_and_combined_transports() {
                 "app",
                 "--dbname",
                 "app",
-                "--password-secret-config",
-                path_text,
-                "PGPASSWORD",
+                "--password",
+                &source,
                 "--sql",
                 "select 1",
             ])
@@ -403,13 +386,13 @@ fn ssh_transport_parses_dsn_config_in_process_without_leaking() {
         &format!("DATABASE_URL=postgresql://user:{DSN_CANARY}@db1:5432,db2:5433/app\n"),
     );
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#DATABASE_URL");
     let output = Command::new(afpsql())
         .args([
             "--ssh",
             "user@example.invalid",
-            "--dsn-secret-config",
-            path_text,
-            "DATABASE_URL",
+            "--dsn",
+            &source,
             "--sql",
             "select 1",
         ])
@@ -436,54 +419,36 @@ fn config_source_executes_live_canonical_psql_pipe_and_readonly_paths() {
     let content = serde_json::json!({"database": {"url": dsn}}).to_string();
     let path = temp_config("live", "json", &content);
     let path_text = path.to_str().expect("utf8 path");
+    let source = format!("file:{path_text}#database.url");
 
     for args in [
         vec!["--sql", "select 11 as n"],
         vec!["--dry-run", "--sql", "select 12 as n"],
-        vec!["--explain", "--sql", "select 13 as n"],
+        vec!["--explain", "plan", "--sql", "select 13 as n"],
         vec!["inspect", "schemas"],
     ] {
         let output = Command::new(afpsql())
-            .args(["--dsn-secret-config", path_text, "database.url"])
             .args(args)
+            .args(config_source("--dsn", path_text, "database.url"))
             .output()
             .expect("run live canonical config path");
         assert!(output.status.success(), "{}", combined(&output));
     }
 
     let psql = Command::new(afpsql())
-        .args([
-            "--mode=psql",
-            "--dsn-secret-config",
-            path_text,
-            "database.url",
-            "-c",
-            "select 14 as n",
-        ])
+        .args(["--mode=psql", "--dsn", &source, "-c", "select 14 as n"])
         .output()
         .expect("run live psql config path");
     assert!(psql.status.success(), "{}", combined(&psql));
 
     let readonly = Command::new(readonly())
-        .args([
-            "--dsn-secret-config",
-            path_text,
-            "database.url",
-            "--sql",
-            "select 15 as n",
-        ])
+        .args(["--dsn", &source, "--sql", "select 15 as n"])
         .output()
         .expect("run live readonly config path");
     assert!(readonly.status.success(), "{}", combined(&readonly));
 
     let mut pipe = Command::new(afpsql())
-        .args([
-            "--mode",
-            "pipe",
-            "--dsn-secret-config",
-            path_text,
-            "database.url",
-        ])
+        .args(["--mode", "pipe", "--dsn", &source])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

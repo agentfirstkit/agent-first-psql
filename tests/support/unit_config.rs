@@ -37,14 +37,17 @@ fn apply_update_merges_session_fields() {
                 sudo_user: PatchField::Value("postgres".to_string()),
             },
             container: ContainerConfigPatch {
-                target: PatchField::Value("pg-container".to_string()),
-                driver: PatchField::Value("podman".to_string()),
-                runtime: PatchField::Value("podman".to_string()),
-                user: PatchField::Value("postgres".to_string()),
-                namespace: PatchField::Value("prod".to_string()),
-                context: PatchField::Value("cluster-a".to_string()),
+                docker_name: PatchField::Value("pg-container".to_string()),
+                docker_user: PatchField::Value("postgres".to_string()),
+                docker_context: PatchField::Value("cluster-a".to_string()),
+                docker_runtime: PatchField::Value("podman".to_string()),
+                podman_name: PatchField::Value("pg-podman".to_string()),
+                nerdctl_name: PatchField::Value("pg-nerdctl".to_string()),
+                compose_service: PatchField::Value("db".to_string()),
                 compose_files: PatchField::Value(vec!["compose.yml".to_string()]),
                 compose_project: PatchField::Value("demo".to_string()),
+                kubectl_pod: PatchField::Value("pg-pod".to_string()),
+                kubectl_namespace: PatchField::Value("prod".to_string()),
                 ..Default::default()
             },
         },
@@ -81,14 +84,17 @@ fn apply_update_merges_session_fields() {
             Some("/var/run/postgresql/.s.PGSQL.5432")
         );
         assert_eq!(s1.ssh.sudo_user.as_deref(), Some("postgres"));
-        assert_eq!(s1.container.target.as_deref(), Some("pg-container"));
-        assert_eq!(s1.container.driver.as_deref(), Some("podman"));
-        assert_eq!(s1.container.runtime.as_deref(), Some("podman"));
-        assert_eq!(s1.container.user.as_deref(), Some("postgres"));
-        assert_eq!(s1.container.namespace.as_deref(), Some("prod"));
-        assert_eq!(s1.container.context.as_deref(), Some("cluster-a"));
+        assert_eq!(s1.container.docker_name.as_deref(), Some("pg-container"));
+        assert_eq!(s1.container.docker_user.as_deref(), Some("postgres"));
+        assert_eq!(s1.container.docker_context.as_deref(), Some("cluster-a"));
+        assert_eq!(s1.container.docker_runtime.as_deref(), Some("podman"));
+        assert_eq!(s1.container.podman_name.as_deref(), Some("pg-podman"));
+        assert_eq!(s1.container.nerdctl_name.as_deref(), Some("pg-nerdctl"));
+        assert_eq!(s1.container.compose_service.as_deref(), Some("db"));
         assert_eq!(s1.container.compose_files, vec!["compose.yml".to_string()]);
         assert_eq!(s1.container.compose_project.as_deref(), Some("demo"));
+        assert_eq!(s1.container.kubectl_pod.as_deref(), Some("pg-pod"));
+        assert_eq!(s1.container.kubectl_namespace.as_deref(), Some("prod"));
     }
     assert_eq!(cfg.inline_max_rows, 10);
     assert_eq!(cfg.inline_max_bytes, 20);
@@ -215,7 +221,7 @@ fn resolve_options_defaults_to_container_read_and_requires_container_permission(
     let cfg = RuntimeConfig::default();
     let container_session = SessionConfig {
         container: ContainerConfig {
-            target: Some("pg".to_string()),
+            docker_name: Some("pg".to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -277,7 +283,7 @@ fn resolve_options_treats_ssh_plus_container_as_container_transport() {
             ..Default::default()
         },
         container: ContainerConfig {
-            target: Some("pg".to_string()),
+            docker_name: Some("pg".to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -391,14 +397,17 @@ fn apply_update_can_clear_session_fields_with_null() {
                 sudo_user: Some("postgres".to_string()),
             },
             container: ContainerConfig {
-                target: Some("pg-container".to_string()),
-                driver: Some("podman".to_string()),
-                runtime: Some("podman".to_string()),
-                user: Some("postgres".to_string()),
-                namespace: Some("prod".to_string()),
-                context: Some("cluster-a".to_string()),
+                docker_name: Some("pg-container".to_string()),
+                docker_user: Some("postgres".to_string()),
+                docker_context: Some("cluster-a".to_string()),
+                docker_runtime: Some("podman".to_string()),
+                podman_name: Some("pg-podman".to_string()),
+                nerdctl_name: Some("pg-nerdctl".to_string()),
+                compose_service: Some("db".to_string()),
                 compose_files: vec!["compose.yml".to_string()],
                 compose_project: Some("demo".to_string()),
+                kubectl_pod: Some("pg-pod".to_string()),
+                kubectl_namespace: Some("prod".to_string()),
                 ..Default::default()
             },
         },
@@ -424,14 +433,17 @@ fn apply_update_can_clear_session_fields_with_null() {
                 sudo_user: PatchField::Null,
             },
             container: ContainerConfigPatch {
-                target: PatchField::Null,
-                driver: PatchField::Null,
-                runtime: PatchField::Null,
-                user: PatchField::Null,
-                namespace: PatchField::Null,
-                context: PatchField::Null,
+                docker_name: PatchField::Null,
+                docker_user: PatchField::Null,
+                docker_context: PatchField::Null,
+                docker_runtime: PatchField::Null,
+                podman_name: PatchField::Null,
+                nerdctl_name: PatchField::Null,
+                compose_service: PatchField::Null,
                 compose_files: PatchField::Null,
                 compose_project: PatchField::Null,
+                kubectl_pod: PatchField::Null,
+                kubectl_namespace: PatchField::Null,
                 ..Default::default()
             },
         },
@@ -457,13 +469,7 @@ fn apply_update_can_clear_session_fields_with_null() {
         assert!(s1.ssh.local_port.is_none());
         assert!(s1.ssh.remote_socket.is_none());
         assert!(s1.ssh.sudo_user.is_none());
-        assert!(s1.container.target.is_none());
-        assert!(s1.container.driver.is_none());
-        assert!(s1.container.runtime.is_none());
-        assert!(s1.container.user.is_none());
-        assert!(s1.container.namespace.is_none());
-        assert!(s1.container.context.is_none());
+        assert!(!s1.container.has_transport_fields());
         assert!(s1.container.compose_files.is_empty());
-        assert!(s1.container.compose_project.is_none());
     }
 }

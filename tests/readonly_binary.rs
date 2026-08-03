@@ -153,16 +153,36 @@ fn readonly_allows_skill_admin_redirects_and_sql_files() {
 }
 
 #[test]
-fn readonly_stream_redirect_scanner_keeps_ordinary_entrypoint_semantics() {
-    // The stream-redirect installer scans raw argv independently of the CLI
-    // parser. Ordinary readonly intentionally grants the same host redirect
-    // capability as afpsql, even when the later CLI parse fails.
+fn readonly_file_sinks_follow_the_resolved_invocation() {
+    // Ordinary readonly intentionally grants the same host redirect capability
+    // as afpsql. The redirect is installed from the resolved output plan, so a
+    // rejected argv never reaches the filesystem: a file sink named inside an
+    // invocation the parser refuses is not created.
+    let target = temp_path("resolved-redirect");
+    let _ = fs::remove_file(&target);
+    let output = Command::new(readonly())
+        .args([
+            "--sql",
+            "select 1",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--stderr-file",
+            target.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run readonly with a file sink");
+    assert!(!output.status.success());
+    let redirected = fs::read_to_string(&target).expect("redirected diagnostics");
+    assert!(redirected.contains("connect_failed"), "{redirected}");
+    fs::remove_file(&target).expect("remove redirect target");
+
     for args in [
         vec!["--sql", "--stdout-file=SMUGGLE"],
-        vec!["--sql", "--stdout-file", "SMUGGLE"],
         vec!["--param", "x", "--stderr-file=SMUGGLE"],
     ] {
-        let target = temp_path("smuggled-redirect");
+        let target = temp_path("rejected-redirect");
         let _ = fs::remove_file(&target);
         let target_text = target.to_str().expect("utf8 path");
         let resolved: Vec<String> = args
@@ -175,15 +195,14 @@ fn readonly_stream_redirect_scanner_keeps_ordinary_entrypoint_semantics() {
             .expect("run readonly redirect-like value");
         assert!(!output.status.success());
         assert!(
-            target.exists(),
-            "redirect scanner did not create a file for {resolved:?}"
+            !target.exists(),
+            "a rejected invocation created a file for {resolved:?}"
         );
-        fs::remove_file(target).expect("remove redirect target");
     }
 }
 
 #[test]
-fn readonly_allows_custom_transport_capabilities_before_database_boundary() {
+fn readonly_rejects_custom_transport_capabilities_before_database_boundary() {
     for option in ["ProxyCommand=false", "LocalCommand=false"] {
         let value = error(
             Command::new(readonly())
@@ -192,7 +211,7 @@ fn readonly_allows_custom_transport_capabilities_before_database_boundary() {
                 .output()
                 .expect("run readonly transport override"),
         );
-        assert_ne!(value["error"]["code"], "invalid_request");
+        assert_eq!(value["error"]["code"], "invalid_request");
     }
 
     #[cfg(unix)]
@@ -204,9 +223,9 @@ fn readonly_allows_custom_transport_capabilities_before_database_boundary() {
         let value = error(
             Command::new(readonly())
                 .args([
-                    "--container-runtime",
+                    "--container-docker-runtime",
                     runtime.to_str().expect("utf8 runtime path"),
-                    "--container",
+                    "--container-docker-name",
                     "invalid",
                     "--sql",
                     "select 1",
@@ -214,7 +233,7 @@ fn readonly_allows_custom_transport_capabilities_before_database_boundary() {
                 .output()
                 .expect("run readonly custom runtime"),
         );
-        assert_ne!(value["error"]["code"], "invalid_request");
+        assert_eq!(value["error"]["code"], "invalid_request");
         fs::remove_file(runtime).expect("remove custom runtime");
     }
 }
@@ -283,9 +302,9 @@ fn readonly_pipe_rejects_write_begin_and_query() {
 }
 
 #[test]
-fn readonly_pipe_accepts_transport_config_patches_without_write_escalation() {
+fn readonly_pipe_rejects_unsafe_transport_config_patches() {
     let payload = concat!(
-        r#"{"code":"config","sessions":{"default":{"container":"pg","container_runtime":"custom"}}}"#,
+        r#"{"code":"config","sessions":{"default":{"docker_name":"pg","docker_runtime":"custom"}}}"#,
         "\n",
         r#"{"code":"config","sessions":{"default":{"ssh":"db","ssh_options":["ProxyCommand=false"]}}}"#,
         "\n",
@@ -307,8 +326,8 @@ fn readonly_pipe_accepts_transport_config_patches_without_write_escalation() {
     let output = child.wait_with_output().expect("wait");
     assert!(output.status.success());
     let events = String::from_utf8(output.stdout).expect("UTF-8 events");
-    assert_eq!(events.matches(r#""code":"config""#).count(), 2);
-    assert_eq!(events.matches(r#""code":"invalid_request""#).count(), 0);
+    assert_eq!(events.matches(r#""code":"config""#).count(), 0);
+    assert_eq!(events.matches(r#""code":"invalid_request""#).count(), 2);
 }
 
 #[test]
@@ -340,7 +359,7 @@ fn readonly_help_uses_actual_binary_name() {
 fn readonly_executes_reads_and_database_rejects_unpermitted_dml() {
     let dsn = test_env::required_test_dsn();
     let read = Command::new(readonly())
-        .args(["--dsn-secret", &dsn, "--sql", "select 1 as n"])
+        .args(["--dsn", &dsn, "--sql", "select 1 as n"])
         .output()
         .expect("run readonly query");
     assert!(
@@ -356,7 +375,7 @@ fn readonly_executes_reads_and_database_rejects_unpermitted_dml() {
     fs::write(&sql_path, "select 2 as n").expect("write live SQL file");
     let file_read = Command::new(readonly())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &dsn,
             "--sql-file",
             sql_path.to_str().expect("utf8 SQL path"),
@@ -371,7 +390,7 @@ fn readonly_executes_reads_and_database_rejects_unpermitted_dml() {
 
     let dml = Command::new(readonly())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &dsn,
             "--sql",
             "create temp table afpsql_readonly_should_fail(n int)",
@@ -392,9 +411,10 @@ fn readonly_explain_analyze_cannot_bypass_write_permission() {
     let dsn = test_env::required_test_dsn();
     let output = Command::new(readonly())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &dsn,
-            "--explain-analyze",
+            "--explain",
+            "analyze",
             "--permission",
             "write",
             "--sql",
@@ -426,14 +446,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
         ),
     ] {
         let setup_output = Command::new(readwrite())
-            .args([
-                "--dsn-secret",
-                &dsn,
-                "--permission",
-                "write",
-                "--sql",
-                &setup,
-            ])
+            .args(["--dsn", &dsn, "--permission", "write", "--sql", &setup])
             .output()
             .expect("set up readonly boundary fixture");
         assert!(
@@ -451,7 +464,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
         "begin".to_string(),
     ] {
         let output = Command::new(readonly())
-            .args(["--dsn-secret", &dsn, "--sql", &sql])
+            .args(["--dsn", &dsn, "--sql", &sql])
             .output()
             .expect("run readonly transaction-control query");
         let value = error(output);
@@ -467,7 +480,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
         format!("select {function}()"),
     ] {
         let output = Command::new(readonly())
-            .args(["--dsn-secret", &dsn, "--sql", &sql])
+            .args(["--dsn", &dsn, "--sql", &sql])
             .output()
             .expect("run readonly boundary query");
         assert!(
@@ -490,7 +503,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
         "select pg_advisory_xact_lock(424242)",
     ] {
         let output = Command::new(readonly())
-            .args(["--dsn-secret", &dsn, "--sql", sql])
+            .args(["--dsn", &dsn, "--sql", sql])
             .output()
             .expect("run allowed readonly side effect");
         assert!(
@@ -502,7 +515,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
 
     let check = Command::new(readonly())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &dsn,
             "--sql",
             &format!("select count(*)::int as n from {table}"),
@@ -519,14 +532,7 @@ fn readonly_database_transaction_and_side_effect_boundaries_are_explicit() {
         format!("drop table if exists {table}"),
     ] {
         let cleanup_output = Command::new(readwrite())
-            .args([
-                "--dsn-secret",
-                &dsn,
-                "--permission",
-                "write",
-                "--sql",
-                &cleanup,
-            ])
+            .args(["--dsn", &dsn, "--permission", "write", "--sql", &cleanup])
             .output()
             .expect("clean up readonly boundary fixture");
         assert!(cleanup_output.status.success());
@@ -553,14 +559,7 @@ fn dedicated_reader_role_blocks_writes_through_full_afpsql() {
         format!("grant select on {table} to {role}"),
     ] {
         let output = Command::new(readwrite())
-            .args([
-                "--dsn-secret",
-                &dsn,
-                "--permission",
-                "write",
-                "--sql",
-                &setup,
-            ])
+            .args(["--dsn", &dsn, "--permission", "write", "--sql", &setup])
             .output()
             .expect("set up reader role fixture");
         assert!(
@@ -573,7 +572,7 @@ fn dedicated_reader_role_blocks_writes_through_full_afpsql() {
     let reader_dsn = dsn_with_credentials(&dsn, &role, &password);
     let read = Command::new(readwrite())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &reader_dsn,
             "--sql",
             &format!("select count(*)::int as n from {table}"),
@@ -588,7 +587,7 @@ fn dedicated_reader_role_blocks_writes_through_full_afpsql() {
 
     let write = Command::new(readwrite())
         .args([
-            "--dsn-secret",
+            "--dsn",
             &reader_dsn,
             "--permission",
             "write",
@@ -606,14 +605,7 @@ fn dedicated_reader_role_blocks_writes_through_full_afpsql() {
         format!("drop role if exists {role}"),
     ] {
         let output = Command::new(readwrite())
-            .args([
-                "--dsn-secret",
-                &dsn,
-                "--permission",
-                "write",
-                "--sql",
-                &cleanup,
-            ])
+            .args(["--dsn", &dsn, "--permission", "write", "--sql", &cleanup])
             .output()
             .expect("clean up reader role fixture");
         assert!(output.status.success());
@@ -646,14 +638,7 @@ fn readonly_pipe_keeps_read_only_lifecycle_available() {
         "\n",
     );
     let mut child = Command::new(readonly())
-        .args([
-            "--mode",
-            "pipe",
-            "--dsn-secret",
-            &dsn,
-            "--output-to",
-            "stdout",
-        ])
+        .args(["--mode", "pipe", "--dsn", &dsn, "--output-to", "stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

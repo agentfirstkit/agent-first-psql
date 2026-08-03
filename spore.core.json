@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,14 +13,20 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Move every environment-mutating test into a dedicated integration binary: two tests set PGHOST and AFPSQL_DSN_SECRET inside the shared library test binary while unlocked readers ran in parallel, so five unrelated connection tests failed depending on thread scheduling",
-    "Keep the locked-profile assertion honest by resolving an unpinned session under the same hostile environment, so the pinned case cannot pass merely because nothing was set",
-    "Upgrade to agent-first-data 0.26.2, whose spec amendment names the consumption-mode rule this release line already implements for --mode pipe and --stream-rows"
+    "Compile the CLI from a closed-world registry of 17 commands and 23 shapes, so an invocation runs only when it matches one registered shape and illegal argument mixes become parse-time errors: connection arguments are no longer globals, arguments must follow their subcommand, --explain takes a plan|analyze value, and every rejection carries a typed cli_* error code",
+    "Replace the nine --*-secret[-env|-config] flags with three typed source arguments --dsn, --conninfo, and --password, each accepting a literal, env:NAME, file:PATH#DOT_PATH, or literal:VALUE, so a malformed source is refused rather than partially interpreted",
+    "Close the pipe-mode write hole: begin now asserts a write-family permission, read_only defaults to true, and every query inside a read-write transaction must repeat the write permission, where previously three JSONL lines with no permission field could delete rows",
+    "Scope container transport flags to one flag per (driver, option) pair, retiring --container and --container-driver along with the runtime compatibility matrix, so an option a driver does not have cannot be written and two driver families are rejected by name",
+    "Carry SSH transport entirely over the ssh child process's stdio bridge, removing the local TCP listener so no other process on the workstation can reach the connection, and keep the bridge source valid on Python 2 where socket errors are not OSError",
+    "Restore the row-encoding fallback on the explicit-transaction paths so EXPLAIN and SHOW run again, and report the narrower decoder as a structured query.row_encoding_degraded log event instead of a Rust Debug dump, starting the streaming sink only once the wrapper is known usable",
+    "Bind bare null, true, and false --param values as JSON primitives, with a text: prefix to force the literal string",
+    "Run the release gate itself in CI with the container end-to-end suite folded into all, and make that suite fail rather than report green when its environment is unset",
+    "Upgrade to agent-first-data 0.29.2 with default features off and only the needed document formats enabled, routing raw help and docs output through afdata's write_raw"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.2u9kRio7ReF5aR1ZVyiJG17Py79q5yLsPj96renkCCLx",
+      "uri": "cmn://agentfirstkit.com/b3.DybgBCZQ6YRTrjjif59swyURbRsA47mnfM3hyc37KMR7",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

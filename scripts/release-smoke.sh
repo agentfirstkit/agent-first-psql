@@ -57,8 +57,8 @@ expect_runtime_failure() {
 "$READONLY" --version
 expect_invalid_request "write permission" --permission write --sql "select 1"
 "$READONLY" skill status >/dev/null
-expect_runtime_failure "ProxyCommand" --ssh invalid --ssh-option "ProxyCommand=false" --sql "select 1"
-expect_runtime_failure "custom container runtime" --container invalid --container-runtime false --sql "select 1"
+expect_invalid_request "ProxyCommand" --ssh invalid --ssh-option "ProxyCommand=false" --sql "select 1"
+expect_invalid_request "custom container runtime" --container-docker-name invalid --container-docker-runtime false --sql "select 1"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -98,16 +98,15 @@ MINGW* | MSYS* | CYGWIN* | *NT*)
     exit 1
   fi
 
-  # A redirect flag positioned where a value-skipping arg walk would treat it as
-  # the SQL value is still installed by the independent stream-redirect scanner.
-  # Ordinary readonly deliberately grants this same host capability as afpsql.
-  smuggled_path="$tmp_dir/smuggled"
+  # A file sink is installed from the resolved output plan, so an invocation the
+  # parser refuses never reaches the filesystem.
+  rejected_path="$tmp_dir/rejected"
   set +e
-  "$READONLY" --sql "--stdout-file=$smuggled_path" >/dev/null 2>&1
-  smuggled_status=$?
+  "$READONLY" --sql "--stdout-file=$rejected_path" >/dev/null 2>&1
+  rejected_status=$?
   set -e
-  if [ "$smuggled_status" -eq 0 ] || [ ! -e "$smuggled_path" ]; then
-    echo "ordinary readonly redirect scanner behavior changed" >&2
+  if [ "$rejected_status" -eq 0 ] || [ -e "$rejected_path" ]; then
+    echo "a rejected invocation created a file sink" >&2
     exit 1
   fi
   ;;
@@ -118,7 +117,8 @@ expect_runtime_failure "local SQL file" --sql-file "$sql_path"
 config_path="$tmp_dir/config.env"
 canary="AFPSQL_RELEASE_SMOKE_SECRET_CANARY"
 printf '%s\n' "DATABASE_URL=postgresql://user:$canary@127.0.0.1:1/db" >"$config_path"
-run_readonly --dsn-secret-config "$config_path" DATABASE_URL --sql 'select 1'
+run_readonly --dsn file:"$config_path"#DATABASE_URL \
+  --sql 'select 1'
 if [ "$STATUS" -eq 0 ]; then
   echo "readonly config secret smoke unexpectedly succeeded" >&2
   exit 1
@@ -130,7 +130,15 @@ if grep -q "$canary" <<<"$OUT" || grep -q "$canary" <<<"$ERR"; then
   exit 1
 fi
 expect_invalid_request "config-backed write permission" \
-  --dsn-secret-config "$config_path" DATABASE_URL \
+  --dsn file:"$config_path"#DATABASE_URL \
   --permission write --sql "select 1"
+
+# A structural rejection names its own rule, so the smoke also proves the parser
+# and the readonly capability refusals stay two distinguishable failures.
+run_readonly -c "select 1"
+if [ "$STATUS" -ne 2 ] || ! grep -q '"code":"cli_unknown_argument"' <<<"$ERR"; then
+  echo "psql short flag was not rejected as an unknown argument: stderr=$ERR" >&2
+  exit 1
+fi
 
 echo "afpsql-readonly release smoke passed"

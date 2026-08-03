@@ -3,7 +3,7 @@ use crate::conn::{
     resolve_single_postgres_endpoint,
 };
 use crate::db::ConnectError;
-use crate::types::SessionConfig;
+use crate::types::{ContainerConfig, ContainerDriver, SessionConfig};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +16,6 @@ use tokio::sync::oneshot;
 use tokio_postgres::Client;
 use tokio_postgres::tls::MakeTlsConnect;
 
-const DEFAULT_DRIVER: &str = "docker";
 const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
 const STDERR_HINT_BYTES: usize = 512;
 const BRIDGE_READY_PREFIX: &str = "AFPSQL_BRIDGE_OK";
@@ -218,39 +217,11 @@ impl AsyncWrite for ContainerStdioStream {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContainerDriver {
-    Docker,
-    Podman,
-    Nerdctl,
-    Compose,
-    Kubectl,
-}
-
-impl ContainerDriver {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "docker" => Ok(Self::Docker),
-            "podman" => Ok(Self::Podman),
-            "nerdctl" => Ok(Self::Nerdctl),
-            "compose" | "docker-compose" => Ok(Self::Compose),
-            "kubectl" | "kubernetes" | "k8s" => Ok(Self::Kubectl),
-            _ => Err(format!(
-                "unsupported container driver `{value}`; expected docker, podman, nerdctl, compose, or kubectl"
-            )),
-        }
-    }
-
-    fn default_runtime(self) -> &'static str {
-        match self {
-            Self::Docker | Self::Compose => "docker",
-            Self::Podman => "podman",
-            Self::Nerdctl => "nerdctl",
-            Self::Kubectl => "kubectl",
-        }
-    }
-}
-
+/// The driver-shaped view the argv builders work from.
+///
+/// The external surface is one flag per (driver, option) pair; this is what
+/// those flags collapse to once the driver has been inferred, so each builder
+/// reads one field instead of re-deriving the family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContainerSettings {
     driver: ContainerDriver,
@@ -617,62 +588,160 @@ async fn list_container_targets(settings: &ContainerSettings) -> Option<String> 
     }
 }
 
-fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, String> {
-    let target = cfg
-        .container
-        .target
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER"));
-    let ssh_destination = cfg
-        .ssh
-        .destination
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_SSH"));
-    let namespace = cfg
-        .container
-        .namespace
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_NAMESPACE"));
-    let context = cfg
-        .container
-        .context
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_CONTEXT"));
-    let compose_files = if cfg.container.compose_files.is_empty() {
-        env_colon_list("AFPSQL_CONTAINER_COMPOSE_FILE")
-    } else {
-        cfg.container.compose_files.clone()
-    };
-    let compose_project = cfg
-        .container
-        .compose_project
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_COMPOSE_PROJECT"));
-    let pod_container = cfg
-        .container
-        .pod_container
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_POD_CONTAINER"));
-    let has_container_fields = target.is_some()
-        || cfg.container.driver.is_some()
-        || cfg.container.runtime.is_some()
-        || cfg.container.user.is_some()
-        || namespace.is_some()
-        || context.is_some()
-        || !compose_files.is_empty()
-        || compose_project.is_some()
-        || pod_container.is_some();
+/// Fill each unset container field from its environment variable.
+///
+/// A pinned profile reads no environment at all: its endpoint and transport are
+/// the administrator's, and a variable must not redirect them.
+pub fn container_config_with_env(
+    container: &ContainerConfig,
+    profile_pinned: bool,
+) -> ContainerConfig {
+    if profile_pinned {
+        return container.clone();
+    }
+    let env = crate::runtime_env::nonempty;
+    ContainerConfig {
+        docker_name: container
+            .docker_name
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_DOCKER_NAME")),
+        docker_user: container
+            .docker_user
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_DOCKER_USER")),
+        docker_context: container
+            .docker_context
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_DOCKER_CONTEXT")),
+        docker_runtime: container
+            .docker_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_DOCKER_RUNTIME")),
+        podman_name: container
+            .podman_name
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_PODMAN_NAME")),
+        podman_user: container
+            .podman_user
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_PODMAN_USER")),
+        podman_runtime: container
+            .podman_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_PODMAN_RUNTIME")),
+        nerdctl_name: container
+            .nerdctl_name
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_NERDCTL_NAME")),
+        nerdctl_user: container
+            .nerdctl_user
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_NERDCTL_USER")),
+        nerdctl_runtime: container
+            .nerdctl_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_NERDCTL_RUNTIME")),
+        compose_service: container
+            .compose_service
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_COMPOSE_SERVICE")),
+        compose_user: container
+            .compose_user
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_COMPOSE_USER")),
+        compose_files: if container.compose_files.is_empty() {
+            crate::runtime_env::colon_list("AFPSQL_CONTAINER_COMPOSE_FILE")
+        } else {
+            container.compose_files.clone()
+        },
+        compose_project: container
+            .compose_project
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_COMPOSE_PROJECT")),
+        compose_runtime: container
+            .compose_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_COMPOSE_RUNTIME")),
+        kubectl_pod: container
+            .kubectl_pod
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_KUBECTL_POD")),
+        kubectl_container: container
+            .kubectl_container
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_KUBECTL_CONTAINER")),
+        kubectl_namespace: container
+            .kubectl_namespace
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_KUBECTL_NAMESPACE")),
+        kubectl_context: container
+            .kubectl_context
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_KUBECTL_CONTEXT")),
+        kubectl_runtime: container
+            .kubectl_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_KUBECTL_RUNTIME")),
+    }
+}
 
-    let Some(target) = target else {
-        if has_container_fields {
-            return Err(
-                "--container is required when container transport options are set".to_string(),
-            );
+fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, String> {
+    let container = container_config_with_env(&cfg.container, cfg.profile_pinned);
+    let ssh_destination = cfg.ssh.destination.clone().or_else(|| {
+        if cfg.profile_pinned {
+            None
+        } else {
+            crate::runtime_env::nonempty("AFPSQL_SSH")
         }
-        return Err("--container is required for container transport".to_string());
+    });
+
+    let Some(driver) = container.selected_driver()? else {
+        return Err(
+            "container transport requires one of --container-docker-name, --container-podman-name, --container-nerdctl-name, --container-compose-service, or --container-kubectl-pod"
+                .to_string(),
+        );
+    };
+    // An option flag on its own picks a driver but names nothing to exec into,
+    // so the missing-target error has to speak that family's vocabulary:
+    // a compose service, a kubectl pod, a container name everywhere else.
+    let target_flag = driver.target_flag();
+    let (target, user, runtime) = match driver {
+        ContainerDriver::Docker => (
+            container.docker_name.clone(),
+            container.docker_user.clone(),
+            container.docker_runtime.clone(),
+        ),
+        ContainerDriver::Podman => (
+            container.podman_name.clone(),
+            container.podman_user.clone(),
+            container.podman_runtime.clone(),
+        ),
+        ContainerDriver::Nerdctl => (
+            container.nerdctl_name.clone(),
+            container.nerdctl_user.clone(),
+            container.nerdctl_runtime.clone(),
+        ),
+        ContainerDriver::Compose => (
+            container.compose_service.clone(),
+            container.compose_user.clone(),
+            container.compose_runtime.clone(),
+        ),
+        // No kubectl user: `kubectl exec` has no exec-as-user option, so the
+        // flag that would set one does not exist.
+        ContainerDriver::Kubectl => (
+            container.kubectl_pod.clone(),
+            None,
+            container.kubectl_runtime.clone(),
+        ),
+    };
+    let Some(target) = target else {
+        return Err(format!(
+            "{target_flag} is required when other {} options are set",
+            driver.flag_family()
+        ));
     };
     if target.trim().is_empty() {
-        return Err("--container requires a non-empty target name".to_string());
+        return Err(format!("{target_flag} requires a non-empty value"));
     }
     if let Some(destination) = ssh_destination.as_ref() {
         if destination.trim().is_empty() {
@@ -687,143 +756,25 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
         return Err("container transport with --ssh supports only --ssh and --ssh-option; SSH tunnel and sudo bridge options are for non-container SSH transport".to_string());
     }
 
-    let driver_name = cfg
-        .container
-        .driver
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_DRIVER"))
-        .unwrap_or_else(|| DEFAULT_DRIVER.to_string());
-    let driver = ContainerDriver::parse(&driver_name)?;
-    let user = cfg
-        .container
-        .user
-        .clone()
-        .or_else(|| env_nonempty("AFPSQL_CONTAINER_USER"));
-    if driver == ContainerDriver::Kubectl && user.is_some() {
-        return Err(
-            "--container-user is not supported with --container-driver kubectl".to_string(),
-        );
-    }
-    validate_driver_scoped_options(
-        driver,
-        namespace.as_ref(),
-        context.as_ref(),
-        &compose_files,
-        compose_project.as_ref(),
-        pod_container.as_ref(),
-    )?;
-
     Ok(ContainerSettings {
-        runtime: cfg
-            .container
-            .runtime
-            .clone()
-            .or_else(|| env_nonempty("AFPSQL_CONTAINER_RUNTIME"))
-            .unwrap_or_else(|| driver.default_runtime().to_string()),
+        runtime: runtime.unwrap_or_else(|| driver.default_runtime().to_string()),
         driver,
         target,
         user,
-        namespace,
-        context,
-        compose_files,
-        compose_project,
-        pod_container,
+        namespace: container.kubectl_namespace.clone(),
+        context: match driver {
+            ContainerDriver::Docker => container.docker_context.clone(),
+            ContainerDriver::Kubectl => container.kubectl_context.clone(),
+            // Podman, nerdctl, and Compose select no context, so no flag in
+            // those families can name one.
+            ContainerDriver::Podman | ContainerDriver::Nerdctl | ContainerDriver::Compose => None,
+        },
+        compose_files: container.compose_files.clone(),
+        compose_project: container.compose_project.clone(),
+        pod_container: container.kubectl_container.clone(),
         ssh_destination,
         ssh_options: cfg.ssh.options.clone(),
     })
-}
-
-fn validate_driver_scoped_options(
-    driver: ContainerDriver,
-    namespace: Option<&String>,
-    context: Option<&String>,
-    compose_files: &[String],
-    compose_project: Option<&String>,
-    pod_container: Option<&String>,
-) -> Result<(), String> {
-    match driver {
-        ContainerDriver::Docker => {
-            reject_present(
-                namespace,
-                "--container-namespace requires --container-driver kubectl",
-            )?;
-            reject_present(
-                pod_container,
-                "--container-pod-container requires --container-driver kubectl",
-            )?;
-            reject_nonempty(
-                compose_files,
-                "--container-compose-file requires --container-driver compose",
-            )?;
-            reject_present(
-                compose_project,
-                "--container-compose-project requires --container-driver compose",
-            )?;
-        }
-        ContainerDriver::Compose => {
-            reject_present(
-                namespace,
-                "--container-namespace requires --container-driver kubectl",
-            )?;
-            reject_present(
-                context,
-                "--container-context requires --container-driver docker or kubectl",
-            )?;
-            reject_present(
-                pod_container,
-                "--container-pod-container requires --container-driver kubectl",
-            )?;
-        }
-        ContainerDriver::Kubectl => {
-            reject_nonempty(
-                compose_files,
-                "--container-compose-file requires --container-driver compose",
-            )?;
-            reject_present(
-                compose_project,
-                "--container-compose-project requires --container-driver compose",
-            )?;
-        }
-        ContainerDriver::Podman | ContainerDriver::Nerdctl => {
-            reject_present(
-                namespace,
-                "--container-namespace requires --container-driver kubectl",
-            )?;
-            reject_present(
-                context,
-                "--container-context requires --container-driver docker or kubectl",
-            )?;
-            reject_nonempty(
-                compose_files,
-                "--container-compose-file requires --container-driver compose",
-            )?;
-            reject_present(
-                compose_project,
-                "--container-compose-project requires --container-driver compose",
-            )?;
-            reject_present(
-                pod_container,
-                "--container-pod-container requires --container-driver kubectl",
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn reject_present<T>(value: Option<T>, message: &str) -> Result<(), String> {
-    if value.is_some() {
-        Err(message.to_string())
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_nonempty<T>(value: &[T], message: &str) -> Result<(), String> {
-    if value.is_empty() {
-        Ok(())
-    } else {
-        Err(message.to_string())
-    }
 }
 
 fn resolve_container_target(cfg: &SessionConfig) -> Result<ContainerTarget, String> {
@@ -879,6 +830,7 @@ fn build_container_exec_args(
                 args.push("--user".to_string());
                 args.push(user.clone());
             }
+            args.push("--".to_string());
             args.push(settings.target.clone());
             args.extend(command);
         }
@@ -900,6 +852,7 @@ fn build_container_exec_args(
                 args.push("--user".to_string());
                 args.push(user.clone());
             }
+            args.push("--".to_string());
             args.push(settings.target.clone());
             args.extend(command);
         }
@@ -1007,26 +960,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn env_colon_list(name: &str) -> Vec<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .split(':')
-                .filter(|part| !part.is_empty())
-                .map(std::string::ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ContainerConfig;
 
     const TEST_NONCE: &str = "deadbeefcafef00d";
 
@@ -1344,7 +1281,7 @@ mod tests {
     fn target_from_dsn_tcp() -> Result<(), String> {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             dsn_secret: Some("postgresql://u:p@127.0.0.1:6543/db".to_string()),
@@ -1364,7 +1301,7 @@ mod tests {
     fn target_from_unix_socket_dir() -> Result<(), String> {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             host: Some("/var/run/postgresql".to_string()),
@@ -1381,23 +1318,24 @@ mod tests {
     }
 
     #[test]
-    fn settings_require_container_when_options_set() {
+    fn settings_require_family_name_when_family_options_set() {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                user: Some("postgres".to_string()),
+                docker_user: Some("postgres".to_string()),
                 ..Default::default()
             },
             ..Default::default()
         };
         let err = resolve_container_settings(&cfg);
-        assert!(matches!(err, Err(message) if message.contains("--container is required")));
+        assert!(matches!(err, Err(message) if message
+                == "--container-docker-name is required when other --container-docker-* options are set"));
     }
 
     #[test]
     fn settings_require_ssh_destination_when_ssh_options_set() {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             ssh: crate::types::SshConfig {
@@ -1414,7 +1352,7 @@ mod tests {
     fn settings_reject_tunnel_only_ssh_options_for_container_transport() {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             ssh: crate::types::SshConfig {
@@ -1428,34 +1366,53 @@ mod tests {
         assert!(matches!(err, Err(message) if message.contains("supports only --ssh")));
     }
 
+    /// `kubectl exec` has no exec-as-user option, so the kubectl family has no
+    /// user flag to carry one and the settings it resolves have no user at all.
     #[test]
-    fn settings_reject_kubectl_user() {
+    fn kubectl_family_cannot_carry_an_exec_user() {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pod/app".to_string()),
-                driver: Some("kubectl".to_string()),
-                user: Some("postgres".to_string()),
+                kubectl_pod: Some("pod/app".to_string()),
+                kubectl_namespace: Some("prod".to_string()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let err = resolve_container_settings(&cfg);
-        assert!(matches!(err, Err(message) if message.contains("not supported")));
+        let settings = resolve_container_settings(&cfg).expect("resolve kubectl settings");
+        assert_eq!(settings.driver, ContainerDriver::Kubectl);
+        assert!(settings.user.is_none());
     }
 
     #[test]
-    fn settings_reject_scoped_flags_for_wrong_driver() {
+    fn settings_reject_two_driver_families() {
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
-                driver: Some("podman".to_string()),
-                context: Some("prod".to_string()),
+                docker_name: Some("pg".to_string()),
+                kubectl_pod: Some("pod/app".to_string()),
                 ..Default::default()
             },
             ..Default::default()
         };
         let err = resolve_container_settings(&cfg);
-        assert!(matches!(err, Err(message) if message.contains("--container-context requires")));
+        assert!(matches!(err, Err(message) if message
+                == "--container-docker-name cannot be combined with --container-kubectl-pod; each container driver has its own flag family"));
+    }
+
+    /// A driver that has no context selection has no flag able to name one, so
+    /// the podman family plus a context is just the two-family rejection.
+    #[test]
+    fn settings_reject_context_from_another_family() {
+        let cfg = SessionConfig {
+            container: crate::types::ContainerConfig {
+                podman_name: Some("pg".to_string()),
+                docker_context: Some("prod".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = resolve_container_settings(&cfg);
+        assert!(matches!(err, Err(message) if message
+                == "--container-docker-context cannot be combined with --container-podman-name; each container driver has its own flag family"));
     }
 
     #[test]
@@ -1468,8 +1425,7 @@ mod tests {
         }
         let cfg = SessionConfig {
             container: crate::types::ContainerConfig {
-                target: Some("pg".to_string()),
-                driver: Some("compose".to_string()),
+                compose_service: Some("pg".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -1488,6 +1444,72 @@ mod tests {
                 ..
             }) if compose_files == vec!["base.yml".to_string(), "prod.yml".to_string()]
         ));
+    }
+
+    #[test]
+    fn pinned_profile_ignores_all_container_environment_fallbacks() {
+        let _guard = crate::test_env::env_lock();
+        // Every container variable, including the families the pinned profile
+        // did not choose: a hostile value must not be able to redirect the
+        // endpoint, nor to smuggle in a second driver family.
+        let names = [
+            "AFPSQL_CONTAINER_DOCKER_NAME",
+            "AFPSQL_CONTAINER_DOCKER_USER",
+            "AFPSQL_CONTAINER_DOCKER_CONTEXT",
+            "AFPSQL_CONTAINER_DOCKER_RUNTIME",
+            "AFPSQL_CONTAINER_PODMAN_NAME",
+            "AFPSQL_CONTAINER_PODMAN_USER",
+            "AFPSQL_CONTAINER_PODMAN_RUNTIME",
+            "AFPSQL_CONTAINER_NERDCTL_NAME",
+            "AFPSQL_CONTAINER_NERDCTL_USER",
+            "AFPSQL_CONTAINER_NERDCTL_RUNTIME",
+            "AFPSQL_CONTAINER_COMPOSE_SERVICE",
+            "AFPSQL_CONTAINER_COMPOSE_USER",
+            "AFPSQL_CONTAINER_COMPOSE_FILE",
+            "AFPSQL_CONTAINER_COMPOSE_PROJECT",
+            "AFPSQL_CONTAINER_COMPOSE_RUNTIME",
+            "AFPSQL_CONTAINER_KUBECTL_POD",
+            "AFPSQL_CONTAINER_KUBECTL_CONTAINER",
+            "AFPSQL_CONTAINER_KUBECTL_NAMESPACE",
+            "AFPSQL_CONTAINER_KUBECTL_CONTEXT",
+            "AFPSQL_CONTAINER_KUBECTL_RUNTIME",
+            "AFPSQL_SSH",
+        ];
+        let prior = names
+            .iter()
+            .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for name in names {
+            // SAFETY: the shared test environment lock serializes mutations.
+            unsafe { std::env::set_var(name, "hostile-value") };
+        }
+
+        let cfg = SessionConfig {
+            profile_pinned: true,
+            container: ContainerConfig {
+                docker_name: Some("trusted-container".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let settings = resolve_container_settings(&cfg).expect("resolve pinned profile");
+        assert_eq!(settings.driver, ContainerDriver::Docker);
+        assert_eq!(settings.runtime, "docker");
+        assert_eq!(settings.target, "trusted-container");
+        assert!(settings.user.is_none());
+        assert!(settings.context.is_none());
+        assert!(settings.compose_files.is_empty());
+        assert!(settings.pod_container.is_none());
+        assert!(settings.ssh_destination.is_none());
+
+        for (name, value) in prior {
+            match value {
+                // SAFETY: the shared test environment lock is still held.
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                // SAFETY: the shared test environment lock is still held.
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
     }
 
     #[test]

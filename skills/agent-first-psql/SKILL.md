@@ -11,8 +11,32 @@ read-only by default, safe for scripts, or reachable only across SSH/container
 boundaries. Prefer `afpsql` over parsing human `psql` tables, SSHing in to run
 `psql`, or `docker exec`/`kubectl exec` with human output.
 
-For flag-level detail, run `afpsql --help` or `afpsql --help --recursive --output markdown`. This
-skill covers behavior, decisions, and recovery only.
+For flag-level detail, run `afpsql --help`, or `afpsql <command> --help` for one
+command. This skill covers behavior, decisions, and recovery only.
+
+## Calling Convention
+
+`afpsql` is compiled from a closed registry: an invocation runs only when it
+matches exactly one registered shape.
+
+- There are no short flags. `-c`, `-h`, `-V` are psql spellings and exist only
+  behind `--mode psql`.
+- A command path comes first, then its arguments: `afpsql inspect tables
+  --dsn ...`, never the reverse. Nothing is global.
+- One `--help` per command is the whole answer: every shape, complete with its
+  optional arguments and closed value sets. There is no second level to ask for
+  and no recursive mode. `afpsql --docs` renders the whole registry as Markdown,
+  for reading rather than for calling.
+- A value is never taken from a token that starts with `-`. SQL that looks like
+  a flag is written `--sql=<value>`.
+- Rejections name their own classification in `error.code` —
+  `cli_unknown_argument`, `cli_unknown_command`, `cli_unregistered_combination`,
+  `cli_missing_argument_value`, `cli_invalid_argument_value`,
+  `cli_duplicate_argument`, `cli_unexpected_positional`, `cli_invalid_utf8` —
+  and always exit 2 with stdout left empty. Branch on the code rather than
+  parsing the message. `cli_unregistered_combination` means the arguments were
+  individually known but not a registered mix: read the shapes in `--help`
+  rather than dropping arguments at random.
 
 ## Core Rules
 
@@ -22,8 +46,9 @@ skill covers behavior, decisions, and recovery only.
 - Read the stream the invocation actually uses. A finite query splits by kind,
   so capture the result from stdout and read diagnostics from stderr. `--mode
   pipe` and `--stream-rows` are ordered event streams and put every event on
-  stdout, so read one stream and branch on `kind`. Only pass `--output-to` to
-  override this; it cannot split a stream.
+  stdout, so read one stream and branch on `kind`. `--output-to` overrides the
+  destination, but the streaming shapes have no `split` to select: it is not in
+  their output contract.
 - When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
   It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
   transaction-control SQL, and psql translation. It still permits SQL/config
@@ -37,13 +62,13 @@ skill covers behavior, decisions, and recovery only.
   administrator-locked profile when target and transport inputs must be fixed.
 - Default to read-only. Native CLI and pipe mode require explicit write
   permissions: `write`, `ssh-write`, or `container-write`.
-- Use `--ssh`, `--container`, or `--ssh + --container` as afpsql transports;
-  keep afpsql local unless the user explicitly asks for server-side tools.
-- With `--ssh`, use `--dsn-secret[-env|-config]` or
-  `--conninfo-secret[-env|-config]` directly when that is how the application
+- Use `--ssh`, one `--container-<driver>-*` flag family, or both together as
+  afpsql transports; keep afpsql local unless the user explicitly asks for
+  server-side tools.
+- With `--ssh`, use `--dsn SOURCE` or `--conninfo SOURCE` directly when that is how the application
   stores its connection. afpsql parses the value locally in-process, uses its
   host/port as the PostgreSQL target visible from the final SSH host, and keeps
-  the remaining authentication/TLS settings for the tunneled connection. Never
+  the remaining authentication/TLS settings for the bridged connection. Never
   reveal or split a DSN in shell code.
 - For SSH jump hosts, keep using afpsql transport. If every hop is reachable
   from the local OpenSSH client, use `--ssh-option ProxyJump=bastion`. If a
@@ -53,6 +78,8 @@ skill covers behavior, decisions, and recovery only.
 - Use `$1..$N` placeholders plus `--param N=value` / JSON `params`; do not
   interpolate user data into SQL text. `--param` values pass to PostgreSQL
   as text — string forms like `"00123"` and `NUMERIC` precision survive.
+  Bare `null`, `true`, and `false` are primitives; use `text:null`,
+  `text:true`, or `text:false` when the literal string is intended.
 - In shell commands, quote SQL containing `$1..$N` placeholders with single
   quotes, or use `--sql-file` / pipe mode JSON. Do not put such SQL in double
   quotes: shells expand `$1` and `$2` before `afpsql` sees the SQL, often into
@@ -67,12 +94,11 @@ skill covers behavior, decisions, and recovery only.
 - Keep PostgreSQL secret env names conventional (`PGPASSWORD`, `DATABASE_URL`);
   do not invent names such as `PGPASSWORD_SECRET`.
 - When an application already stores a connection string or password in JSON,
-  TOML, YAML, or dotenv, prefer `--dsn-secret-config FILE DOT_PATH`,
-  `--conninfo-secret-config FILE DOT_PATH`, or
-  `--password-secret-config FILE DOT_PATH`. Do not assemble Ruby/jq/yq command
-  substitutions or shell out to another tool: afpsql reads the value once
-  in-process through Agent-First Data's document layer, and config sources
-  are mutually exclusive with direct/env flags for a slot.
+  TOML, YAML, or dotenv, prefer `--dsn file:FILE#DOT_PATH` and its
+  `--conninfo file:FILE#DOT_PATH` / `--password file:FILE#DOT_PATH`
+  siblings. The file and dot path form one typed argument. Do not assemble Ruby/jq/yq
+  command substitutions or shell out to another tool: afpsql reads the value once
+  in-process through Agent-First Data's document layer.
 - `afpsql-readonly` accepts config secret sources, but doing so reads the exact
   local file selected by the caller. Its guarantee remains database read-family
   permission, not absence of local file, process, or network side effects.
@@ -110,8 +136,8 @@ Prefer `afpsql inspect` over hand-writing `information_schema` /
   relation, columns, constraints, indexes, triggers, and sequence/default
   relationships.
 
-For query plans, wrap with `--explain` (`EXPLAIN (FORMAT JSON)`) or
-`--explain-analyze` (also runs the statement; writes still need write
+For query plans, add `--explain plan` (`EXPLAIN (FORMAT JSON)`) or
+`--explain analyze` (also runs the statement; writes still need write
 permission). The plan JSON arrives in a normal `kind:"result"` event under
 `result.rows`.
 
@@ -132,13 +158,31 @@ actually run.
   SQLSTATE is present.
 - Other `kind:"error"` events are non-SQL failures (connect, cancel, invalid request,
   config). Branch on `error.code` first: `connect_failed`, `cancelled`,
-  `invalid_request`, `invalid_params`. Connect failures may also carry
-  `sqlstate`/`message`/`detail` populated from the server-side rejection.
+  `invalid_request`, `invalid_params`, `internal_error`. Connect failures may
+  also carry `sqlstate`/`message`/`detail` populated from the server-side
+  rejection. `internal_error` is afpsql's own fault rather than the request's:
+  retry once, restart the session if it repeats, and report it rather than
+  working around it.
 - Honor `retryable: true/false`. Only retry when `true`, and only after
   correcting whatever the hint pointed at. `retryable:false` means the
   same input will fail the same way.
 - After a successful `cancel`, never resubmit the cancelled `id` — pick a
   fresh id. Cancellation is final.
+
+## Row Encoding Fidelity
+
+Rows are normally encoded by PostgreSQL itself, so `numeric`, `timestamptz`,
+`uuid`, `interval` and friends keep their exact server representation. A few
+statements cannot be encoded that way — utility statements such as `EXPLAIN`
+and `SHOW`, and any SQL whose text prevents the wrapper from being built — and
+those fall back to a narrower client-side decoder that only handles booleans,
+integers, floats, JSON, bytea, and text-like types.
+
+The fallback is announced by the `query.row_encoding_degraded` log event; ask
+for it with `--log query.row_encoding_degraded` whenever exact value fidelity
+matters. A statement whose columns the narrow decoder cannot represent fails
+loudly instead of returning an approximation, so a `kind:"result"` is always
+trustworthy — the log only tells you which decoder produced it.
 
 ## Results that Don't Fit Inline
 
@@ -168,8 +212,10 @@ work, open an explicit transaction:
   can retry or move on. Send `rollback` to discard everything since
   `begin`, or `commit` to persist what worked.
 - `begin` with `read_only:true` opens `BEGIN READ ONLY` and needs no
-  write permission. Read-write `begin` requires the matching write
-  permission for the session's transport.
+  write permission; `read_only` defaults to `true`. Read-write `begin`
+  requires explicit `read_only:false` and the matching write permission for
+  the session's transport. Every query in that transaction must repeat the
+  matching write permission.
 
 ## Non-Obvious Behaviors
 
@@ -178,11 +224,16 @@ work, open an explicit transaction:
   final transport boundary. A DSN/conninfo used with either transport must
   resolve to one PostgreSQL endpoint; choose one host explicitly when an
   application DSN contains a failover host list.
+- Every `--ssh` connection runs a stdio bridge on the remote host, so that host
+  needs `sh` plus any one of `python3`, `python`, or `perl` — not all three.
+  There is no local listening port, so nothing else on the workstation can
+  reach the database through afpsql's connection. A host missing all three
+  interpreters fails with exit 127 and a message naming them.
 - `--ssh-via` is repeatable and means "local SSHs to this hop, that hop SSHs to
   the next hop, and the final `--ssh` host runs the PostgreSQL bridge." The
   PostgreSQL `--host/--port` are interpreted on the final host, so
   `--host localhost --port 5432` means final-host localhost, not workstation
-  localhost. The final host needs `python3`, `python`, or `perl` for the bridge.
+  localhost. The bridge runs on that final host.
 - `--ssh-option` is OpenSSH `-o` passthrough and is repeatable; use it for
   bastion/jump-host setups such as `ProxyJump=bastion` when local OpenSSH can
   authenticate to the final host through the jump. Use `--ssh-via` instead
@@ -192,11 +243,16 @@ work, open an explicit transaction:
 - Container transport runs a no-TTY stdio bridge. The target container needs
   `sh` plus one of `python3`, `python`, or `perl`, but does not need afpsql or
   `psql` installed.
+- The container driver is inferred from the flag family used, never named
+  separately, and two families cannot be combined. Each family carries only the
+  options its driver actually has, so an unavailable option has no flag rather
+  than a runtime rejection: `kubectl exec` cannot exec as a user, and no kubectl
+  flag asks it to.
 - Connecting to a containerized PostgreSQL without a known password: prefer peer
-  auth over the container's Unix socket with
-  `--container-user <db-os-user> --host /var/run/postgresql`. The `--container-user`
-  must match the database role (commonly `postgres`). TCP (`--host 127.0.0.1`)
-  requires a password.
+  auth over the container's Unix socket with the family's user flag plus
+  `--host /var/run/postgresql`. That exec user must match the database role
+  (commonly `postgres`). TCP (`--host 127.0.0.1`) requires a password, and the
+  kubectl family cannot take this path at all.
 - libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
   `PGPASSWORD`, `PGSSLMODE`) silently fill connection fields not given via
   flags or secrets. Prefer explicit flags for agent runs, and pass `--log connect`
@@ -240,7 +296,11 @@ afpsql psql install             # optional: psql-compatible wrapper
 - `password authentication failed`: TCP auth rules are in effect; use the correct
   secret or switch to a valid remote Unix-socket/peer pattern.
 - `peer authentication failed`: the OS user does not match the database role;
-  use a matching role, a `pg_ident` mapping, `--container-user`, or an explicit
-  SSH sudo bridge only when needed.
+  use a matching role, a `pg_ident` mapping, the container family's user flag,
+  or an explicit SSH sudo bridge only when needed.
 - psql mode without `-c`, `-f`, or `-l`: use native afpsql or original human
   `psql` for interactive terminal sessions.
+- `cli_unregistered_combination` on a query: the most common causes are two SQL
+  sources (`--sql` with `--sql-file`), a buffering argument on a streaming shape
+  (`--dry-run` or `--inline-max-*` with `--stream-rows`), a batching argument
+  without it, or two sources for one secret slot.

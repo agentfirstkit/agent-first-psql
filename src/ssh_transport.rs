@@ -1,32 +1,32 @@
 use crate::conn::{
-    PostgresEndpoint, make_supported_tls, pg_config_for_tcp_tunnel, postgres_tls_server_name,
+    PostgresEndpoint, make_supported_tls, postgres_tls_server_name,
     resolve_single_postgres_endpoint,
 };
 use crate::types::SessionConfig;
-use std::io::Read as _;
-use std::net::{TcpListener, TcpStream};
 use std::pin::Pin;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{Client, Config};
 
-const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
-const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const TUNNEL_READY_POLL: Duration = Duration::from_millis(50);
-const TUNNEL_READY_SETTLE: Duration = Duration::from_millis(100);
 const STDERR_CAPTURE_LIMIT: usize = 8192;
 const STDERR_HINT_BYTES: usize = 2048;
 
+// The `python3` and `python` launcher branches run this source verbatim, and
+// `python` is still Python 2 on older hosts, so it must stay valid on both.
+// That means no f-strings, binary stdio via `getattr(..., "buffer", ...)`, and
+// `except Exception` rather than `except OSError` around socket calls: Python 2
+// raises `socket.error`, which derives from `IOError` and is a distinct class
+// from `OSError` until the two merged in Python 3.3.
 const PYTHON_STREAM_BRIDGE: &str = r#"import os,select,socket,sys
 mode=sys.argv[1] if len(sys.argv)>1 else ""
 last_error=""
 s=None
-timeout=float(os.environ.get("AFPSQL_SSH_BRIDGE_CONNECT_TIMEOUT","10"))
+timeout=10.0
 if mode=="tcp":
     host=sys.argv[2]
     port=int(sys.argv[3])
@@ -35,7 +35,7 @@ if mode=="tcp":
     try:
         s.connect((host,port))
         s.settimeout(None)
-    except OSError as e:
+    except Exception as e:
         sys.stderr.write("could not connect PostgreSQL tcp "+host+":"+str(port)+": "+str(e)+"\n")
         sys.exit(1)
 elif mode=="unix":
@@ -47,7 +47,7 @@ elif mode=="unix":
             s.connect(p)
             s.settimeout(None)
             break
-        except OSError as e:
+        except Exception as e:
             last_error=p+": "+str(e)
             s.close()
             s=None
@@ -75,7 +75,7 @@ while True:
             stdin_open=False
             try:
                 s.shutdown(socket.SHUT_WR)
-            except OSError:
+            except Exception:
                 pass
     if s in ready:
         data=s.recv(65536)
@@ -151,22 +151,6 @@ while (1) {
     }
 }
 "#;
-
-pub struct SshTunnelGuard {
-    child: Mutex<Child>,
-    stderr_capture: Arc<Mutex<Vec<u8>>>,
-    pub local_host: String,
-    pub local_port: u16,
-}
-
-impl Drop for SshTunnelGuard {
-    fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
 
 pub struct SshBridgeGuard {
     child: Option<tokio::process::Child>,
@@ -251,54 +235,12 @@ struct SshSettings {
     destination: String,
     via: Vec<String>,
     options: Vec<String>,
-    local_host: String,
-    local_port: Option<u16>,
     remote_socket: Option<String>,
     sudo_user: Option<String>,
 }
 
-enum TunnelTarget {
-    Tcp { host: String, port: u16 },
-    UnixSocket { path: String },
-}
-
 pub fn needs_stdio_bridge(cfg: &SessionConfig) -> bool {
-    resolve_ssh_settings(cfg)
-        .ok()
-        .flatten()
-        .map(|settings| settings.sudo_user.is_some() || !settings.via.is_empty())
-        .unwrap_or(false)
-}
-
-pub async fn prepare_session(
-    cfg: &SessionConfig,
-    pg_cfg: &Config,
-) -> Result<(Config, Option<SshTunnelGuard>), String> {
-    let Some(settings) = resolve_ssh_settings(cfg)? else {
-        return Ok((pg_cfg.clone(), None));
-    };
-
-    if settings.sudo_user.is_some() {
-        return Err("--ssh-sudo-user requires SSH Unix-socket bridge mode".to_string());
-    }
-    if !settings.via.is_empty() {
-        return Err("--ssh-via requires SSH stdio bridge mode".to_string());
-    }
-
-    let target = if let Some(path) = settings.remote_socket.clone() {
-        TunnelTarget::UnixSocket { path }
-    } else {
-        match resolve_single_postgres_endpoint(pg_cfg, "SSH transport")? {
-            PostgresEndpoint::Tcp { host, port } => TunnelTarget::Tcp { host, port },
-            PostgresEndpoint::UnixSocket { directory, port } => TunnelTarget::UnixSocket {
-                path: socket_file_from_dir(&directory, port),
-            },
-        }
-    };
-    let tunnel = start_tunnel(&settings, target).await?;
-
-    let local_cfg = pg_config_for_tcp_tunnel(pg_cfg, &tunnel.local_host, tunnel.local_port);
-    Ok((local_cfg, Some(tunnel)))
+    resolve_ssh_settings(cfg).ok().flatten().is_some()
 }
 
 pub async fn connect_stdio_bridge(
@@ -308,12 +250,6 @@ pub async fn connect_stdio_bridge(
     let Some(settings) = resolve_ssh_settings(cfg)? else {
         return Err("--ssh is required for SSH stdio bridge mode".to_string());
     };
-    if settings.sudo_user.is_none() && settings.via.is_empty() {
-        return Err(
-            "--ssh-via or --ssh-sudo-user is required for SSH stdio bridge mode".to_string(),
-        );
-    }
-
     let endpoint = resolve_single_postgres_endpoint(pg_cfg, "SSH transport")?;
     let target = bridge_target(&settings, &endpoint)?;
     let command = remote_stream_bridge_command(&settings, &target);
@@ -427,102 +363,6 @@ fn bridge_socket_candidates(
     Err("--ssh-sudo-user requires an explicit remote PostgreSQL Unix socket".to_string())
 }
 
-async fn start_tunnel(
-    settings: &SshSettings,
-    target: TunnelTarget,
-) -> Result<SshTunnelGuard, String> {
-    let local_port = match settings.local_port {
-        Some(port) => {
-            ensure_local_port_available(&settings.local_host, port)?;
-            port
-        }
-        None => allocate_local_port(&settings.local_host)?,
-    };
-    let args = build_tunnel_ssh_args(settings, &target, local_port);
-    let mut child = Command::new("ssh")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("start ssh tunnel failed: {e}"))?;
-    let stderr_capture = Arc::new(Mutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        spawn_blocking_stderr_capture(stderr, Arc::clone(&stderr_capture));
-    }
-
-    let guard = SshTunnelGuard {
-        child: Mutex::new(child),
-        stderr_capture,
-        local_host: settings.local_host.clone(),
-        local_port,
-    };
-    wait_for_tunnel_ready(&guard).await?;
-    Ok(guard)
-}
-
-fn allocate_local_port(local_host: &str) -> Result<u16, String> {
-    TcpListener::bind((local_host, 0))
-        .map_err(|e| format!("allocate ssh local port on {local_host} failed: {e}"))?
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|e| format!("read allocated ssh local port failed: {e}"))
-}
-
-fn ensure_local_port_available(local_host: &str, local_port: u16) -> Result<(), String> {
-    TcpListener::bind((local_host, local_port))
-        .map(|_| ())
-        .map_err(|e| format!("ssh local port {local_host}:{local_port} is not available: {e}"))
-}
-
-async fn wait_for_tunnel_ready(guard: &SshTunnelGuard) -> Result<(), String> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = tunnel_child_status(guard)? {
-            return Err(tunnel_error(
-                guard,
-                format!("ssh tunnel exited before it became ready with status {status}"),
-            ));
-        }
-        if TcpStream::connect((guard.local_host.as_str(), guard.local_port)).is_ok() {
-            tokio::time::sleep(TUNNEL_READY_SETTLE).await;
-            if let Some(status) = tunnel_child_status(guard)? {
-                return Err(tunnel_error(
-                    guard,
-                    format!(
-                        "ssh tunnel exited after local port became reachable with status {status}"
-                    ),
-                ));
-            }
-            return Ok(());
-        }
-        if start.elapsed() >= TUNNEL_READY_TIMEOUT {
-            return Err(tunnel_error(
-                guard,
-                format!(
-                    "ssh tunnel did not become ready on {}:{}",
-                    guard.local_host, guard.local_port
-                ),
-            ));
-        }
-        tokio::time::sleep(TUNNEL_READY_POLL).await;
-    }
-}
-
-fn tunnel_error(guard: &SshTunnelGuard, base: String) -> String {
-    append_ssh_stderr(base, &captured_stderr(&guard.stderr_capture))
-}
-
-fn tunnel_child_status(guard: &SshTunnelGuard) -> Result<Option<ExitStatus>, String> {
-    let mut child = guard
-        .child
-        .lock()
-        .map_err(|_| "ssh tunnel child lock poisoned".to_string())?;
-    child
-        .try_wait()
-        .map_err(|e| format!("check ssh tunnel status failed: {e}"))
-}
-
 fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, String> {
     let destination = cfg.ssh.destination.clone();
     let has_ssh_fields = cfg.ssh.has_transport_fields();
@@ -547,43 +387,20 @@ fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, Stri
     if !cfg.ssh.via.is_empty() && via.len() != cfg.ssh.via.len() {
         return Err("--ssh-via requires non-empty USER@HOST hop values".to_string());
     }
-    if !via.is_empty() && (cfg.ssh.local_host.is_some() || cfg.ssh.local_port.is_some()) {
-        return Err("--ssh-via uses SSH stdio bridge mode and cannot be combined with --ssh-local-host or --ssh-local-port".to_string());
+    if cfg.ssh.local_host.is_some() || cfg.ssh.local_port.is_some() {
+        return Err(
+            "--ssh-local-host and --ssh-local-port were removed; SSH now uses a stdio bridge without a local listening port"
+                .to_string(),
+        );
     }
 
     Ok(Some(SshSettings {
         destination,
         via,
         options: cfg.ssh.options.clone(),
-        local_host: cfg
-            .ssh
-            .local_host
-            .clone()
-            .unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_string()),
-        local_port: cfg.ssh.local_port,
         remote_socket: cfg.ssh.remote_socket.clone(),
         sudo_user: cfg.ssh.sudo_user.clone(),
     }))
-}
-
-fn build_tunnel_ssh_args(
-    settings: &SshSettings,
-    target: &TunnelTarget,
-    local_port: u16,
-) -> Vec<String> {
-    let mut args = base_ssh_args(settings);
-    args.push("-N".to_string());
-    args.push("-L".to_string());
-    args.push(match target {
-        TunnelTarget::Tcp { host, port } => {
-            format!("{}:{local_port}:{host}:{port}", settings.local_host)
-        }
-        TunnelTarget::UnixSocket { path } => {
-            format!("{}:{local_port}:{path}", settings.local_host)
-        }
-    });
-    args.push(settings.destination.clone());
-    args
 }
 
 fn build_bridge_ssh_args(settings: &SshSettings, final_command: &str) -> Vec<String> {
@@ -696,21 +513,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn spawn_blocking_stderr_capture(
-    mut stderr: std::process::ChildStderr,
-    capture: Arc<Mutex<Vec<u8>>>,
-) {
-    let _handle = std::thread::spawn(move || {
-        let mut buf = [0u8; 1024];
-        loop {
-            match stderr.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => append_stderr_capture(&capture, &buf[..n]),
-            }
-        }
-    });
-}
-
 fn spawn_async_stderr_capture(
     mut stderr: ChildStderr,
     capture: Arc<Mutex<Vec<u8>>>,
@@ -784,37 +586,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tunnel_args_target_remote_tcp() {
-        let settings = SshSettings {
-            destination: "app@example.com".to_string(),
-            via: vec![],
-            options: vec!["ProxyJump=bastion".to_string()],
-            local_host: "127.0.0.1".to_string(),
-            local_port: Some(15432),
-            remote_socket: None,
-            sudo_user: None,
-        };
-        let args = build_tunnel_ssh_args(
-            &settings,
-            &TunnelTarget::Tcp {
-                host: "127.0.0.1".to_string(),
-                port: 5432,
-            },
-            15432,
-        );
-        assert!(args.contains(&"ProxyJump=bastion".to_string()));
-        assert!(args.contains(&"127.0.0.1:15432:127.0.0.1:5432".to_string()));
-        assert_eq!(args.last(), Some(&"app@example.com".to_string()));
-    }
-
-    #[test]
     fn bridge_args_use_sudo_noninteractive_python_socket_bridge() {
         let settings = SshSettings {
             destination: "user@example.com".to_string(),
             via: vec![],
             options: vec![],
-            local_host: "127.0.0.1".to_string(),
-            local_port: None,
             remote_socket: Some("/var/run/postgresql/.s.PGSQL.5432".to_string()),
             sudo_user: Some("postgres".to_string()),
         };
@@ -838,8 +614,6 @@ mod tests {
             destination: "ubuntu@db.internal".to_string(),
             via: vec!["ubuntu@bastion".to_string()],
             options: vec!["ConnectTimeout=10".to_string()],
-            local_host: "127.0.0.1".to_string(),
-            local_port: None,
             remote_socket: None,
             sudo_user: None,
         };
@@ -866,8 +640,6 @@ mod tests {
             destination: "user@example.com".to_string(),
             via: vec![],
             options: vec![],
-            local_host: "127.0.0.1".to_string(),
-            local_port: None,
             remote_socket: None,
             sudo_user: Some("postgres".to_string()),
         };
@@ -889,8 +661,6 @@ mod tests {
             destination: "user@example.com".to_string(),
             via: vec![],
             options: vec![],
-            local_host: "127.0.0.1".to_string(),
-            local_port: None,
             remote_socket: Some("/custom/.s.PGSQL.6543".to_string()),
             sudo_user: Some("postgres".to_string()),
         };
@@ -907,8 +677,6 @@ mod tests {
             destination: "user@example.com".to_string(),
             via: vec![],
             options: vec![],
-            local_host: "127.0.0.1".to_string(),
-            local_port: None,
             remote_socket: None,
             sudo_user: Some("postgres".to_string()),
         };
@@ -950,21 +718,5 @@ mod tests {
             socket_file_from_dir("/var/run/postgresql/", 5433),
             "/var/run/postgresql/.s.PGSQL.5433"
         );
-    }
-
-    #[test]
-    fn local_port_availability_rejects_bound_port() -> Result<(), String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-
-        let unavailable = ensure_local_port_available("127.0.0.1", port);
-        assert!(matches!(
-            unavailable,
-            Err(message) if message.contains("not available")
-        ));
-
-        drop(listener);
-        assert!(ensure_local_port_available("127.0.0.1", port).is_ok());
-        Ok(())
     }
 }

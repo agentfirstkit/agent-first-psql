@@ -17,7 +17,7 @@ fn has_session_override_true_for_host() {
 fn has_session_override_true_for_container() {
     assert!(has_session_override(&SessionConfig {
         container: ContainerConfig {
-            target: Some("pg".to_string()),
+            docker_name: Some("pg".to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -102,6 +102,24 @@ async fn read_limited_line_rejects_oversized_line_and_recovers() {
 
     let second = read_limited_line(&mut reader, 4).await;
     assert!(matches!(second, Ok(Some(Ok(line))) if line == "ok\n"));
+}
+
+#[tokio::test]
+async fn pipe_input_stops_waiting_as_soon_as_the_writer_dies() {
+    let (_input, reader) = tokio::io::duplex(64);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut writer = tokio::spawn(async {
+        panic!("simulated terminal-output failure");
+        #[allow(unreachable_code)]
+        Ok::<(), agent_first_data::CliEmitterError>(())
+    });
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        crate::pipe::next_pipe_input(&mut reader, &mut writer),
+    )
+    .await;
+    assert!(matches!(outcome, Ok(crate::pipe::PipeInput::WriterStopped)));
 }
 
 #[test]

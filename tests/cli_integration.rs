@@ -31,7 +31,7 @@ fn stream_rows_keeps_the_whole_result_stream_on_stdout() {
     // payload the caller captures, so they must not land on the diagnostic
     // stream while only the terminator reaches stdout.
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--stream-rows")
         .arg("--sql")
@@ -98,7 +98,7 @@ fn pipe_mode_keeps_failures_in_stream_order_on_stdout() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -139,7 +139,7 @@ fn pipe_mode_keeps_failures_in_stream_order_on_stdout() {
 #[test]
 fn afd_cli_param_binding_query() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select $1::int + $2::int as n")
@@ -170,7 +170,7 @@ fn psql_mode_translates_v_params() {
     let out = Command::new(bin())
         .arg("--mode")
         .arg("psql")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("-c")
         .arg("select $1::int as n")
@@ -210,7 +210,7 @@ fn pipe_stream_rows() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -256,7 +256,7 @@ fn pipe_plain_output_mode() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--output")
         .arg("plain")
@@ -298,7 +298,7 @@ fn pipe_yaml_output_mode() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--output")
         .arg("yaml")
@@ -389,7 +389,7 @@ fn pipe_rejects_duplicate_active_query_id() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -420,4 +420,34 @@ fn pipe_rejects_duplicate_active_query_id() {
         })
     );
     assert!(text.contains("duplicate active query id"));
+}
+
+#[test]
+fn docs_document_every_exit_code_the_binary_can_produce() {
+    // `--docs` renders afdata's CLI reference and then splices in the exit-4
+    // row by replacing an exact literal copy of afdata's exit-2 row. If afdata
+    // ever rewords that row, `str::replace` silently matches nothing and the
+    // exit code vanishes from the published reference while the `exit(4)` call
+    // sites keep running. Assert the result rather than the mechanism.
+    let out = Command::new(bin())
+        .arg("--docs")
+        .output()
+        .expect("run afpsql --docs");
+    assert!(
+        out.status.success(),
+        "--docs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs = String::from_utf8(out.stdout).expect("utf8 docs");
+    for code in ["| 0 |", "| 1 |", "| 2 |", "| 4 |"] {
+        assert!(
+            docs.contains(code),
+            "exit code row {code} missing from --docs; if only `| 4 |` is absent, \
+             afdata reworded the anchor row that src/cli.rs splices against"
+        );
+    }
+    assert!(
+        docs.contains("A terminal event could not be written"),
+        "the exit-4 row lost its description"
+    );
 }

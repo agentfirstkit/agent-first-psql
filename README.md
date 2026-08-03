@@ -16,8 +16,10 @@ execution, and turns many failures into prose that an agent has to guess about.
 - **Machine-readable failures.** PostgreSQL execution errors carry `SQLSTATE`; connection-time PostgreSQL rejections preserve SQLSTATE diagnostics on `error.code="connect_failed"`; runtime/protocol failures use stable `error.code` values and actionable hints.
 - **Safe write boundary.** Native CLI and pipe mode default to PostgreSQL read-only transactions; writes must opt in with explicit permission.
 - **Predictable session state.** Pipe named sessions map to stable PostgreSQL backend sessions with FIFO execution, so temp tables, GUCs, and other session state behave predictably.
-- **No SQL guesswork.** Runtime behavior is derived from PostgreSQL metadata, not SQL-text heuristics.
-- **First-class SSH/container boundaries.** Use `--ssh`, `--container`, or `--ssh + --container` to keep the agent local while crossing server, container, and remote-container boundaries with structured output and transport-specific permissions.
+- **PostgreSQL-enforced writes.** Query shape and write enforcement come from
+  PostgreSQL metadata, transaction mode, and permissions. The readonly binary
+  additionally uses a narrow lexical classifier for transaction-control SQL.
+- **First-class SSH/container boundaries.** Use `--ssh`, a `--container-<driver>-*` flag family, or both together to keep the agent local while crossing server, container, and remote-container boundaries with structured output and transport-specific permissions.
 - **psql compatibility where it helps.** `--mode psql` translates common non-interactive psql flags for scripts, while preserving psql's writable default.
 
 The goal is reliability for agents, not being a high-throughput pooler or an
@@ -38,7 +40,7 @@ Use pipe mode when an agent needs a long-running conversation with the database,
 especially when later statements depend on PostgreSQL session state:
 
 ```bash
-afpsql --mode pipe --dsn-secret-env DATABASE_URL
+afpsql --mode pipe --dsn env:DATABASE_URL
 ```
 
 Use psql-compatible mode only for non-interactive script compatibility:
@@ -57,24 +59,31 @@ file without shell command substitution or a subprocess: afpsql reads the
 value in-process through Agent-First Data's document layer.
 
 ```bash
-afpsql --dsn-secret-config config.yaml database.url --sql 'select 1'
-afpsql --dsn-secret-config .env DATABASE_URL --sql 'select 1'
-afpsql --conninfo-secret-config .env PG_CONNINFO --sql 'select 1'
+afpsql --dsn file:config.yaml#database.url \
+  --sql 'select 1'
+afpsql --dsn file:.env#DATABASE_URL \
+  --sql 'select 1'
+afpsql --conninfo file:.env#PG_CONNINFO \
+  --sql 'select 1'
 afpsql --ssh user@server \
-  --dsn-secret-config config.yaml database.url --sql 'select 1'
+  --dsn file:config.yaml#database.url \
+  --sql 'select 1'
 afpsql --host localhost --user app --dbname app \
-  --password-secret-config .env PGPASSWORD --sql 'select 1'
+  --password file:.env#PGPASSWORD \
+  --sql 'select 1'
 ```
 
-The syntax is always two separate values: `FILE DOT_PATH`; the `=FILE` form is
-not accepted. Within one secret slot, direct, `*-secret-env`, and
-`*-secret-config` sources are mutually exclusive. A config value must exist,
-be a non-empty string, and is read once during process startup. Pipe mode keeps
+A config source is one typed argument containing both a file and dot path;
+malformed sources are refused rather than partially interpreted. Within one
+secret slot, literal, `env:NAME`, and `file:PATH#DOT_PATH` are the supported
+forms. A config value must exist, be a non-empty string, and is read once during
+process startup. Pipe mode keeps
 that resolved in-memory value across reconnects; it does not watch the file or
 accept dynamic config-file references in pipe requests.
 
-Resolved secrets never enter argv, a temporary environment variable, startup
-logs, errors, or config responses. Runtime config output represents a configured
+Resolved secrets never enter a temporary environment variable, startup logs,
+errors, or config responses. A literal source is necessarily present in argv;
+prefer `env:` or `file:` when process arguments are observable. Runtime config output represents a configured
 `dsn_secret`, `conninfo_secret`, or `password_secret` as `***`. Startup logging
 may include only the source kind, file path, and dot-path.
 
@@ -106,7 +115,7 @@ remote/local boundary into a write path:
 ```bash
 afpsql --permission ssh-write --ssh user@server --host 127.0.0.1 --port 5432 \
   --user app --dbname appdb \
-  --password-secret-env PGPASSWORD \
+  --password env:PGPASSWORD \
   --sql 'update jobs set checked_at = now() where id = $1' \
   --param 1=123
 ```
@@ -114,8 +123,8 @@ afpsql --permission ssh-write --ssh user@server --host 127.0.0.1 --port 5432 \
 Container transport also has its own write permission:
 
 ```bash
-afpsql --permission container-write --container pg-container \
-  --dsn-secret-env DATABASE_URL \
+afpsql --permission container-write --container-docker-name pg-container \
+  --dsn env:DATABASE_URL \
   --sql 'update jobs set checked_at = now() where id = $1' \
   --param 1=123
 ```
@@ -162,7 +171,7 @@ instead of installing afpsql on that server or asking the agent to run human
 
 ```bash
 afpsql --ssh user@server \
-  --dsn-secret-config config.yaml database.url \
+  --dsn file:config.yaml#database.url \
   --sql "select now()"
 ```
 
@@ -178,7 +187,7 @@ afpsql --ssh user@db-server \
   --ssh-option ProxyJump=bastion \
   --host 127.0.0.1 --port 5432 \
   --user app --dbname appdb \
-  --password-secret-env PGPASSWORD \
+  --password env:PGPASSWORD \
   --sql "select now()"
 ```
 
@@ -188,22 +197,22 @@ instead of container-local `psql`. The container does not need afpsql or psql;
 afpsql uses a no-TTY exec bridge through the selected driver:
 
 ```bash
-afpsql --container pg-container \
-  --dsn-secret 'postgresql://app:pw@127.0.0.1:5432/appdb' \
+afpsql --container-docker-name pg-container \
+  --dsn 'postgresql://app:pw@127.0.0.1:5432/appdb' \
   --sql "select now()"
 ```
 
 For container-local Unix sockets, pass the socket directory as `--host`:
 
 ```bash
-afpsql --container pg-container \
+afpsql --container-docker-name pg-container \
   --host /var/run/postgresql --port 5432 \
   --user app --dbname appdb \
   --sql "select current_user"
 ```
 
-For peer-authenticated sockets, add `--container-user` to run the bridge as the
-matching container OS user.
+For peer-authenticated sockets, add the family's user flag
+(`--container-docker-user`) to run the bridge as the matching container OS user.
 
 For containers on a remote SSH host, combine afpsql's existing SSH transport
 with container transport. Do not SSH in and then run a container-local `psql`;
@@ -211,20 +220,19 @@ local `afpsql` drives both boundaries. The container exec command runs on the
 SSH host, and permissions stay in the container family:
 
 ```bash
-afpsql --ssh root@server --container app-container \
-  --container-driver docker \
+afpsql --ssh root@server --container-docker-name app-container \
   --host postgres --port 5432 \
   --user app --dbname appdb \
-  --password-secret-env PGPASSWORD \
+  --password env:PGPASSWORD \
   --sql "select 1"
 ```
 
-Use `--container-driver podman|nerdctl|compose|kubectl` when the target uses a
-non-default exec driver. `--container-runtime` can override the executable path,
-for example `--container-runtime docker-compose` with `--container-driver
-compose` for Compose v1. Use named scope flags such as `--container-context`,
-`--container-namespace`, `--container-compose-file`, and
-`--container-compose-project` instead of raw driver option passthrough.
+The driver is the flag family, not a separate selector: use
+`--container-podman-name`, `--container-nerdctl-name`,
+`--container-compose-service`, or `--container-kubectl-pod` when the target uses
+another exec driver. Each family carries only the options its driver has, so
+`--container-kubectl-namespace` exists and `--container-podman-context` does not,
+and flags from two families cannot be combined.
 
 Use `host.docker.internal` only when the Docker environment provides it (Docker
 Desktop, or Linux configured with `host-gateway`).

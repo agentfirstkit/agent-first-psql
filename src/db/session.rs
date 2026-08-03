@@ -4,7 +4,7 @@ use crate::types::{SessionConfig, TransportKind};
 use super::errors::{ConnectError, ExecError, map_connect_error};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
@@ -29,14 +29,13 @@ pub(super) struct SessionEntry {
     /// (set by `begin`, cleared by `commit`/`rollback`). When set, the
     /// executor bypasses its implicit `BEGIN..COMMIT` wrap and runs queries
     /// directly on the open transaction.
-    pub(super) explicit_tx: AtomicBool,
+    pub(super) explicit_tx: AtomicU8,
 }
 
 pub(super) struct SessionClient {
     pub(super) client: Option<tokio_postgres::Client>,
     pub(super) backend_pid: i32,
     connection_task: Option<tokio::task::JoinHandle<()>>,
-    ssh_tunnel: Option<crate::ssh_transport::SshTunnelGuard>,
     ssh_bridge: Option<crate::ssh_transport::SshBridgeGuard>,
     container_bridge: Option<crate::container_transport::ContainerBridgeGuard>,
 }
@@ -133,11 +132,24 @@ pub(super) fn new_session_map() -> SessionMap {
 
 impl SessionEntry {
     pub(super) fn explicit_tx_active(&self) -> bool {
-        self.explicit_tx.load(Ordering::SeqCst)
+        self.explicit_tx.load(Ordering::SeqCst) != 0
     }
 
-    pub(super) fn set_explicit_tx(&self, active: bool) {
-        self.explicit_tx.store(active, Ordering::SeqCst);
+    pub(super) fn explicit_tx_read_only(&self) -> Option<bool> {
+        match self.explicit_tx.load(Ordering::SeqCst) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_explicit_tx(&self, read_only: Option<bool>) {
+        let state = match read_only {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        self.explicit_tx.store(state, Ordering::SeqCst);
     }
 }
 
@@ -152,7 +164,7 @@ pub(super) async fn get_session(sessions: &SessionMap, session_name: &str) -> Ar
         .or_insert_with(|| {
             Arc::new(SessionEntry {
                 client: Mutex::new(None),
-                explicit_tx: AtomicBool::new(false),
+                explicit_tx: AtomicU8::new(0),
             })
         })
         .clone()
@@ -203,7 +215,6 @@ pub(super) async fn connect_session(
                 client: Some(client),
                 backend_pid,
                 connection_task: None,
-                ssh_tunnel: None,
                 ssh_bridge: None,
                 container_bridge: Some(bridge),
             },
@@ -224,7 +235,6 @@ pub(super) async fn connect_session(
                 client: Some(client),
                 backend_pid,
                 connection_task: None,
-                ssh_tunnel: None,
                 ssh_bridge: Some(bridge),
                 container_bridge: None,
             },
@@ -234,15 +244,12 @@ pub(super) async fn connect_session(
         ));
     }
 
-    let (connect_cfg, ssh_tunnel) = crate::ssh_transport::prepare_session(cfg, &pg_cfg)
-        .await
-        .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
     let tls = make_supported_tls().map_err(|e| {
         ExecError::Connect(Box::new(ConnectError::new(format!(
             "create TLS connector failed: {e}"
         ))))
     })?;
-    let (client, connection) = connect_cfg.connect(tls).await.map_err(map_connect_error)?;
+    let (client, connection) = pg_cfg.connect(tls).await.map_err(map_connect_error)?;
     let connection_task = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -253,7 +260,6 @@ pub(super) async fn connect_session(
             client: Some(client),
             backend_pid,
             connection_task: Some(connection_task),
-            ssh_tunnel,
             ssh_bridge: None,
             container_bridge: None,
         },
@@ -307,17 +313,17 @@ pub(super) fn transport_chain_summary(cfg: &SessionConfig, reveal_targets: bool)
 }
 
 fn container_exec_summary(cfg: &SessionConfig, reveal_targets: bool) -> String {
-    let driver = cfg.container.driver.as_deref().unwrap_or("docker");
-    let driver = match driver {
-        "kubernetes" | "k8s" => "kubectl",
-        "docker-compose" => "compose",
-        other => other,
-    };
-    let target = cfg.container.target.as_deref().unwrap_or("target");
-    match (reveal_targets, cfg.container.pod_container.as_deref()) {
-        (true, Some(container)) if matches!(driver, "kubectl") => {
-            format!("{driver} exec {target} -c {container}")
-        }
+    let driver = cfg
+        .container
+        .selected_driver()
+        .ok()
+        .flatten()
+        .map_or("docker", crate::types::ContainerDriver::as_str);
+    let target = cfg.container.target_name().unwrap_or("target");
+    // A pod container can only have come from the kubectl family, so the driver
+    // needs no second check here.
+    match (reveal_targets, cfg.container.kubectl_container.as_deref()) {
+        (true, Some(container)) => format!("{driver} exec {target} -c {container}"),
         (true, _) => format!("{driver} exec {target}"),
         (false, _) => format!("{driver} exec"),
     }
@@ -422,9 +428,6 @@ impl SessionClient {
             {
                 task.abort();
             }
-        }
-        if let Some(tunnel) = self.ssh_tunnel.take() {
-            drop(tunnel);
         }
         if let Some(bridge) = self.ssh_bridge.take() {
             bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;

@@ -4,17 +4,64 @@ fn raw_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
-fn count_help_surface(command: &Value) -> (usize, usize) {
-    let mut commands = 1;
-    let mut arguments = command["arguments"].as_array().map_or(0, Vec::len);
-    if let Some(subcommands) = command["subcommands"].as_array() {
-        for subcommand in subcommands {
-            let (subcommand_count, argument_count) = count_help_surface(subcommand);
-            commands += subcommand_count;
-            arguments += argument_count;
-        }
+fn registry() -> agent_first_data::BuiltCliSpec {
+    match build_cli("afpsql") {
+        Ok(cli) => cli,
+        Err(error) => panic!("registry must build: {error}"),
     }
-    (commands, arguments)
+}
+
+/// Resolve one argv against the registry, or report why it was rejected.
+fn resolve(args: &[&str]) -> Result<ResolvedInvocation, agent_first_data::CliError> {
+    match registry().resolve_from(args)? {
+        CliOutcome::Run(invocation) => Ok(invocation),
+        _ => panic!("{args:?} did not resolve to a run"),
+    }
+}
+
+fn shape_of(args: &[&str]) -> String {
+    match resolve(args) {
+        Ok(invocation) => invocation.combination_id().to_string(),
+        Err(error) => panic!("{args:?} was rejected: {}", error.message),
+    }
+}
+
+fn rejection(args: &[&str]) -> agent_first_data::CliErrorRule {
+    match registry().resolve_from(args) {
+        Err(error) => error.rule,
+        Ok(_) => panic!("{args:?} should have been rejected"),
+    }
+}
+
+/// The session one query invocation resolves to.
+fn query_session(args: &[&str]) -> SessionConfig {
+    let invocation = match resolve(args) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("{args:?} was rejected: {}", error.message),
+    };
+    match run_query(&invocation) {
+        Ok(Mode::Cli(request)) => request.session,
+        Ok(_) => panic!("{args:?} is not a query"),
+        Err(error) => panic!("{args:?} failed: {}", error.message),
+    }
+}
+
+/// Why one query invocation was refused after the registry accepted its shape.
+fn query_session_error(args: &[&str]) -> ParseError {
+    let invocation = match resolve(args) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("{args:?} was rejected by the registry: {}", error.message),
+    };
+    match run_query(&invocation) {
+        Ok(_) => panic!("{args:?} should have been rejected"),
+        Err(error) => error,
+    }
+}
+
+/// The psql translation on its own, which is what every translation test here
+/// asserts on; the routing it also decides is exercised through the binary.
+fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
+    parse_psql_mode_full(raw).map(|(mode, _)| mode)
 }
 
 #[test]
@@ -90,6 +137,14 @@ fn parse_param_value_primitives() {
     assert_eq!(parse_param_value("null"), Value::Null);
     assert_eq!(parse_param_value("true"), Value::Bool(true));
     assert_eq!(parse_param_value("false"), Value::Bool(false));
+    assert_eq!(
+        parse_param_value("text:null"),
+        Value::String("null".to_string())
+    );
+    assert_eq!(
+        parse_param_value("text:true"),
+        Value::String("true".to_string())
+    );
     // Numeric-looking strings stay as strings so PG receives the literal as
     // written. This preserves leading zeros and NUMERIC precision.
     assert_eq!(parse_param_value("42"), Value::String("42".to_string()));
@@ -271,28 +326,50 @@ fn inspect_table_full_returns_snapshot_rows_for_one_table() {
 }
 
 #[test]
-fn clap_accepts_extended_inspect_subcommands() {
-    for args in [
-        vec!["afpsql", "inspect", "schema", "--schema", "public"],
-        vec!["afpsql", "inspect", "snapshot", "--like", "foo%"],
-        vec![
-            "afpsql", "inspect", "indexes", "--schema", "public", "--table", "users", "--stats",
-        ],
-        vec!["afpsql", "inspect", "table", "public.users", "--full"],
+fn registry_accepts_extended_inspect_subcommands() {
+    for (args, shape) in [
+        (
+            vec!["afpsql", "inspect", "schema", "--schema", "public"],
+            "inspect_schema",
+        ),
+        (
+            vec!["afpsql", "inspect", "snapshot", "--like", "foo%"],
+            "inspect_snapshot",
+        ),
+        (
+            vec![
+                "afpsql", "inspect", "indexes", "--schema", "public", "--table", "users", "--stats",
+            ],
+            "inspect_indexes",
+        ),
+        (
+            vec!["afpsql", "inspect", "table", "public.users", "--full"],
+            "inspect_table",
+        ),
     ] {
-        assert!(
-            AfdCli::try_parse_from(args).is_ok(),
-            "extended inspect command did not parse"
-        );
+        assert_eq!(shape_of(&args), shape);
     }
 }
 
 #[test]
-fn parse_output_formats() {
-    assert!(matches!(parse_output("json"), Ok(OutputFormat::Json)));
-    assert!(matches!(parse_output("yaml"), Ok(OutputFormat::Yaml)));
-    assert!(matches!(parse_output("plain"), Ok(OutputFormat::Plain)));
-    assert!(parse_output("bad").is_err());
+fn output_format_is_taken_from_the_resolved_plan() {
+    for (value, expected) in [
+        ("json", OutputFormat::Json),
+        ("yaml", OutputFormat::Yaml),
+        ("plain", OutputFormat::Plain),
+    ] {
+        let invocation = match resolve(&["afpsql", "--sql", "select 1", "--output", value]) {
+            Ok(invocation) => invocation,
+            Err(error) => panic!("--output {value} was rejected: {}", error.message),
+        };
+        assert_eq!(format_of(&invocation), Ok(expected));
+    }
+    // The closed set lives in the output contract, so an unlisted format is
+    // rejected by the parser rather than by a second check in the handler.
+    assert_eq!(
+        rejection(&["afpsql", "--sql", "select 1", "--output", "bad"]),
+        agent_first_data::CliErrorRule::InvalidArgumentValue
+    );
 }
 
 #[test]
@@ -310,36 +387,53 @@ fn parse_log_categories_normalizes_and_dedups() {
 }
 
 #[test]
-fn clap_log_flag_accepts_startup() {
-    let cli_res =
-        AfdCli::try_parse_from(["afpsql", "--mode", "pipe", "--log", "startup,query.error"]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(
-            parse_log_categories(&cli.log),
-            agent_first_data::LogFilters::new(["startup", "query.error"])
-        );
-    }
+fn log_filters_accept_repetition_and_comma_lists() {
+    let invocation = match resolve(&[
+        "afpsql",
+        "--mode",
+        "pipe",
+        "--log",
+        "startup,query.error",
+        "--log",
+        "transport",
+    ]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("--log was rejected: {}", error.message),
+    };
+    let entries = log_entries(&invocation);
+    assert_eq!(entries, vec!["startup", "query.error", "transport"]);
+    assert!(startup_requested(&entries));
+    assert_eq!(
+        parse_log_categories(&entries),
+        agent_first_data::LogFilters::new(["startup", "query.error", "transport"])
+    );
 }
 
 #[test]
-fn clap_accepts_psql_admin_subcommands() {
-    let cli_res =
-        AfdCli::try_parse_from(["afpsql", "psql", "status", "--bin-dir", "/tmp/afpsql-bin"]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert!(matches!(
-            cli.command,
-            Some(AfdCommand::Psql(PsqlCommand {
-                action: PsqlCliAction::Status(_)
-            }))
-        ));
-    }
+fn registry_accepts_psql_admin_subcommands() {
+    let invocation = match resolve(&["afpsql", "psql", "status", "--bin-dir", "/tmp/afpsql-bin"]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("psql status was rejected: {}", error.message),
+    };
+    assert_eq!(invocation.action_id(), "psql_status");
+    assert!(matches!(
+        run_psql_status(&invocation),
+        Ok(Mode::PsqlAdmin(PsqlAdminRequest {
+            action: PsqlAdminAction::Status { bin_dir: Some(dir) },
+            ..
+        })) if dir == "/tmp/afpsql-bin"
+    ));
+    // Connection arguments belong to the commands that connect; the wrapper
+    // installer is not one of them.
+    assert_eq!(
+        rejection(&["afpsql", "psql", "status", "--host", "db.example"]),
+        agent_first_data::CliErrorRule::UnknownArgument
+    );
 }
 
 #[test]
-fn clap_accepts_skill_admin_subcommands() {
-    let cli_res = AfdCli::try_parse_from([
+fn registry_accepts_skill_admin_subcommands() {
+    let invocation = match resolve(&[
         "afpsql",
         "skill",
         "install",
@@ -348,30 +442,38 @@ fn clap_accepts_skill_admin_subcommands() {
         "--scope",
         "workspace",
         "--force",
-    ]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert!(matches!(
-            cli.command,
-            Some(AfdCommand::Skill(SkillCommand {
-                action: SkillCliAction::Install(_)
-            }))
-        ));
-    }
+    ]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("skill install was rejected: {}", error.message),
+    };
+    assert_eq!(invocation.combination_id(), "skill-install-one-agent");
+    assert!(matches!(
+        run_skill_install(&invocation),
+        Ok(Mode::SkillAdmin(SkillAdminRequest {
+            action: SkillAdminAction::Install(SkillAdminOptions {
+                agent: SkillAgentSelection::ClaudeCode,
+                scope: SkillScope::Workspace,
+                force: true,
+                ..
+            }),
+            ..
+        }))
+    ));
 }
 
 #[test]
-fn clap_accepts_global_output_after_admin_subcommands() {
-    let cli_res = AfdCli::try_parse_from(["afpsql", "skill", "status", "--output", "yaml"]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.output, "yaml");
-    }
+fn output_is_injected_into_every_command() {
+    let invocation = match resolve(&["afpsql", "skill", "status", "--output", "yaml"]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("skill status --output yaml was rejected: {}", error.message),
+    };
+    assert_eq!(format_of(&invocation), Ok(OutputFormat::Yaml));
 }
 
 #[test]
-fn clap_accepts_ssh_transport_flags() {
-    let cli_res = AfdCli::try_parse_from([
+fn registry_accepts_ssh_transport_flags() {
+    let _env_guard = crate::test_env::env_lock();
+    let session = query_session(&[
         "afpsql",
         "--ssh",
         "user@example.com",
@@ -381,10 +483,6 @@ fn clap_accepts_ssh_transport_flags() {
         "user@jump2",
         "--ssh-option",
         "ProxyJump=bastion",
-        "--ssh-local-host",
-        "127.0.0.1",
-        "--ssh-local-port",
-        "15432",
         "--ssh-remote-socket",
         "/var/run/postgresql/.s.PGSQL.5432",
         "--ssh-sudo-user",
@@ -392,146 +490,207 @@ fn clap_accepts_ssh_transport_flags() {
         "--sql",
         "select 1",
     ]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.ssh.as_deref(), Some("user@example.com"));
-        assert_eq!(
-            cli.ssh_via,
-            vec!["user@jump1".to_string(), "user@jump2".to_string()]
-        );
-        assert_eq!(cli.ssh_options, vec!["ProxyJump=bastion".to_string()]);
-        assert_eq!(cli.ssh_local_host.as_deref(), Some("127.0.0.1"));
-        assert_eq!(cli.ssh_local_port, Some(15432));
-        assert_eq!(
-            cli.ssh_remote_socket.as_deref(),
-            Some("/var/run/postgresql/.s.PGSQL.5432")
-        );
-        assert_eq!(cli.ssh_sudo_user.as_deref(), Some("postgres"));
-    }
+    assert_eq!(session.ssh.destination.as_deref(), Some("user@example.com"));
+    assert_eq!(
+        session.ssh.via,
+        vec!["user@jump1".to_string(), "user@jump2".to_string()]
+    );
+    assert_eq!(session.ssh.options, vec!["ProxyJump=bastion".to_string()]);
+    assert_eq!(session.ssh.local_host, None);
+    assert_eq!(session.ssh.local_port, None);
+    assert_eq!(
+        session.ssh.remote_socket.as_deref(),
+        Some("/var/run/postgresql/.s.PGSQL.5432")
+    );
+    assert_eq!(session.ssh.sudo_user.as_deref(), Some("postgres"));
 }
 
 #[test]
-fn clap_accepts_container_transport_flags() {
-    let cli_res = AfdCli::try_parse_from([
+fn registry_accepts_container_transport_flags() {
+    let _env_guard = crate::test_env::env_lock();
+    let session = query_session(&[
         "afpsql",
-        "--container",
+        "--container-kubectl-pod",
         "pg",
-        "--container-driver",
-        "kubectl",
-        "--container-namespace",
+        "--container-kubectl-namespace",
         "prod",
-        "--container-context",
+        "--container-kubectl-context",
         "cluster-a",
-        "--container-pod-container",
-        "postgres",
-        "--container-user",
+        "--container-kubectl-container",
         "postgres",
         "--sql",
         "select 1",
     ]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.container.as_deref(), Some("pg"));
-        assert_eq!(cli.container_driver.as_deref(), Some("kubectl"));
-        assert_eq!(cli.container_namespace.as_deref(), Some("prod"));
-        assert_eq!(cli.container_context.as_deref(), Some("cluster-a"));
-        assert_eq!(cli.container_pod_container.as_deref(), Some("postgres"));
-        assert_eq!(cli.container_user.as_deref(), Some("postgres"));
-    }
+    assert_eq!(session.container.kubectl_pod.as_deref(), Some("pg"));
+    assert_eq!(session.container.kubectl_namespace.as_deref(), Some("prod"));
+    assert_eq!(
+        session.container.kubectl_context.as_deref(),
+        Some("cluster-a")
+    );
+    assert_eq!(
+        session.container.kubectl_container.as_deref(),
+        Some("postgres")
+    );
+    assert_eq!(
+        session.container.selected_driver(),
+        Ok(Some(crate::types::ContainerDriver::Kubectl))
+    );
+
+    let compose = query_session(&[
+        "afpsql",
+        "--container-compose-service",
+        "db",
+        "--container-compose-file",
+        "compose.yml",
+        "--container-compose-project",
+        "demo",
+        "--container-compose-user",
+        "postgres",
+        "--container-compose-runtime",
+        "docker-compose",
+        "--sql",
+        "select 1",
+    ]);
+    assert_eq!(compose.container.compose_service.as_deref(), Some("db"));
+    assert_eq!(compose.container.compose_files, vec!["compose.yml"]);
+    assert_eq!(compose.container.compose_project.as_deref(), Some("demo"));
+    assert_eq!(compose.container.compose_user.as_deref(), Some("postgres"));
+    assert_eq!(
+        compose.container.compose_runtime.as_deref(),
+        Some("docker-compose")
+    );
+}
+
+/// `kubectl exec` has no exec-as-user option, so there is no flag that could
+/// ask for one — the impossibility is in the surface, not in a runtime check.
+#[test]
+fn container_kubectl_family_has_no_user_flag() {
+    assert_eq!(
+        rejection(&[
+            "afpsql",
+            "--container-kubectl-pod",
+            "pg",
+            "--container-kubectl-user",
+            "postgres",
+            "--sql",
+            "select 1",
+        ]),
+        agent_first_data::CliErrorRule::UnknownArgument
+    );
+}
+
+/// The driver is inferred from the family used, so two families name two
+/// drivers and there is nothing to run.
+#[test]
+fn container_flag_families_cannot_be_mixed() {
+    let _env_guard = crate::test_env::env_lock();
+    let error = query_session_error(&[
+        "afpsql",
+        "--container-docker-name",
+        "pg",
+        "--container-kubectl-pod",
+        "app",
+        "--sql",
+        "select 1",
+    ]);
+    assert_eq!(error.code, "cli_invalid_argument_value");
+    assert_eq!(
+        error.message,
+        "--container-docker-name cannot be combined with --container-kubectl-pod; each container driver has its own flag family"
+    );
 }
 
 #[test]
-fn clap_accepts_ssh_plus_container_transport_flags() {
-    let cli_res = AfdCli::try_parse_from([
+fn registry_accepts_ssh_plus_container_transport_flags() {
+    let _env_guard = crate::test_env::env_lock();
+    let session = query_session(&[
         "afpsql",
         "--ssh",
         "root@example.com",
         "--ssh-option",
         "ProxyJump=bastion",
-        "--container",
+        "--container-podman-name",
         "pg",
-        "--container-driver",
-        "podman",
         "--sql",
         "select 1",
     ]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.ssh.as_deref(), Some("root@example.com"));
-        assert_eq!(cli.ssh_options, vec!["ProxyJump=bastion".to_string()]);
-        assert_eq!(cli.container.as_deref(), Some("pg"));
-        assert_eq!(cli.container_driver.as_deref(), Some("podman"));
-    }
+    assert_eq!(session.ssh.destination.as_deref(), Some("root@example.com"));
+    assert_eq!(session.ssh.options, vec!["ProxyJump=bastion".to_string()]);
+    assert_eq!(session.container.podman_name.as_deref(), Some("pg"));
+    assert_eq!(
+        session.container.selected_driver(),
+        Ok(Some(crate::types::ContainerDriver::Podman))
+    );
 }
 
 #[test]
-fn clap_accepts_permission_flag() {
-    let cli_res = AfdCli::try_parse_from([
+fn registry_accepts_permission_flag() {
+    let invocation = match resolve(&[
         "afpsql",
         "--permission",
         "container-write",
         "--sql",
         "select 1",
-    ]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.permission, Some(Permission::ContainerWrite));
-    }
+    ]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("--permission was rejected: {}", error.message),
+    };
+    assert_eq!(permission_of(&invocation), Some(Permission::ContainerWrite));
 }
 
 #[test]
-fn canonical_clap_rejects_psql_compatibility_shorts() {
+fn short_flags_do_not_exist() {
+    // The registry has no short syntax at all, so `-h` is not a rejected alias
+    // of `--host` — it is simply not an argument.
     for args in [
         vec!["afpsql", "-h", "db.example", "--sql", "select 1"],
         vec!["afpsql", "-V"],
         vec!["afpsql", "-o", "yaml", "--sql", "select 1"],
     ] {
-        assert!(
-            AfdCli::try_parse_from(args).is_err(),
-            "canonical afpsql accepted a psql compatibility short"
+        assert_eq!(
+            rejection(&args),
+            agent_first_data::CliErrorRule::UnknownArgument,
+            "{args:?}"
         );
     }
 }
 
 #[test]
-fn clap_accepts_sql_values_that_look_like_flags() {
-    let cli_res = AfdCli::try_parse_from(["afpsql", "--sql", "--mode=psql", "--dry-run"]);
-    assert!(cli_res.is_ok());
-    if let Ok(cli) = cli_res {
-        assert_eq!(cli.sql.as_deref(), Some("--mode=psql"));
-        assert!(cli.dry_run);
+fn sql_values_that_look_like_flags_need_the_inline_form() {
+    // A value is never taken from a token that starts with `-`, so a SQL string
+    // that looks like a flag is written `--sql=<value>`. That is what keeps
+    // `--sql --dry-run` a missing value rather than a silently swallowed flag.
+    for value in ["--mode=psql", "--explain"] {
+        let invocation = match resolve(&["afpsql", &format!("--sql={value}"), "--dry-run"]) {
+            Ok(invocation) => invocation,
+            Err(error) => panic!("--sql={value} was rejected: {}", error.message),
+        };
+        assert_eq!(optional_string(&invocation, "sql").as_deref(), Some(value));
+        assert!(flag(&invocation, "dry_run"));
     }
-
-    let help_sql_res = AfdCli::try_parse_from(["afpsql", "--sql", "--explain", "--dry-run"]);
-    assert!(help_sql_res.is_ok());
-    if let Ok(cli) = help_sql_res {
-        assert_eq!(cli.sql.as_deref(), Some("--explain"));
-        assert!(cli.dry_run);
-    }
+    assert_eq!(
+        rejection(&["afpsql", "--sql", "--dry-run"]),
+        agent_first_data::CliErrorRule::MissingArgumentValue
+    );
 }
 
 #[test]
-fn clap_rejects_removed_read_only_flag() {
-    let cli_res = AfdCli::try_parse_from(["afpsql", "--read-only", "--sql", "select 1"]);
-    assert!(cli_res.is_err());
+fn registry_rejects_removed_read_only_flag() {
+    assert_eq!(
+        rejection(&["afpsql", "--read-only", "--sql", "select 1"]),
+        agent_first_data::CliErrorRule::UnknownArgument
+    );
 }
 
 #[test]
-fn startup_requested_detects_raw_log_entries() {
-    assert!(startup_requested_from_raw(&[
-        "afpsql".to_string(),
-        "--log".to_string(),
-        "startup".to_string(),
-    ]));
-    assert!(startup_requested_from_raw(&[
-        "afpsql".to_string(),
-        "--log=all".to_string(),
-    ]));
-    assert!(!startup_requested_from_raw(&[
-        "afpsql".to_string(),
-        "--log".to_string(),
-        "query.error".to_string(),
-    ]));
+fn startup_is_requested_only_by_a_filter_that_selects_it() {
+    assert!(startup_requested(&split_log_entries(&[
+        "startup".to_string()
+    ])));
+    assert!(startup_requested(&split_log_entries(&["all".to_string()])));
+    assert!(!startup_requested(&split_log_entries(&[
+        "query.error".to_string()
+    ])));
 }
 
 #[test]
@@ -548,7 +707,7 @@ fn top_level_mode_scan_ignores_option_values() {
     assert!(!is_psql_mode_requested(&raw_args(&[
         "afpsql",
         "--sql",
-        "--mode=psql",
+        "select 1",
         "--dry-run",
     ])));
     assert!(!is_psql_mode_requested(&raw_args(&[
@@ -566,120 +725,128 @@ fn top_level_mode_scan_ignores_option_values() {
 }
 
 #[test]
-fn help_output_markdown_scan_ignores_option_values() {
-    let rendered = agent_first_data::cli_handle_help_or_continue(
-        &raw_args(&["afpsql", "--help", "--output", "markdown"]),
-        &command_for_bin("afpsql"),
-        &agent_first_data::HelpConfig::output_aware(),
-    );
-    assert!(
-        matches!(&rendered, Ok(Some(md)) if md.starts_with("# afpsql -") && md.contains("`afpsql`")),
-        "markdown help should render with the canonical afpsql command name"
-    );
-
-    let non_helper = agent_first_data::cli_handle_help_or_continue(
-        &raw_args(&["afpsql", "--sql", "--help", "--dry-run"]),
-        &command_for_bin("afpsql"),
-        &agent_first_data::HelpConfig::output_aware(),
-    );
-    assert!(
-        matches!(non_helper, Ok(None)),
-        "non-helper request should produce no help output"
-    );
+fn every_registered_shape_resolves_back_to_itself() {
+    // Each generated argv must resolve to the shape it came from, so an
+    // overlapping or unreachable combination fails here rather than at a
+    // caller's first invocation.
+    let cli = registry();
+    let synthetics = cli.synthetic_invocations();
+    assert!(!synthetics.is_empty(), "the registry generated no fixtures");
+    for synthetic in synthetics {
+        let argv = synthetic.argv.clone();
+        match cli.resolve_from(argv.clone()) {
+            Ok(CliOutcome::Run(invocation)) => assert_eq!(
+                invocation.combination_id(),
+                synthetic.combination_id,
+                "{argv:?} resolved to the wrong shape"
+            ),
+            Ok(_) => panic!("{argv:?} did not resolve to a run"),
+            Err(error) => panic!("{argv:?} failed to resolve: {}", error.message),
+        }
+    }
 }
 
 #[test]
-fn scoped_help_progressively_discloses_global_connection_arguments() {
-    let command = command_for_bin("afpsql");
-    let rendered = agent_first_data::cli_handle_help_or_continue(
-        &raw_args(&["afpsql", "inspect", "table", "--help"]),
-        &command,
-        &agent_first_data::HelpConfig::output_aware(),
-    )
-    .expect("scoped help request should be valid")
-    .expect("scoped help should render");
-    let event: Value = serde_json::from_str(&rendered).expect("scoped help must be JSON");
-    let help = &event["result"]["help"];
-    assert_eq!(help["command_path"], "afpsql inspect table");
-    assert_eq!(
-        help["inherited_arguments_from"],
-        serde_json::json!(["afpsql"])
-    );
-    assert!(help["arguments"].as_array().is_some_and(|arguments| {
-        arguments
-            .iter()
-            .any(|argument| argument["name"] == "--full")
-    }));
-    assert!(
-        !rendered.contains("--dsn-secret"),
-        "structured leaf help must not repeat global connection arguments"
-    );
-
-    let root = agent_first_data::cli_handle_help_or_continue(
-        &raw_args(&["afpsql", "--help"]),
-        &command,
-        &agent_first_data::HelpConfig::output_aware(),
-    )
-    .expect("root help request should be valid")
-    .expect("root help should render");
-    let root_event: Value = serde_json::from_str(&root).expect("root help must be JSON");
-    let root_arguments = root_event["result"]["help"]["arguments"]
-        .as_array()
-        .expect("root help arguments");
-    assert!(
-        root_arguments
-            .iter()
-            .any(|argument| { argument["name"] == "--dsn-secret" && argument["global"] == true }),
-        "root help must define global connection arguments"
-    );
-    assert!(
-        root_arguments
-            .iter()
-            .any(|argument| argument["name"] == "--host" && argument.get("short").is_none())
-    );
-
-    let plain = agent_first_data::cli_handle_help_or_continue(
-        &raw_args(&["afpsql", "inspect", "table", "--help", "--output", "plain"]),
-        &command,
-        &agent_first_data::HelpConfig::output_aware(),
-    )
-    .expect("plain scoped help request should be valid")
-    .expect("plain scoped help should render");
-    assert!(plain.contains("Usage: afpsql inspect table [OPTIONS] <NAME>"));
-    assert!(plain.contains("--dsn-secret"));
-}
-
-#[test]
-fn clap_help_pseudo_command_is_disabled() {
-    let error = command_for_bin("afpsql")
-        .try_get_matches_from(["afpsql", "help"])
-        .expect_err("help pseudo-command must be disabled");
-    assert_ne!(error.kind(), clap::error::ErrorKind::DisplayHelp);
-}
-
-#[test]
-fn structured_help_stays_within_structural_payload_budget() {
-    for raw in [
-        raw_args(&["afpsql", "--help"]),
-        raw_args(&["afpsql", "--help", "--recursive"]),
+fn an_ordered_stream_cannot_be_dry_run_or_bounded() {
+    // `--dry-run` never streams and `--inline-max-rows` bounds the buffered
+    // result a stream does not build, so neither belongs to a streaming shape.
+    // Both were runtime no-ops; the registry rejects them before anything runs.
+    for args in [
+        vec!["afpsql", "--sql", "select 1", "--stream-rows", "--dry-run"],
+        vec![
+            "afpsql",
+            "--sql",
+            "select 1",
+            "--stream-rows",
+            "--inline-max-rows",
+            "10",
+        ],
+        vec!["afpsql", "--sql", "select 1", "--batch-rows", "10"],
     ] {
-        let rendered = agent_first_data::cli_handle_help_or_continue(
-            &raw,
-            &command_for_bin("afpsql"),
-            &agent_first_data::HelpConfig::output_aware(),
-        )
-        .expect("help request should be valid")
-        .expect("help should render");
-        let event: Value = serde_json::from_str(&rendered).expect("help must be JSON");
-        let help = &event["result"]["help"];
-        let (commands, arguments) = count_help_surface(help);
-        let budget = 512 + commands * 160 + arguments * 120;
-        assert!(
-            rendered.len() < budget,
-            "help exceeded its payload budget: {} >= {budget}",
-            rendered.len()
+        assert_eq!(
+            rejection(&args),
+            agent_first_data::CliErrorRule::UnregisteredCombination,
+            "{args:?}"
         );
     }
+}
+
+#[test]
+fn one_sql_source_and_one_mode_per_invocation() {
+    assert_eq!(shape_of(&["afpsql", "--sql", "select 1"]), "query-inline");
+    assert_eq!(shape_of(&["afpsql", "--sql-file", "-"]), "query-file");
+    assert_eq!(shape_of(&["afpsql", "--mode", "pipe"]), "pipe");
+    assert_eq!(shape_of(&["afpsql", "--mode", "psql"]), "psql-translation");
+    for args in [
+        // Two sources for one query, and a query source in a mode that reads
+        // its requests from stdin: both were runtime checks, both are shapes.
+        vec!["afpsql", "--sql", "select 1", "--sql-file", "/tmp/q.sql"],
+        vec!["afpsql", "--mode", "pipe", "--sql", "select 1"],
+    ] {
+        assert_eq!(
+            rejection(&args),
+            agent_first_data::CliErrorRule::UnregisteredCombination,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn help_answers_one_command_completely() {
+    let cli = registry();
+    let CliOutcome::Help(help) = (match cli.resolve_from(["afpsql", "inspect", "table", "--help"]) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("scoped help was rejected: {}", error.message),
+    }) else {
+        panic!("expected a help outcome");
+    };
+    let model = help.model();
+    assert_eq!(model.schema, "cli-help-v2");
+    assert_eq!(model.command_path, "afpsql inspect table");
+
+    let [shape] = model.shapes.as_slice() else {
+        panic!("inspect table has exactly one shape");
+    };
+    assert!(
+        shape.usage.contains("afpsql inspect table <NAME>"),
+        "{shape:?}"
+    );
+    assert!(shape.usage.contains("[--full]"), "{shape:?}");
+    // Connection arguments are the command's own, so one call is the whole
+    // answer: there is no second level that would only be reachable by asking
+    // a parent command for what this one accepts.
+    assert!(shape.usage.contains("[--dsn <SOURCE>]"), "{shape:?}");
+
+    // A group command routes rather than running, so it advertises ready-to-run
+    // next calls instead of shapes.
+    let CliOutcome::Help(group) = (match cli.resolve_from(["afpsql", "inspect", "--help"]) {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("group help was rejected: {}", error.message),
+    }) else {
+        panic!("expected a help outcome");
+    };
+    assert!(group.model().shapes.is_empty());
+    assert!(
+        group
+            .model()
+            .subcommands
+            .contains(&"afpsql inspect table --help".to_string()),
+        "{:?}",
+        group.model().subcommands
+    );
+}
+
+#[test]
+fn an_unknown_command_is_named_rather_than_guessed() {
+    assert_eq!(
+        rejection(&["afpsql", "inspect", "nope"]),
+        agent_first_data::CliErrorRule::UnknownCommand
+    );
+    // clap's `help` pseudo-command went with clap: `help` names no command.
+    assert_eq!(
+        rejection(&["afpsql", "help"]),
+        agent_first_data::CliErrorRule::UnknownCommand
+    );
 }
 
 #[test]
@@ -737,156 +904,74 @@ fn startup_env_snapshot_records_presence_only() {
 }
 
 #[test]
-fn resolve_secret_value_from_env_and_errors() {
+fn typed_secret_source_resolves_env_and_errors() {
     let path = std::env::var("PATH");
     assert!(path.is_ok());
     if let Ok(path) = path {
-        let resolved = resolve_secret_value("--dsn-secret", None, Some("PATH"), None);
-        assert_eq!(resolved, Ok(Some(path)));
+        let source = TypedSecretSource::Env("PATH".to_string());
+        assert_eq!(source.resolve("--dsn"), Ok(path));
     }
 
-    let conflict = resolve_secret_value(
-        "--dsn-secret",
-        Some("direct".to_string()),
-        Some("PATH"),
-        None,
-    );
-    assert!(conflict.is_err());
-
     let missing_name = format!("AFPSQL_TEST_MISSING_{}", std::process::id());
-    let missing = resolve_secret_value("--dsn-secret", None, Some(&missing_name), None);
+    let missing = TypedSecretSource::Env(missing_name).resolve("--dsn");
     assert!(missing.is_err());
 }
 
 #[test]
-fn clap_accepts_two_value_config_sources_and_rejects_slot_conflicts() {
-    for flag in [
-        "--dsn-secret-config",
-        "--conninfo-secret-config",
-        "--password-secret-config",
-    ] {
-        let parsed = AfdCli::try_parse_from([
-            "afpsql",
-            flag,
-            "config.yaml",
-            "database.url",
-            "--sql",
-            "select 1",
-        ]);
-        assert!(parsed.is_ok(), "failed to parse {flag}");
-
-        let equals = format!("{flag}=config.yaml");
-        let parsed =
-            AfdCli::try_parse_from(["afpsql", &equals, "database.url", "--sql", "select 1"]);
-        assert!(parsed.is_err(), "accepted unsupported {equals}");
-
-        for invalid in [
-            vec!["afpsql", flag, "config.yaml", "--sql", "select 1"],
-            vec![
-                "afpsql",
-                flag,
-                "config.yaml",
-                "database.url",
-                "extra",
-                "--sql",
-                "select 1",
-            ],
-        ] {
-            assert!(AfdCli::try_parse_from(invalid).is_err(), "accepted {flag}");
-        }
-    }
-
-    for (direct, env, config) in [
-        ("--dsn-secret", "--dsn-secret-env", "--dsn-secret-config"),
-        (
-            "--conninfo-secret",
-            "--conninfo-secret-env",
-            "--conninfo-secret-config",
-        ),
-        (
-            "--password-secret",
-            "--password-secret-env",
-            "--password-secret-config",
-        ),
-    ] {
-        for args in [
-            vec!["afpsql", direct, "direct", env, "SECRET_ENV"],
-            vec!["afpsql", direct, "direct", config, "config.json", "value"],
-            vec!["afpsql", env, "SECRET_ENV", config, "config.json", "value"],
-        ] {
-            assert!(AfdCli::try_parse_from(args).is_err());
-        }
+fn a_config_source_is_one_file_and_one_dot_path() {
+    for flag in ["--dsn", "--conninfo", "--password"] {
+        let source =
+            TypedSecretSource::parse(flag, Some("file:config.yaml#database.url".to_string()))
+                .expect("typed file source")
+                .expect("source");
+        let TypedSecretSource::File(reference) = source else {
+            panic!("expected file source")
+        };
+        assert_eq!(reference.file, std::path::PathBuf::from("config.yaml"));
+        assert_eq!(reference.path, "database.url");
+        assert!(TypedSecretSource::parse(flag, Some("file:config.yaml".to_string())).is_err());
     }
 }
 
 #[test]
-fn psql_parser_consumes_config_source_pairs_and_rejects_bad_arity() {
-    for (flag, field) in [
-        ("--dsn-secret-config", "dsn"),
-        ("--conninfo-secret-config", "conninfo"),
-        ("--password-secret-config", "password"),
-    ] {
-        let raw = vec![
-            "afpsql".to_string(),
-            "--mode=psql".to_string(),
-            flag.to_string(),
-            "config.env".to_string(),
-            "SECRET".to_string(),
-            "-c".to_string(),
-            "select 1".to_string(),
-        ];
+fn one_slot_is_one_typed_secret_source() {
+    assert!(matches!(
+        TypedSecretSource::parse("--dsn", Some("env:DATABASE_URL".to_string())),
+        Ok(Some(TypedSecretSource::Env(name))) if name == "DATABASE_URL"
+    ));
+    assert!(matches!(
+        TypedSecretSource::parse("--dsn", Some("postgresql://db/app".to_string())),
+        Ok(Some(TypedSecretSource::Literal(value))) if value == "postgresql://db/app"
+    ));
+    assert!(TypedSecretSource::parse("--dsn", Some("env:".to_string())).is_err());
+}
+
+#[test]
+fn psql_mode_takes_the_same_typed_secret_sources() {
+    for (flag, slot) in [("--dsn", "dsn"), ("--conninfo", "conninfo")] {
+        let source = "file:config.env#SECRET";
+        let raw = raw_args(&["afpsql", "--mode=psql", flag, source, "-c", "select 1"]);
         let mut state = PsqlModeState::default();
         let mut index = 2;
         assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_ok());
-        let reference = match field {
-            "dsn" => state.dsn_secret_config,
-            "conninfo" => state.conninfo_secret_config,
-            _ => state.password_secret_config,
+        let value = match slot {
+            "dsn" => state.dsn_secret,
+            _ => state.conninfo_secret,
         };
-        assert_eq!(
-            reference.map(|value| value.path),
-            Some("SECRET".to_string())
-        );
+        assert_eq!(value.as_deref(), Some(source));
         assert_eq!(index, raw.len() - 2);
-
-        let raw = raw_args(&[
-            "afpsql",
-            "--mode=psql",
-            &format!("{flag}=config.env"),
-            "SECRET",
-            "-c",
-            "select 1",
-        ]);
-        let mut state = PsqlModeState::default();
-        let mut index = 2;
-        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
-
-        let raw = raw_args(&[
-            "afpsql",
-            "--mode=psql",
-            flag,
-            "config.env",
-            "-c",
-            "select 1",
-        ]);
-        let mut state = PsqlModeState::default();
-        let mut index = 2;
-        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
-
-        let raw = raw_args(&[
-            "afpsql",
-            "--mode=psql",
-            flag,
-            "config.env",
-            "SECRET",
-            "extra",
-            "-c",
-            "select 1",
-        ]);
-        let mut state = PsqlModeState::default();
-        let mut index = 2;
-        assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_err());
     }
+    let raw = raw_args(&[
+        "afpsql",
+        "--mode=psql",
+        "--password=env:PGPASSWORD",
+        "-c",
+        "select 1",
+    ]);
+    let mut state = PsqlModeState::default();
+    let mut index = 2;
+    assert!(parse_psql_long_arg(&raw, &mut index, &mut state).is_ok());
+    assert_eq!(state.password_secret.as_deref(), Some("env:PGPASSWORD"));
 }
 
 #[test]
@@ -929,7 +1014,7 @@ fn temp_sql_path(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn parse_psql_mode_accepts_secret_env_flags() {
+fn parse_psql_mode_accepts_typed_env_sources() {
     let path = std::env::var("PATH");
     assert!(path.is_ok());
     let raw = vec![
@@ -938,10 +1023,9 @@ fn parse_psql_mode_accepts_secret_env_flags() {
         "psql".to_string(),
         "-c".to_string(),
         "select 1".to_string(),
-        "--dsn-secret-env".to_string(),
-        "PATH".to_string(),
-        "--password-secret-env".to_string(),
-        "PATH".to_string(),
+        "--dsn".to_string(),
+        "env:PATH".to_string(),
+        "--password=env:PATH".to_string(),
     ];
     let mode_res = parse_psql_mode(&raw);
     assert!(mode_res.is_ok());
@@ -977,7 +1061,7 @@ fn parse_psql_mode_all_flags_and_sql_file() {
         "roger".to_string(),
         "-d".to_string(),
         "postgres".to_string(),
-        "--conninfo-secret".to_string(),
+        "--conninfo".to_string(),
         "host=localhost user=roger dbname=postgres".to_string(),
         "-v".to_string(),
         "1=7".to_string(),
@@ -1015,7 +1099,7 @@ fn parse_psql_mode_dsn_and_errors() {
         "psql".to_string(),
         "-c".to_string(),
         "select 1".to_string(),
-        "--dsn-secret".to_string(),
+        "--dsn".to_string(),
         "postgresql://localhost/postgres".to_string(),
     ];
     let mode_res = parse_psql_mode(&raw);
@@ -1046,19 +1130,18 @@ fn parse_psql_mode_dsn_and_errors() {
 
 #[test]
 fn parse_psql_mode_accepts_container_transport() {
+    let _env_guard = crate::test_env::env_lock();
     let raw = vec![
         "afpsql".to_string(),
         "--mode".to_string(),
         "psql".to_string(),
-        "--container".to_string(),
+        "--container-compose-service".to_string(),
         "pg".to_string(),
-        "--container-driver".to_string(),
-        "compose".to_string(),
         "--container-compose-file".to_string(),
         "compose.yml".to_string(),
         "--container-compose-project".to_string(),
         "demo".to_string(),
-        "--container-user".to_string(),
+        "--container-compose-user".to_string(),
         "postgres".to_string(),
         "-c".to_string(),
         "select 1".to_string(),
@@ -1066,8 +1149,7 @@ fn parse_psql_mode_accepts_container_transport() {
     let mode_res = parse_psql_mode(&raw);
     assert!(mode_res.is_ok());
     if let Ok(Mode::Cli(req)) = mode_res {
-        assert_eq!(req.session.container.target.as_deref(), Some("pg"));
-        assert_eq!(req.session.container.driver.as_deref(), Some("compose"));
+        assert_eq!(req.session.container.compose_service.as_deref(), Some("pg"));
         assert_eq!(
             req.session.container.compose_files,
             vec!["compose.yml".to_string()]
@@ -1076,9 +1158,35 @@ fn parse_psql_mode_accepts_container_transport() {
             req.session.container.compose_project.as_deref(),
             Some("demo")
         );
-        assert_eq!(req.session.container.user.as_deref(), Some("postgres"));
+        assert_eq!(
+            req.session.container.compose_user.as_deref(),
+            Some("postgres")
+        );
         assert_eq!(req.options.permission, Some(Permission::ContainerWrite));
     }
+}
+
+#[test]
+fn parse_psql_mode_rejects_mixed_container_flag_families() {
+    let _env_guard = crate::test_env::env_lock();
+    let raw = vec![
+        "afpsql".to_string(),
+        "--mode".to_string(),
+        "psql".to_string(),
+        "--container-docker-name".to_string(),
+        "pg".to_string(),
+        "--container-kubectl-pod".to_string(),
+        "app".to_string(),
+        "-c".to_string(),
+        "select 1".to_string(),
+    ];
+    assert_eq!(
+        parse_psql_mode(&raw).err(),
+        Some(
+            "--container-docker-name cannot be combined with --container-kubectl-pod; each container driver has its own flag family"
+                .to_string()
+        )
+    );
 }
 
 #[test]

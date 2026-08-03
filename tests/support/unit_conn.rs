@@ -1,5 +1,4 @@
 use super::*;
-use std::net::IpAddr;
 use tokio_postgres::config::{Host, SslMode};
 
 #[test]
@@ -161,39 +160,6 @@ fn resolve_single_endpoint_rejects_multi_host_connection_sources() -> Result<(),
         return Err("expected multi-host SSH target error".to_string());
     };
     assert!(error.contains("single PostgreSQL host and port"));
-    Ok(())
-}
-
-#[test]
-fn tunnel_config_preserves_dsn_settings_and_replaces_only_network_endpoint() -> Result<(), String> {
-    let cfg = SessionConfig {
-        dsn_secret: Some(
-            "postgresql://alice:p%40ss%3Aword@db.internal:6543/app?sslmode=require&application_name=agent-test&connect_timeout=7"
-                .to_string(),
-        ),
-        ..Default::default()
-    };
-    let source = resolve_pg_config(&cfg).map_err(|e| e.to_string())?;
-    let tunneled = pg_config_for_tcp_tunnel(&source, "127.0.0.1", 15432);
-
-    assert_eq!(tunneled.get_user(), Some("alice"));
-    assert_eq!(tunneled.get_password(), Some("p@ss:word".as_bytes()));
-    assert_eq!(tunneled.get_dbname(), Some("app"));
-    assert_eq!(tunneled.get_application_name(), Some("agent-test"));
-    assert_eq!(tunneled.get_ssl_mode(), SslMode::Require);
-    assert_eq!(
-        tunneled.get_connect_timeout(),
-        Some(&std::time::Duration::from_secs(7))
-    );
-    assert_eq!(
-        tunneled.get_hosts(),
-        &[Host::Tcp("db.internal".to_string())]
-    );
-    assert_eq!(
-        tunneled.get_hostaddrs(),
-        &["127.0.0.1".parse::<IpAddr>().map_err(|e| e.to_string())?]
-    );
-    assert_eq!(tunneled.get_ports(), &[15432]);
     Ok(())
 }
 

@@ -42,6 +42,22 @@ fn query_options_accept_permission_and_reject_removed_read_only() {
 }
 
 #[test]
+fn begin_defaults_to_read_only() {
+    let input = serde_json::from_value::<Input>(serde_json::json!({
+        "code": "begin",
+        "id": "b1"
+    }));
+    assert!(matches!(
+        input,
+        Ok(Input::Begin {
+            read_only: true,
+            permission: None,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn permission_parses_container_values() {
     assert_eq!(
         "container-read".parse::<Permission>(),
@@ -64,12 +80,56 @@ fn ssh_plus_container_selects_container_transport_kind() {
             ..Default::default()
         },
         container: ContainerConfig {
-            target: Some("pg".to_string()),
+            docker_name: Some("pg".to_string()),
             ..Default::default()
         },
         ..Default::default()
     };
     assert_eq!(cfg.transport_kind(), Ok(TransportKind::Container));
+}
+
+/// A pipe session carrying two families names two drivers, so it has no
+/// transport at all — rejected on the request, before any connect attempt.
+#[test]
+fn two_container_families_have_no_transport_kind() {
+    let cfg = SessionConfig {
+        container: ContainerConfig {
+            compose_service: Some("db".to_string()),
+            kubectl_pod: Some("app".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cfg.transport_kind(),
+        Err(
+            "--container-compose-service cannot be combined with --container-kubectl-pod; each container driver has its own flag family"
+                .to_string()
+        )
+    );
+}
+
+/// The kubectl family has no exec-user field, so a session cannot express one.
+#[test]
+fn kubectl_family_has_no_user_field() {
+    let cfg = ContainerConfig {
+        kubectl_pod: Some("app".to_string()),
+        kubectl_container: Some("postgres".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        cfg.selected_driver(),
+        Ok(Some(crate::types::ContainerDriver::Kubectl))
+    );
+    // Only the four non-kubectl families carry a user, and none of them can be
+    // set alongside a kubectl field.
+    assert!(
+        serde_json::from_value::<SessionConfig>(serde_json::json!({
+            "kubectl_pod": "app",
+            "kubectl_user": "postgres"
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -133,15 +193,26 @@ fn session_config_flat_wire_round_trips_through_substructs() {
         "ssh_local_port": 15432,
         "ssh_remote_socket": "/var/run/postgresql/.s.PGSQL.5432",
         "ssh_sudo_user": "postgres",
-        "container": "pg",
-        "container_driver": "kubectl",
-        "container_runtime": "kubectl",
-        "container_user": "postgres",
-        "container_namespace": "prod",
-        "container_context": "cluster-a",
-        "container_compose_files": ["base.yml", "prod.yml"],
-        "container_compose_project": "demo",
-        "container_pod_container": "postgres"
+        "docker_name": "pg",
+        "docker_user": "postgres",
+        "docker_context": "cluster-a",
+        "docker_runtime": "docker",
+        "podman_name": "pg-podman",
+        "podman_user": "postgres",
+        "podman_runtime": "podman",
+        "nerdctl_name": "pg-nerdctl",
+        "nerdctl_user": "postgres",
+        "nerdctl_runtime": "nerdctl",
+        "compose_service": "db",
+        "compose_user": "postgres",
+        "compose_files": ["base.yml", "prod.yml"],
+        "compose_project": "demo",
+        "compose_runtime": "docker-compose",
+        "kubectl_pod": "pg-pod",
+        "kubectl_container": "postgres",
+        "kubectl_namespace": "prod",
+        "kubectl_context": "cluster-a",
+        "kubectl_runtime": "kubectl"
     });
 
     let parsed: Result<SessionConfig, _> = serde_json::from_value(wire.clone());
@@ -157,14 +228,14 @@ fn session_config_flat_wire_round_trips_through_substructs() {
     assert_eq!(cfg.ssh.options, vec!["ProxyJump=jump".to_string()]);
     assert_eq!(cfg.ssh.local_port, Some(15432));
     assert_eq!(cfg.ssh.sudo_user.as_deref(), Some("postgres"));
-    assert_eq!(cfg.container.target.as_deref(), Some("pg"));
-    assert_eq!(cfg.container.driver.as_deref(), Some("kubectl"));
-    assert_eq!(cfg.container.namespace.as_deref(), Some("prod"));
+    assert_eq!(cfg.container.docker_name.as_deref(), Some("pg"));
+    assert_eq!(cfg.container.compose_service.as_deref(), Some("db"));
     assert_eq!(
         cfg.container.compose_files,
         vec!["base.yml".to_string(), "prod.yml".to_string()]
     );
-    assert_eq!(cfg.container.pod_container.as_deref(), Some("postgres"));
+    assert_eq!(cfg.container.kubectl_pod.as_deref(), Some("pg-pod"));
+    assert_eq!(cfg.container.kubectl_namespace.as_deref(), Some("prod"));
 
     let reserialized_res = serde_json::to_value(&cfg);
     assert!(

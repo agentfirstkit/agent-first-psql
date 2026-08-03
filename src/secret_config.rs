@@ -10,22 +10,6 @@ pub struct SecretConfigRef {
 }
 
 impl SecretConfigRef {
-    pub fn from_values(flag: &str, values: Option<Vec<String>>) -> Result<Option<Self>, String> {
-        let Some(values) = values else {
-            return Ok(None);
-        };
-        let [file, path]: [String; 2] = values
-            .try_into()
-            .map_err(|_| format!("{flag} requires exactly two values: <FILE> <DOT_PATH>"))?;
-        if path.is_empty() {
-            return Err(format!("{flag} requires a non-empty DOT_PATH"));
-        }
-        Ok(Some(Self {
-            file: PathBuf::from(file),
-            path,
-        }))
-    }
-
     pub fn safe_metadata(&self) -> serde_json::Value {
         serde_json::json!({
             "kind": "config",
@@ -102,7 +86,7 @@ mod tests {
 
     fn resolve(path: PathBuf, dot_path: &str) -> Result<String, String> {
         let result = resolve_config_secret(
-            "--dsn-secret-config",
+            "--dsn",
             &SecretConfigRef {
                 file: path.clone(),
                 path: dot_path.to_string(),

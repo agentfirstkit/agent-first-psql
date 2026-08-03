@@ -21,6 +21,7 @@ pub mod pipe;
 pub mod protocol;
 pub mod psql_admin;
 pub mod readonly_policy;
+pub mod runtime_env;
 pub mod secret_config;
 pub mod skill_admin;
 pub mod ssh_transport;
@@ -34,20 +35,8 @@ pub enum Capability {
     ReadOnly,
 }
 
-impl Capability {
-    pub fn permits(self, permission: types::Permission) -> bool {
-        self == Self::ReadWrite || permission.is_read_only()
-    }
-}
-
 pub async fn run(capability: Capability, bin_name: &str) {
     let raw_args = std::env::args().collect::<Vec<_>>();
-    if let Err(error) = emit::install_output_to_from_raw(&raw_args) {
-        if emit::emit_cli_error(&error, None, OutputFormat::Json).is_err() {
-            std::process::exit(4);
-        }
-        std::process::exit(2);
-    }
     let mut locked_profile = None;
     if capability == Capability::ReadOnly {
         let profile_name = match raw_args
@@ -77,11 +66,24 @@ pub async fn run(capability: Capability, bin_name: &str) {
             };
         }
     }
-    let _stream_redirect = install_stream_redirect_or_exit();
-    let mode = match cli::parse_args(bin_name) {
-        Ok(mode) => mode,
+    // The registry decides the destination and the file sinks, so redirection
+    // is installed from the resolved plan rather than from a second scan of
+    // argv — and only after the readonly capability checks above have had
+    // their say about creating local files.
+    let cli::Parsed {
+        mode,
+        redirect: _redirect,
+    } = match cli::parse_args(bin_name) {
+        Ok(parsed) => parsed,
         Err(error) => {
-            if emit::emit_cli_error(&error, None, OutputFormat::Json).is_err() {
+            if emit::emit_coded_error(
+                &error.code,
+                &error.message,
+                error.hint.as_deref(),
+                OutputFormat::Json,
+            )
+            .is_err()
+            {
                 std::process::exit(4);
             }
             std::process::exit(2);
@@ -167,18 +169,6 @@ fn reject_readonly(error: &str, hint: &str) -> ! {
         std::process::exit(4);
     }
     std::process::exit(2);
-}
-
-fn install_stream_redirect_or_exit()
--> Option<agent_first_data::stream_redirect::InstalledStreamRedirect> {
-    match agent_first_data::stream_redirect::install_from_raw_args(std::env::args()) {
-        Ok(redirect) => redirect,
-        Err(error) => {
-            let value = agent_first_data::build_cli_error(&error.to_string(), None);
-            let _ = emit::emit_value(value.into(), OutputFormat::Json);
-            std::process::exit(2);
-        }
-    }
 }
 
 #[cfg(test)]

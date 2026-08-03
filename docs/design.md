@@ -59,9 +59,11 @@ Non-goals:
 6. Dynamic values use PostgreSQL parameters, never client text interpolation.
 7. Session state is explicit: pipe named sessions are stable backend sessions.
 8. Per-session query execution is FIFO.
-9. Runtime behavior is based on PostgreSQL metadata, not SQL-text heuristics.
+9. Query shape and write enforcement are based on PostgreSQL metadata and
+   transaction state. The readonly binary uses a narrow SQL-text classifier
+   only for transaction-control statements.
 10. SSH and container boundaries are first-class transports, including
-    `--ssh + --container` for containers on SSH hosts.
+    `--ssh` plus a container driver family for containers on SSH hosts.
 11. `psql mode` is compatibility translation only; it does not fork runtime semantics.
 
 ## Execution architecture: translate inputs, preserve one contract
@@ -101,8 +103,8 @@ Permission values are intentionally tied to transport:
 Mismatches fail before execution as `invalid_request` with a hint that tells the
 agent which permission family to use.
 
-`--ssh` and `--container` can be combined to run the selected container driver
-on the SSH host. The database boundary is still the container, so the session
+`--ssh` and a `--container-<driver>-*` flag family can be combined to run that
+driver on the SSH host. The database boundary is still the container, so the session
 uses container permissions rather than SSH permissions.
 
 `psql mode` keeps psql's writable default for script compatibility and does not
@@ -142,7 +144,8 @@ cap, and no group/world write bits establish the Unix trust boundary.
 ## Config secret source architecture
 
 Canonical and psql-compatible argument parsers translate each
-`--*-secret-config FILE DOT_PATH` pair into a typed config reference. A single
+`--*-secret-config FILE` plus `--*-secret-config-path DOT_PATH` pair into a
+typed config reference. A single
 in-process resolver detects JSON, TOML, YAML, or dotenv through
 agent-first-data's document layer, reads the file once, resolves the dot-path,
 and requires a non-empty string. It never invokes a shell, expands dotenv
@@ -158,8 +161,9 @@ references and automatic rotation are deliberately out of scope.
 
 Direct, SSH, and container paths resolve DSN/conninfo through the same typed
 `tokio_postgres::Config`. Boundary transports derive one internal PostgreSQL
-endpoint from that parsed config rather than splitting connection text. A local
-SSH tunnel replaces only the network endpoint; authentication, database,
+endpoint from that parsed config rather than splitting connection text. An SSH
+stdio bridge carries the PostgreSQL wire stream without a local listener;
+authentication, database,
 startup options, timeout/keepalive behavior, channel binding, and supported TLS
 settings remain attached to the connection. Multi-host sources fail explicitly
 until one bridge can represent multiple failover targets.
@@ -357,11 +361,13 @@ It must reject or mark unsupported:
 
 - Keep runtime errors structured and honor `--output-to`.
 - Add tests for each permission boundary and hint.
-- Preserve session/tunnel lifetimes with active work rather than only map entries.
+- Preserve session/bridge lifetimes with active work rather than only map entries.
 - Avoid destructive changes to session state on config updates until active work is safe.
-- Keep generated CLI docs in sync with `--help --recursive --output markdown`.
-- Preserve `clippy.toml` bans that prevent SQL keyword scanning and ad-hoc
-  process-stream writes.
+- Keep `docs/cli.md` generated from the registry with `afpsql --docs`; the
+  registry is the only source, so the document cannot disagree with the parser.
+- Preserve `clippy.toml` bans against ad-hoc process-stream writes. Keep the
+  readonly transaction-control classifier narrow and explicitly tested; do not
+  extend it into a DML/DDL permission heuristic.
 
 ## Skill design: behavior, not flag reference
 
@@ -388,7 +394,7 @@ Drop from the skill:
 - full canonical command variants for every transport combination
 
 For anything in the "drop" list, the agent runs `afpsql --help` or
-`afpsql --help --recursive --output markdown` to discover the current flag surface. Mirroring
+`afpsql <command> --help` to discover the current flag surface. Mirroring
 `--help` content into the skill makes it rot every release, bloats agent
 context, and trains the agent on stale flag names.
 

@@ -131,15 +131,16 @@ pub async fn execute_query(
             .writer
             .send(Output::Error {
                 id: id.clone(),
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {resolved_session}"),
                 sqlstate: None,
                 message: None,
                 detail: None,
                 hint: Some(
-                    "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
+                    "list active sessions with a `config` request, or omit `session` to use the default"
+                        .to_string(),
                 ),
-                retryable: true,
+                retryable: false,
                 trace: trace.clone(),
             })
             .await;
@@ -148,7 +149,7 @@ pub async fn execute_query(
             log_event::QUERY_ERROR,
             id.as_deref(),
             Some(&resolved_session),
-            Some(error_code::CONNECT_FAILED),
+            Some(error_code::INVALID_REQUEST),
             None,
             &trace,
         )
@@ -323,7 +324,7 @@ pub async fn execute_query(
             truncated_at_rows,
             truncated_at_bytes,
         }) => {
-            let status = emit_rows_result(
+            let trace = emit_rows_result(
                 app,
                 id.clone(),
                 Some(resolved_session.clone()),
@@ -335,10 +336,8 @@ pub async fn execute_query(
                     at_bytes: truncated_at_bytes,
                 },
                 start,
-                &resolved_opts,
             )
             .await;
-            let RowEmitStatus::Sent { trace } = status;
             emit_log(
                 app,
                 log_event::QUERY_RESULT,
@@ -375,7 +374,12 @@ fn permission_error_hint(options: &QueryOptions, session: &SessionConfig) -> Str
             "this session does not use afpsql container transport, so permission `{}` is invalid; use `read` for reads or `write` for writes",
             permission.as_str()
         ),
-        (Err(message), _) => message,
+        // The transport itself did not resolve, so no permission family can be
+        // the right one yet.
+        (Err(_), _) => {
+            "keep this session inside one container driver flag family; fields from two families name two drivers"
+                .to_string()
+        }
         _ => {
             "use read/write for direct connections, ssh-read/ssh-write for afpsql SSH transport, and container-read/container-write for afpsql container transport"
                 .to_string()
@@ -442,7 +446,7 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
                     message: None,
                     detail: None,
                     hint: Some(
-                        "this session's transport flags are inconsistent; update the session via a `config` request before requesting `session_info`"
+                        "this session's transport fields are inconsistent; update the session via a `config` request before requesting `session_info`"
                             .to_string(),
                     ),
                     retryable: false,
@@ -487,7 +491,11 @@ pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Op
     };
 
     let (database, user, host, port, server_version) =
-        probe_session_identity(app, &resolved_session, &session_cfg, &resolved_opts).await;
+        if app.executor.explicit_tx_open(&resolved_session).await {
+            (None, None, None, None, None)
+        } else {
+            probe_session_identity(app, &resolved_session, &session_cfg, &resolved_opts).await
+        };
 
     let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
     let _ = app
@@ -730,7 +738,7 @@ pub(crate) async fn emit_exec_error(
             )
             .await;
         }
-        ExecError::Config { message, hint } => {
+        ExecError::Config { message, hint } | ExecError::InvalidRequest { message, hint } => {
             let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
             let _ = app
                 .writer
@@ -787,40 +795,6 @@ pub(crate) async fn emit_exec_error(
             )
             .await;
         }
-        ExecError::ResultTooLarge {
-            row_count,
-            payload_bytes,
-        } => {
-            let trace = Trace {
-                duration_ms: start.elapsed().as_millis() as u64,
-                row_count: Some(row_count),
-                payload_bytes: Some(payload_bytes),
-            };
-            let _ = app
-                .writer
-                .send(Output::Error {
-                    id: id.clone(),
-                    error_code: error_code::RESULT_TOO_LARGE.to_string(),
-                    error: "result exceeds inline limits".to_string(),
-                    sqlstate: None,
-                    message: None,
-                    detail: None,
-                    hint: Some(result_too_large_hint()),
-                    retryable: false,
-                    trace: trace.clone(),
-                })
-                .await;
-            emit_log(
-                app,
-                log_event::QUERY_ERROR,
-                id.as_deref(),
-                Some(resolved_session),
-                Some(error_code::RESULT_TOO_LARGE),
-                None,
-                &trace,
-            )
-            .await;
-        }
         ExecError::Sql {
             sqlstate,
             message,
@@ -839,6 +813,7 @@ pub(crate) async fn emit_exec_error(
                     detail,
                     hint,
                     position,
+                    retryable: crate::protocol::sqlstate_retryable(&sqlstate),
                     trace: trace.clone(),
                 })
                 .await;
@@ -958,11 +933,6 @@ impl RowSink for OutputRowSink {
     }
 }
 
-#[derive(Clone)]
-enum RowEmitStatus {
-    Sent { trace: Trace },
-}
-
 /// Carry the inline-truncation flags from the executor's row collector into
 /// `emit_rows_result` without ballooning the function's argument list.
 #[derive(Clone, Copy, Default)]
@@ -981,75 +951,7 @@ async fn emit_rows_result(
     rows: Vec<Value>,
     truncation: InlineTruncation,
     start: Instant,
-    opts: &ResolvedOptions,
-) -> RowEmitStatus {
-    if opts.stream_rows {
-        let req_id = id.clone().unwrap_or_else(|| "cli".to_string());
-        let _ = app
-            .writer
-            .send(Output::ResultStart {
-                id: req_id.clone(),
-                session: session.clone(),
-                columns: columns.clone(),
-            })
-            .await;
-
-        let mut batch: Vec<Value> = vec![];
-        let mut batch_bytes = 0usize;
-        let mut total_bytes = 0usize;
-        let mut row_count = 0usize;
-
-        for row in rows {
-            let sz = serde_json::to_vec(&row).map(|b| b.len()).unwrap_or(0);
-            batch_bytes += sz;
-            total_bytes += sz;
-            row_count += 1;
-            batch.push(row);
-
-            if batch.len() >= opts.batch_rows || batch_bytes >= opts.batch_bytes {
-                let n = batch.len();
-                let _ = app
-                    .writer
-                    .send(Output::ResultRows {
-                        id: req_id.clone(),
-                        rows: std::mem::take(&mut batch),
-                        rows_batch_count: n,
-                    })
-                    .await;
-                batch_bytes = 0;
-            }
-        }
-
-        for tail in std::iter::once(batch).filter(|r| !r.is_empty()) {
-            let n = tail.len();
-            let _ = app
-                .writer
-                .send(Output::ResultRows {
-                    id: req_id.clone(),
-                    rows: tail,
-                    rows_batch_count: n,
-                })
-                .await;
-        }
-
-        let trace = Trace {
-            duration_ms: start.elapsed().as_millis() as u64,
-            row_count: Some(row_count),
-            payload_bytes: Some(total_bytes),
-        };
-        let _ = app
-            .writer
-            .send(Output::ResultEnd {
-                id: req_id,
-                session,
-                command_tag: command_tag::rows(row_count),
-                trace: trace.clone(),
-            })
-            .await;
-
-        return RowEmitStatus::Sent { trace };
-    }
-
+) -> Trace {
     let mut payload_bytes = 0usize;
     for row in &rows {
         payload_bytes += serde_json::to_vec(row).map(|b| b.len()).unwrap_or(0);
@@ -1077,11 +979,7 @@ async fn emit_rows_result(
         })
         .await;
 
-    RowEmitStatus::Sent { trace }
-}
-
-fn result_too_large_hint() -> String {
-    "retry with stream_rows=true, or increase --inline-max-rows/--inline-max-bytes".to_string()
+    trace
 }
 
 async fn emit_log(

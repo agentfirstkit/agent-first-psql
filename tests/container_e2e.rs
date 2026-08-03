@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[path = "support/env.rs"]
@@ -8,12 +9,19 @@ mod test_env;
 
 const POSTGRES_ALIAS: &str = "postgres";
 
+// `#[ignore]` is what keeps this out of a plain `cargo test`; the container
+// leg opts in with `--ignored`. Once it is running it must assert or fail —
+// an early return on a missing environment variable would report a green run
+// that exercised nothing, which is how the fixed entrypoint exists to prevent.
 #[test]
 #[ignore]
 fn docker_container_transport_select_one() {
-    if test_env::env_value("AFPSQL_E2E").as_deref() != Some("1") {
-        return;
-    }
+    assert_eq!(
+        test_env::env_value("AFPSQL_E2E").as_deref(),
+        Some("1"),
+        "the container e2e needs AFPSQL_E2E=1; run it through `scripts/test.sh container` \
+         or `scripts/test.sh all` rather than cargo directly"
+    );
 
     let suffix = std::process::id().to_string();
     let network = format!("afpsql-e2e-net-{suffix}");
@@ -83,10 +91,8 @@ fn docker_container_transport_select_one() {
     let readonly = env!("CARGO_BIN_EXE_afpsql-readonly");
     let output_result = Command::new(readonly)
         .args([
-            "--container",
+            "--container-docker-name",
             &bridge_name,
-            "--container-driver",
-            "docker",
             "--host",
             POSTGRES_ALIAS,
             "--port",
@@ -95,7 +101,7 @@ fn docker_container_transport_select_one() {
             "test",
             "--dbname",
             "test",
-            "--password-secret",
+            "--password",
             "test",
             "--sql",
             "select 1 as n",
@@ -123,10 +129,8 @@ fn docker_container_transport_select_one() {
 
     let write_result = Command::new(readonly)
         .args([
-            "--container",
+            "--container-docker-name",
             &bridge_name,
-            "--container-driver",
-            "docker",
             "--host",
             POSTGRES_ALIAS,
             "--port",
@@ -135,7 +139,7 @@ fn docker_container_transport_select_one() {
             "test",
             "--dbname",
             "test",
-            "--password-secret",
+            "--password",
             "test",
             "--permission",
             "container-write",
@@ -163,11 +167,15 @@ fn docker_container_transport_select_one() {
         "stderr: {}",
         String::from_utf8_lossy(&write.stderr)
     );
-    assert_readonly_reaches_runtime(
+
+    assert_explicit_transaction_boundaries_and_types(&bridge_name);
+    assert_encoding_fallback_executes_once(&bridge_name);
+
+    assert_readonly_policy_rejects(
         [
-            "--container",
+            "--container-docker-name",
             &bridge_name,
-            "--container-runtime",
+            "--container-docker-runtime",
             "false",
             "--sql",
             "select 1",
@@ -176,7 +184,7 @@ fn docker_container_transport_select_one() {
     );
 
     if let Some(ssh_destination) = test_env::env_value("AFPSQL_E2E_SSH") {
-        assert_readonly_reaches_runtime(
+        assert_readonly_policy_rejects(
             [
                 "--ssh",
                 &ssh_destination,
@@ -199,7 +207,7 @@ fn docker_container_transport_select_one() {
                 "test",
                 "--dbname",
                 "test",
-                "--password-secret",
+                "--password",
                 "test",
                 "--sql",
                 "select 2 as n",
@@ -223,7 +231,7 @@ fn docker_container_transport_select_one() {
                     "test",
                     "--dbname",
                     "test",
-                    "--password-secret",
+                    "--password",
                     "test",
                     "--sql",
                     "select 3 as n",
@@ -236,10 +244,8 @@ fn docker_container_transport_select_one() {
             [
                 "--ssh",
                 &ssh_destination,
-                "--container",
+                "--container-docker-name",
                 &bridge_name,
-                "--container-driver",
-                "docker",
                 "--host",
                 POSTGRES_ALIAS,
                 "--port",
@@ -248,7 +254,7 @@ fn docker_container_transport_select_one() {
                 "test",
                 "--dbname",
                 "test",
-                "--password-secret",
+                "--password",
                 "test",
                 "--sql",
                 "select 4 as n",
@@ -258,12 +264,224 @@ fn docker_container_transport_select_one() {
     }
 }
 
-fn assert_readonly_reaches_runtime<const N: usize>(args: [&str; N], context: &str) {
-    // The ordinary readonly profile is a database write-guard, not a host
-    // sandbox: it allows host and transport capabilities (custom container
-    // runtimes, SSH options) and only refuses database writes. So these flags are
-    // accepted and the failure surfaces from the runtime itself, not as a policy
-    // rejection (`invalid_request`).
+fn container_write(bridge_name: &str, sql: &str) -> std::process::Output {
+    container_write_logging(bridge_name, sql, Some("query.row_encoding_degraded"))
+}
+
+fn container_write_logging(
+    bridge_name: &str,
+    sql: &str,
+    log_filter: Option<&str>,
+) -> std::process::Output {
+    let mut args = vec![
+        "--container-docker-name",
+        bridge_name,
+        "--host",
+        POSTGRES_ALIAS,
+        "--port",
+        "5432",
+        "--user",
+        "test",
+        "--dbname",
+        "test",
+        "--password",
+        "test",
+        "--permission",
+        "container-write",
+    ];
+    if let Some(filter) = log_filter {
+        args.push("--log");
+        args.push(filter);
+    }
+    args.push("--sql");
+    args.push(sql);
+    Command::new(env!("CARGO_BIN_EXE_afpsql"))
+        .args(args)
+        .output()
+        .expect("run container write")
+}
+
+fn assert_encoding_fallback_executes_once(bridge_name: &str) {
+    let table = format!("afpsql_fallback_once_{}", std::process::id());
+    let create = container_write(bridge_name, &format!("create table {table}(n int)"));
+    assert!(
+        create.status.success(),
+        "create fallback fixture: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let explain = container_write(
+        bridge_name,
+        &format!("explain analyze insert into {table} values (1) returning n"),
+    );
+    assert!(
+        explain.status.success(),
+        "fallback statement: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&explain.stderr)
+            .contains("\"event\":\"query.row_encoding_degraded\""),
+        "fallback was not observable: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+
+    let count = container_write(
+        bridge_name,
+        &format!("select count(*)::int as count from {table}"),
+    );
+    assert!(
+        count.status.success(),
+        "count fallback effects: {}",
+        String::from_utf8_lossy(&count.stderr)
+    );
+    let event: serde_json::Value =
+        serde_json::from_slice(&count.stdout).expect("count result event");
+    assert_eq!(
+        event["result"]["rows"][0]["count"], 1,
+        "fallback statement executed more than once"
+    );
+
+    // The degradation notice is a log event, so it must honor --log like every
+    // other one. An agent that asked for no logs must not get one injected into
+    // its stream. `explain` triggers the same wrap failure without writing.
+    let unlogged = container_write_logging(bridge_name, "explain select 1", None);
+    assert!(
+        unlogged.status.success(),
+        "unlogged fallback statement: {}",
+        String::from_utf8_lossy(&unlogged.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&unlogged.stderr).contains("query.row_encoding_degraded"),
+        "degraded event ignored the log filter: {}",
+        String::from_utf8_lossy(&unlogged.stderr)
+    );
+
+    let drop_table = container_write(bridge_name, &format!("drop table {table}"));
+    assert!(drop_table.status.success(), "drop fallback fixture");
+}
+
+fn assert_explicit_transaction_boundaries_and_types(bridge_name: &str) {
+    let requests = [
+        serde_json::json!({"code":"begin","id":"default_begin"}),
+        serde_json::json!({
+            "code":"query",
+            "id":"default_begin_write",
+            "sql":"create temporary table afpsql_must_not_exist(n int)",
+            "options":{"permission":"container-write"}
+        }),
+        serde_json::json!({"code":"rollback","id":"default_rollback"}),
+        serde_json::json!({
+            "code":"begin",
+            "id":"write_begin",
+            "read_only":false,
+            "permission":"container-write"
+        }),
+        serde_json::json!({
+            "code":"query",
+            "id":"unacknowledged_write_tx",
+            "sql":"select 1",
+            "options":{"permission":"container-read"}
+        }),
+        serde_json::json!({"code":"rollback","id":"write_rollback"}),
+        serde_json::json!({"code":"begin","id":"typed_begin"}),
+        serde_json::json!({
+            "code":"query",
+            "id":"typed",
+            "sql":"select 12.34::numeric as amount, '2026-07-31 10:00:00+00'::timestamptz as created_at, '123e4567-e89b-12d3-a456-426614174000'::uuid as id;"
+        }),
+        serde_json::json!({"code":"rollback","id":"typed_rollback"}),
+        serde_json::json!({"code":"begin","id":"utility_begin"}),
+        serde_json::json!({"code":"query","id":"utility_explain","sql":"explain select 1"}),
+        serde_json::json!({"code":"query","id":"utility_show","sql":"show server_version"}),
+        serde_json::json!({"code":"rollback","id":"utility_rollback"}),
+        serde_json::json!({"code":"close"}),
+    ]
+    .into_iter()
+    .map(|request| request.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_afpsql"))
+        .args([
+            "--mode",
+            "pipe",
+            "--output-to",
+            "stdout",
+            "--container-docker-name",
+            bridge_name,
+            "--host",
+            POSTGRES_ALIAS,
+            "--port",
+            "5432",
+            "--user",
+            "test",
+            "--dbname",
+            "test",
+            "--password",
+            "test",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql transaction e2e");
+    child
+        .stdin
+        .as_mut()
+        .expect("pipe stdin")
+        .write_all(format!("{requests}\n").as_bytes())
+        .expect("write transaction requests");
+    let output = child.wait_with_output().expect("wait transaction e2e");
+    assert!(
+        output.status.success(),
+        "transaction e2e failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)
+        .expect("utf8 events")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON event"))
+        .collect::<Vec<_>>();
+    let event = |id: &str| {
+        events
+            .iter()
+            .find(|value| value["result"]["id"] == id || value["error"]["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id}: {events:?}"))
+    };
+    assert_eq!(
+        event("default_begin_write")["error"]["sqlstate"],
+        "25006",
+        "begin without fields must be read-only"
+    );
+    assert_eq!(
+        event("unacknowledged_write_tx")["error"]["code"],
+        "invalid_request",
+        "each query in a read-write transaction must acknowledge write permission"
+    );
+    let typed = &event("typed")["result"]["rows"][0];
+    assert_eq!(typed["amount"], 12.34);
+    assert_eq!(typed["created_at"], "2026-07-31T10:00:00+00:00");
+    assert_eq!(typed["id"], "123e4567-e89b-12d3-a456-426614174000");
+    // Utility statements cannot sit inside the `to_jsonb` CTE, so inside an
+    // explicit transaction they must reach the direct decoder the same way they
+    // do outside one. Without that fallback they fail as a wrapper syntax error
+    // whose position points into SQL the caller never sent.
+    assert!(
+        event("utility_explain")["result"]["rows"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "EXPLAIN inside an explicit transaction must fall back to the direct decoder: {:?}",
+        event("utility_explain")
+    );
+    assert!(
+        event("utility_show")["result"]["rows"][0]["server_version"].is_string(),
+        "SHOW inside an explicit transaction must return its value: {:?}",
+        event("utility_show")
+    );
+}
+
+fn assert_readonly_policy_rejects<const N: usize>(args: [&str; N], context: &str) {
     let output = Command::new(env!("CARGO_BIN_EXE_afpsql-readonly"))
         .args(args)
         .output()
@@ -271,8 +489,8 @@ fn assert_readonly_reaches_runtime<const N: usize>(args: [&str; N], context: &st
     assert!(!output.status.success(), "{context} unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(r#""kind":"error""#) && !stderr.contains(r#""code":"invalid_request""#),
-        "{context} was rejected by policy instead of reaching the runtime: {stderr}"
+        stderr.contains(r#""kind":"error""#) && stderr.contains(r#""code":"invalid_request""#),
+        "{context} was not rejected by readonly policy: {stderr}"
     );
 }
 

@@ -34,7 +34,7 @@ pub fn run(req: SkillAdminRequest) -> i32 {
                 Err(_) => 4,
             },
         },
-        Err(err) => match agent_first_data::json_error("cli_error", &err.message)
+        Err(err) => match agent_first_data::json_error("skill_error", &err.message)
             .hint_if_some(err.hint.as_deref())
             .field(
                 "partial_report",

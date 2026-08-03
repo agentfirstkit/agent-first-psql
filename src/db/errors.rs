@@ -6,15 +6,11 @@ pub enum ExecError {
         message: String,
         hint: Option<String>,
     },
-    InvalidParams(String),
-    /// Reserved variant: the inline path now soft-truncates instead of
-    /// erroring, but this variant is preserved so future callers (e.g. a
-    /// dedicated row-limit gate) can opt back into the hard-fail shape.
-    #[allow(dead_code)]
-    ResultTooLarge {
-        row_count: usize,
-        payload_bytes: usize,
+    InvalidRequest {
+        message: String,
+        hint: Option<String>,
     },
+    InvalidParams(String),
     Sql {
         sqlstate: String,
         message: String,
@@ -23,6 +19,24 @@ pub enum ExecError {
         position: Option<String>,
     },
     Internal(String),
+}
+
+/// Agent-facing text for an error. Every variant renders the human-readable
+/// message only — never a Rust struct dump. `format!("{error:?}")` is the
+/// ergonomic way to put an error into an event field and it leaks internal
+/// shape to the agent, so the correct rendering has to be the easy one.
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Connect(error) => f.write_str(&error.error),
+            Self::Config { message, .. }
+            | Self::InvalidRequest { message, .. }
+            | Self::InvalidParams(message)
+            | Self::Sql { message, .. }
+            | Self::Internal(message) => f.write_str(message),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +163,7 @@ fn connect_retryable_for_sqlstate(sqlstate: &str) -> bool {
 fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
     let hint = match sqlstate {
         "28P01" => {
-            "password authentication failed; check --user and --password-secret-env PGPASSWORD, or use an authentication method accepted by pg_hba.conf"
+            "password authentication failed; check --user and --password env:PGPASSWORD, or use an authentication method accepted by pg_hba.conf"
         }
         "28000" => {
             if message.contains("role") && message.contains("does not exist") {
@@ -171,7 +185,7 @@ fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
             "PostgreSQL rejected the connection because a configured limit was exceeded; inspect server logs and connection limits"
         }
         state if state.starts_with("08") => {
-            "connection exception from PostgreSQL; check host/port/socket path, SSH tunnel, listener status, and network reachability"
+            "connection exception from PostgreSQL; check host/port/socket path, SSH transport, listener status, and network reachability"
         }
         _ => return None,
     };
@@ -181,22 +195,22 @@ fn connect_hint_for_sqlstate(sqlstate: &str, message: &str) -> Option<String> {
 fn connect_hint_for_message(message: &str) -> Option<String> {
     if message.contains("password missing") {
         if message.contains("container") {
-            return Some("PostgreSQL requested password authentication but no password was provided; set --password-secret-env PGPASSWORD or --password-secret, or use peer auth over the container socket: --container-user <db-os-user> --host /var/run/postgresql (the --container-user, e.g. postgres, must match the database role)".to_string());
+            return Some("PostgreSQL requested password authentication but no password was provided; set --password env:PGPASSWORD or --password, or use peer auth over the container socket: --container-docker-user <db-os-user> --host /var/run/postgresql (the exec user, e.g. postgres, must match the database role; use the flag of the driver family you selected)".to_string());
         }
-        return Some("PostgreSQL requested password authentication but no password was provided; set --password-secret-env PGPASSWORD or --password-secret, or use a peer/socket authentication path".to_string());
+        return Some("PostgreSQL requested password authentication but no password was provided; set --password env:PGPASSWORD or --password, or use a peer/socket authentication path".to_string());
     }
     if message.contains("error connecting to server") && message.contains("Operation not permitted")
     {
         return Some("local sandbox or OS policy blocked opening the PostgreSQL connection; in Codex request escalation, or check host/port/socket reachability outside the sandbox".to_string());
     }
-    if message.contains("allocate ssh local port") && message.contains("Operation not permitted") {
-        return Some("local sandbox or OS policy blocked binding the SSH tunnel port; in Codex request escalation, or use SSH sudo Unix-socket bridge mode when appropriate".to_string());
+    if message.contains("ssh bridge") && message.contains("Operation not permitted") {
+        return Some("local sandbox or OS policy blocked starting the SSH transport; in Codex request escalation, or check SSH reachability outside the sandbox".to_string());
     }
     if message.contains("single PostgreSQL host and port") {
         return Some("SSH and container transports currently target one PostgreSQL endpoint; use a DSN/conninfo with one host, or choose one host explicitly with discrete connection fields".to_string());
     }
     if message.contains("container bridge") || message.contains("container transport") {
-        return Some("check the container target, runtime access, driver selection, and whether PostgreSQL is listening on the requested container-internal host/port or socket".to_string());
+        return Some("check the container/service/pod name, runtime access, the driver family you selected, and whether PostgreSQL is listening on the requested container-internal host/port or socket".to_string());
     }
     if message.contains("explicit remote PostgreSQL Unix socket") {
         return Some("pass --ssh-remote-socket /var/run/postgresql/.s.PGSQL.5432, or set --host/PGHOST to the remote socket directory when not using sudo bridge mode".to_string());
@@ -204,7 +218,7 @@ fn connect_hint_for_message(message: &str) -> Option<String> {
     if message.contains(".s.PGSQL") && message.contains("No such file or directory") {
         return Some("the PostgreSQL Unix socket path does not exist; check the server socket directory, port-derived socket filename, and whether PostgreSQL is running".to_string());
     }
-    if message.contains("ssh tunnel") || message.contains("start ssh") {
+    if message.contains("ssh bridge") || message.contains("start ssh") {
         return Some("check SSH reachability/options and whether PostgreSQL is listening on the requested remote host/port or socket".to_string());
     }
     None
@@ -218,7 +232,7 @@ fn connect_retryable_for_message(message: &str) -> bool {
 }
 
 fn default_connect_hint() -> String {
-    "check the DSN/conninfo or --host/--port/PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server (DSN/conninfo targets are interpreted from the final SSH host); for container-local PostgreSQL use --container TARGET; for containers on an SSH host combine --ssh user@server --container TARGET; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
+    "check the DSN/conninfo or --host/--port/PGHOST/PGPORT; for remote local-only PostgreSQL use --ssh user@server (DSN/conninfo targets are interpreted from the final SSH host); for container-local PostgreSQL use --container-docker-name NAME or the flag family of another driver; for containers on an SSH host combine --ssh user@server with that flag; for sudo-only Unix-socket access use --ssh-sudo-user with an explicit --ssh-remote-socket, or set --host/PGHOST to the remote socket directory".to_string()
 }
 
 #[cfg(test)]
@@ -269,12 +283,10 @@ mod tests {
             "connect through container bridge failed: invalid configuration: password missing",
         );
         let container_password = container_password.as_deref().unwrap_or_default();
-        assert!(container_password.contains("--container-user"));
+        assert!(container_password.contains("--container-docker-user"));
         assert!(container_password.contains("/var/run/postgresql"));
 
-        let sandbox = connect_hint_for_message(
-            "allocate ssh local port on 127.0.0.1 failed: Operation not permitted",
-        );
+        let sandbox = connect_hint_for_message("start ssh bridge failed: Operation not permitted");
         assert!(sandbox.as_deref().unwrap_or_default().contains("sandbox"));
 
         let tcp_sandbox = connect_hint_for_message(

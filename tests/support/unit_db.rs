@@ -77,9 +77,8 @@ fn transport_chain_summary_reports_selected_chain() {
             ..Default::default()
         },
         container: ContainerConfig {
-            target: Some("app-pod".to_string()),
-            driver: Some("kubectl".to_string()),
-            pod_container: Some("postgres".to_string()),
+            kubectl_pod: Some("app-pod".to_string()),
+            kubectl_container: Some("postgres".to_string()),
             ..Default::default()
         },
         host: Some("127.0.0.1".to_string()),

@@ -15,6 +15,21 @@ use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 
+pub(crate) enum PipeInput {
+    WriterStopped,
+    Line(std::io::Result<Option<Result<String, ()>>>),
+}
+
+pub(crate) async fn next_pipe_input<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    writer: &mut tokio::task::JoinHandle<Result<(), agent_first_data::CliEmitterError>>,
+) -> PipeInput {
+    tokio::select! {
+        _ = writer => PipeInput::WriterStopped,
+        read = read_limited_line(reader, MAX_PIPE_LINE_BYTES) => PipeInput::Line(read),
+    }
+}
+
 pub async fn run(
     init: crate::cli::PipeInit,
     capability: crate::Capability,
@@ -46,7 +61,7 @@ pub async fn run(
     }
 
     let (tx, rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
-    let writer = tokio::spawn(crate::writer::writer_task(rx, output));
+    let mut writer = tokio::spawn(crate::writer::writer_task(rx, output));
 
     let app = Arc::new(App::new(config, tx, capability));
     app.locked_readonly_profile
@@ -58,7 +73,14 @@ pub async fn run(
     let mut reader = reader;
 
     loop {
-        let line = match read_limited_line(&mut reader, MAX_PIPE_LINE_BYTES).await {
+        let read = match next_pipe_input(&mut reader, &mut writer).await {
+            PipeInput::WriterStopped => {
+                runtime.app.executor.shutdown().await;
+                std::process::exit(4);
+            }
+            PipeInput::Line(read) => read,
+        };
+        let line = match read {
             Ok(Some(Ok(line))) => line,
             Ok(Some(Err(()))) => {
                 send_protocol_error(
@@ -151,6 +173,13 @@ enum SessionOp {
         id: Option<String>,
         session: String,
     },
+    SessionInfo {
+        id: Option<String>,
+        session: String,
+    },
+    Invalidate {
+        session: String,
+    },
 }
 
 struct QueuedQuery {
@@ -218,12 +247,11 @@ async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
                 return false;
             }
             *runtime.app.config.write().await = cfg_snapshot.clone();
-            runtime.app.executor.invalidate_sessions(&sessions).await;
-            let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
+            dispatch_config_invalidation(runtime, sessions, cfg_snapshot).await;
         }
         Input::Cancel { id } => dispatch_cancel(&runtime.app, id).await,
         Input::SessionInfo { id, session } => {
-            handler::handle_session_info(&runtime.app, id, session).await;
+            dispatch_session_info(runtime, id, session).await;
         }
         Input::Ping => {
             cleanup_finished_queries(&runtime.app).await;
@@ -281,15 +309,16 @@ async fn dispatch_begin(
             .writer
             .send(Output::Error {
                 id,
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {resolved_session}"),
                 sqlstate: None,
                 message: None,
                 detail: None,
                 hint: Some(
-                    "check --host/--port or PGHOST/PGPORT environment variables".to_string(),
+                    "list active sessions with a `config` request, or omit `session` to use the default"
+                        .to_string(),
                 ),
-                retryable: true,
+                retryable: false,
                 trace: Trace::only_duration(0),
             })
             .await;
@@ -321,7 +350,7 @@ async fn dispatch_begin(
             permission,
             ..Default::default()
         };
-        if let Err(message) = cfg.resolve_options_for_session(&probe, &session_cfg) {
+        if let Err(message) = cfg.resolve_write_options_for_session(&probe, &session_cfg) {
             let _ = app
                 .writer
                 .send(Output::Error {
@@ -396,13 +425,16 @@ async fn enqueue_tx_finish(
             .writer
             .send(Output::Error {
                 id,
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {resolved_session}"),
                 sqlstate: None,
                 message: None,
                 detail: None,
-                hint: None,
-                retryable: true,
+                hint: Some(
+                    "list active sessions with a `config` request, or omit `session` to use the default"
+                        .to_string(),
+                ),
+                retryable: false,
                 trace: Trace::only_duration(0),
             })
             .await;
@@ -454,21 +486,25 @@ async fn emit_tx_error(
             detail,
             hint,
             position,
-        } => Output::SqlError {
-            id,
-            session: Some(resolved_session.to_string()),
-            sqlstate,
-            message,
-            detail,
-            hint,
-            position,
-            trace,
-        },
+        } => {
+            let retryable = crate::protocol::sqlstate_retryable(&sqlstate);
+            Output::SqlError {
+                id,
+                session: Some(resolved_session.to_string()),
+                sqlstate,
+                message,
+                detail,
+                hint,
+                position,
+                retryable,
+                trace,
+            }
+        }
         ExecError::Connect(connect) => {
             let c = *connect;
             Output::Error {
                 id,
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: c.error,
                 sqlstate: c.sqlstate,
                 message: c.message,
@@ -489,15 +525,42 @@ async fn emit_tx_error(
             retryable: false,
             trace,
         },
-        other => Output::Error {
+        ExecError::Config { message, hint } | ExecError::InvalidRequest { message, hint } => {
+            Output::Error {
+                id,
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: message,
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint,
+                retryable: false,
+                trace,
+            }
+        }
+        ExecError::Cancelled => Output::Error {
             id,
-            error_code: error_code::INVALID_REQUEST.to_string(),
-            error: format!("{other:?}"),
+            error_code: error_code::CANCELLED.to_string(),
+            error: "transaction operation cancelled".to_string(),
             sqlstate: None,
             message: None,
             detail: None,
-            hint: None,
-            retryable: false,
+            hint: Some("retry the typed transaction operation".to_string()),
+            retryable: true,
+            trace,
+        },
+        ExecError::Internal(message) => Output::Error {
+            id,
+            error_code: error_code::INTERNAL_ERROR.to_string(),
+            error: message,
+            sqlstate: None,
+            message: None,
+            detail: None,
+            hint: Some(
+                "afpsql hit an internal error; retry, then restart the session if it persists"
+                    .to_string(),
+            ),
+            retryable: true,
             trace,
         },
     };
@@ -751,8 +814,55 @@ async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<SessionOp>) {
             SessionOp::Rollback { id, session } => {
                 exec_tx_finish_on_worker(&app, id, session, false).await
             }
+            SessionOp::SessionInfo { id, session } => {
+                handler::handle_session_info(&app, id, Some(session)).await;
+            }
+            SessionOp::Invalidate { session } => {
+                app.executor.invalidate_sessions(&[session]).await;
+            }
         }
     }
+}
+
+async fn dispatch_session_info(
+    runtime: &Arc<PipeRuntime>,
+    id: Option<String>,
+    requested_session: Option<String>,
+) {
+    let cfg = runtime.app.config.read().await;
+    let session = crate::conn::resolve_session_name(&cfg, requested_session.as_deref());
+    drop(cfg);
+    let worker = get_session_worker(runtime, &session).await;
+    if worker
+        .send(SessionOp::SessionInfo {
+            id: id.clone(),
+            session,
+        })
+        .await
+        .is_err()
+    {
+        send_protocol_error(
+            &runtime.app,
+            id,
+            error_code::INVALID_REQUEST,
+            "session worker is unavailable",
+            Some("retry; the session worker will be restarted"),
+            true,
+        )
+        .await;
+    }
+}
+
+async fn dispatch_config_invalidation(
+    runtime: &Arc<PipeRuntime>,
+    sessions: Vec<String>,
+    cfg_snapshot: RuntimeConfig,
+) {
+    for session in sessions {
+        let worker = get_session_worker(runtime, &session).await;
+        let _ = worker.send(SessionOp::Invalidate { session }).await;
+    }
+    let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
 }
 
 async fn exec_tx_begin_on_worker(
@@ -767,13 +877,16 @@ async fn exec_tx_begin_on_worker(
             .writer
             .send(Output::Error {
                 id,
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {session}"),
                 sqlstate: None,
                 message: None,
                 detail: None,
-                hint: None,
-                retryable: true,
+                hint: Some(
+                    "list active sessions with a `config` request, or omit `session` to use the default"
+                        .to_string(),
+                ),
+                retryable: false,
                 trace: Trace::only_duration(0),
             })
             .await;
@@ -818,13 +931,16 @@ async fn exec_tx_finish_on_worker(
             .writer
             .send(Output::Error {
                 id,
-                error_code: error_code::CONNECT_FAILED.to_string(),
+                error_code: error_code::INVALID_REQUEST.to_string(),
                 error: format!("unknown session: {session}"),
                 sqlstate: None,
                 message: None,
                 detail: None,
-                hint: None,
-                retryable: true,
+                hint: Some(
+                    "list active sessions with a `config` request, or omit `session` to use the default"
+                        .to_string(),
+                ),
+                retryable: false,
                 trace: Trace::only_duration(0),
             })
             .await;

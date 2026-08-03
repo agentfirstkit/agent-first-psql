@@ -4,9 +4,10 @@ use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
 use crate::secret_config::{SecretConfigRef, resolve_config_secret};
 use crate::types::{ContainerConfig, Permission, QueryOptions, SessionConfig, SshConfig};
 use agent_first_data::{
-    LogFilters, OutputFormat, OutputTo, cli_parse_log_filters, cli_parse_output,
+    ArgSpec, BuiltCliSpec, CliOutcome, CliSpec, CliSpecError, CliValue, Combination, CommandSpec,
+    LogFilters, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation,
+    build_afdata_cli, cli_parse_log_filters, cli_parse_output,
 };
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -19,19 +20,29 @@ const STARTUP_ENV_KEYS: &[&str] = &[
     "AFPSQL_DBNAME",
     "AFPSQL_PASSWORD_SECRET",
     "AFPSQL_SSH",
-    "AFPSQL_SSH_LOCAL_HOST",
-    "AFPSQL_SSH_LOCAL_PORT",
+    "AFPSQL_SSH_VIA",
     "AFPSQL_SSH_REMOTE_SOCKET",
     "AFPSQL_SSH_SUDO_USER",
-    "AFPSQL_CONTAINER",
-    "AFPSQL_CONTAINER_DRIVER",
-    "AFPSQL_CONTAINER_RUNTIME",
-    "AFPSQL_CONTAINER_USER",
-    "AFPSQL_CONTAINER_NAMESPACE",
-    "AFPSQL_CONTAINER_CONTEXT",
+    "AFPSQL_CONTAINER_DOCKER_NAME",
+    "AFPSQL_CONTAINER_DOCKER_USER",
+    "AFPSQL_CONTAINER_DOCKER_CONTEXT",
+    "AFPSQL_CONTAINER_DOCKER_RUNTIME",
+    "AFPSQL_CONTAINER_PODMAN_NAME",
+    "AFPSQL_CONTAINER_PODMAN_USER",
+    "AFPSQL_CONTAINER_PODMAN_RUNTIME",
+    "AFPSQL_CONTAINER_NERDCTL_NAME",
+    "AFPSQL_CONTAINER_NERDCTL_USER",
+    "AFPSQL_CONTAINER_NERDCTL_RUNTIME",
+    "AFPSQL_CONTAINER_COMPOSE_SERVICE",
+    "AFPSQL_CONTAINER_COMPOSE_USER",
     "AFPSQL_CONTAINER_COMPOSE_FILE",
     "AFPSQL_CONTAINER_COMPOSE_PROJECT",
-    "AFPSQL_CONTAINER_POD_CONTAINER",
+    "AFPSQL_CONTAINER_COMPOSE_RUNTIME",
+    "AFPSQL_CONTAINER_KUBECTL_POD",
+    "AFPSQL_CONTAINER_KUBECTL_CONTAINER",
+    "AFPSQL_CONTAINER_KUBECTL_NAMESPACE",
+    "AFPSQL_CONTAINER_KUBECTL_CONTEXT",
+    "AFPSQL_CONTAINER_KUBECTL_RUNTIME",
     "PGHOST",
     "PGPORT",
     "PGUSER",
@@ -91,14 +102,13 @@ pub struct SkillAdminOptions {
     pub force: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillAgentSelection {
     /// Manage every agent that supports the requested scope.
     All,
     /// Manage the Codex local skill under $CODEX_HOME/skills.
     Codex,
     /// Manage the Claude Code skill under ~/.claude/skills or .claude/skills.
-    #[value(name = "claude-code", alias = "claude")]
     ClaudeCode,
     /// Manage the opencode skill under ~/.config/opencode/skills or .opencode/skills.
     Opencode,
@@ -106,7 +116,7 @@ pub enum SkillAgentSelection {
     Hermes,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillScope {
     /// Install under the user-level skills directory.
     Personal,
@@ -132,808 +142,1374 @@ pub struct PsqlUnsupportedRequest {
     pub reason: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum RuntimeMode {
-    Cli,
-    Pipe,
-    #[value(name = "psql")]
-    Psql,
-}
-
-#[derive(Subcommand)]
-enum AfdCommand {
-    /// Manage the local psql wrapper for afpsql --mode psql.
-    Psql(PsqlCommand),
-    /// Manage Agent-First PSQL skills for Codex, Claude Code, opencode, and Hermes.
-    Skill(SkillCommand),
-    /// Schema discovery: inspect databases, schemas, tables, indexes, or snapshots.
-    Inspect(InspectCommand),
-}
-
-#[derive(Args)]
-struct InspectCommand {
-    #[command(subcommand)]
-    action: InspectAction,
-}
-
-#[derive(Subcommand)]
-enum InspectAction {
-    /// List databases on the connected server with size, encoding, and connection facts.
+/// Schema-discovery request, already narrowed to the shape that matched.
+pub enum InspectAction {
     Databases(InspectDatabasesArgs),
-    /// Summarize the connected database: schema/table/view/sequence counts and size.
     Database,
-    /// List user-visible schemas.
     Schemas,
-    /// Export full schema metadata for one schema.
     Schema(InspectSchemaArgs),
-    /// Export a stable full-schema snapshot for machine consumption.
     Snapshot(InspectSchemaArgs),
-    /// List tables in a schema with owner, estimated rows, and size.
     Tables(InspectTablesArgs),
-    /// List views (regular and materialized) in a schema with owner.
     Views(InspectViewsArgs),
-    /// List indexes with definitions, size, validity, and optional usage stats.
     Indexes(InspectIndexesArgs),
-    /// Describe a table's columns: types, nullability, defaults, primary key, comments.
     Table(InspectTableArgs),
 }
 
-#[derive(Args)]
-struct InspectDatabasesArgs {
-    /// Include template databases (template0/template1) in the listing.
-    #[arg(long = "all")]
-    all: bool,
+pub struct InspectDatabasesArgs {
+    pub all: bool,
 }
 
-#[derive(Args)]
-struct InspectTablesArgs {
-    /// Schema to filter on. Defaults to `public`.
-    #[arg(long = "schema", default_value = "public")]
-    schema: String,
-    /// Optional `LIKE` pattern matched against the table name (use `%` as wildcard).
-    #[arg(long = "like")]
-    like: Option<String>,
+pub struct InspectTablesArgs {
+    pub schema: String,
+    pub like: Option<String>,
 }
 
-#[derive(Args)]
-struct InspectSchemaArgs {
-    /// Schema to inspect. Defaults to `public`.
-    #[arg(long = "schema", default_value = "public")]
-    schema: String,
-    /// Optional `LIKE` pattern matched against relation names (use `%` as wildcard).
-    #[arg(long = "like")]
-    like: Option<String>,
+pub struct InspectSchemaArgs {
+    pub schema: String,
+    pub like: Option<String>,
 }
 
-#[derive(Args)]
-struct InspectViewsArgs {
-    /// Schema to filter on. Defaults to `public`.
-    #[arg(long = "schema", default_value = "public")]
-    schema: String,
-    /// Optional `LIKE` pattern matched against the view name (use `%` as wildcard).
-    #[arg(long = "like")]
-    like: Option<String>,
+pub struct InspectViewsArgs {
+    pub schema: String,
+    pub like: Option<String>,
 }
 
-#[derive(Args)]
-struct InspectIndexesArgs {
-    /// Schema to filter on. Defaults to `public`.
-    #[arg(long = "schema", default_value = "public")]
-    schema: String,
-    /// Optional table name to filter on. Accepts `schema.table` to override --schema.
-    #[arg(long = "table")]
-    table: Option<String>,
-    /// Include PostgreSQL's built-in pg_stat_user_indexes usage counters.
-    #[arg(long = "stats")]
-    stats: bool,
+pub struct InspectIndexesArgs {
+    pub schema: String,
+    pub table: Option<String>,
+    pub stats: bool,
 }
 
-#[derive(Args)]
-struct InspectTableArgs {
-    /// Table name. Accepts `schema.table`; defaults to `public.NAME` when unqualified.
-    name: String,
-    /// Include relation, constraints, indexes, triggers, and sequence/default metadata.
-    #[arg(long = "full")]
-    full: bool,
+pub struct InspectTableArgs {
+    pub name: String,
+    pub full: bool,
 }
 
-#[derive(Args)]
-struct PsqlCommand {
-    #[command(subcommand)]
-    action: PsqlCliAction,
+/// One structural or argument-shaped rejection, decided before anything ran.
+///
+/// `code` is the classification an agent branches on: the parser's own
+/// `cli_*` codes when the registry decided, and `invalid_request` when the
+/// failure is about the world the arguments name (an unreadable file, an unset
+/// variable) rather than the arguments themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub code: String,
+    pub message: String,
+    pub hint: Option<String>,
 }
 
-#[derive(Subcommand)]
-enum PsqlCliAction {
-    /// Show whether the afpsql-managed psql wrapper is installed and active.
-    Status(PsqlPathArgs),
-    /// Install an afpsql-managed psql wrapper.
-    Install(PsqlPathArgs),
-    /// Remove an afpsql-managed psql wrapper.
-    Uninstall(PsqlPathArgs),
-}
-
-#[derive(Args)]
-struct PsqlPathArgs {
-    /// Directory that contains the psql wrapper. Defaults to the afpsql executable directory.
-    #[arg(long = "bin-dir")]
-    bin_dir: Option<String>,
-}
-
-#[derive(Args)]
-struct SkillCommand {
-    #[command(subcommand)]
-    action: SkillCliAction,
-}
-
-#[derive(Subcommand)]
-enum SkillCliAction {
-    /// Show whether the Agent-First PSQL skill is installed, valid, and up to date.
-    Status(SkillTargetArgs),
-    /// Install the Agent-First PSQL skill.
-    Install(SkillWriteArgs),
-    /// Remove an afpsql-managed Agent-First PSQL skill.
-    Uninstall(SkillWriteArgs),
-}
-
-#[derive(Args)]
-struct SkillTargetArgs {
-    /// Agent to manage. Defaults to all personal skill targets.
-    #[arg(long = "agent", value_enum, default_value_t = SkillAgentSelection::All)]
-    agent: SkillAgentSelection,
-    /// Skill scope.
-    #[arg(long = "scope", value_enum, default_value_t = SkillScope::Personal)]
-    scope: SkillScope,
-    /// Directory that contains skill folders. Requires an explicit single --agent.
-    #[arg(long = "skills-dir")]
-    skills_dir: Option<String>,
-}
-
-#[derive(Args)]
-struct SkillWriteArgs {
-    #[command(flatten)]
-    target: SkillTargetArgs,
-    /// Overwrite or remove an unmanaged Agent-First PSQL skill at the target path.
-    #[arg(long)]
-    force: bool,
-}
-
-#[doc = r#"`afpsql` gives agents a reliable PostgreSQL contract: structured
-AFDATA events, first-class SSH/container transports, explicit write permissions,
-stable pipe sessions, and machine-readable failures.
-
-### Interface Policy
-
-- default mode is canonical agent-first CLI
-- `--mode psql` is argument translation only; runtime output stays JSONL
-- a finite query splits by kind: result to stdout, errors/logs/progress to stderr
-- `--mode pipe` and `--stream-rows` are ordered event streams and stay on one stream (stdout)
-- `--output-to split|stdout|stderr` overrides the destination; `split` is rejected for a stream
-- native CLI and pipe mode default to read-only transactions; writes require permission
-- SSH/container transports keep afpsql local instead of running human `psql` across boundaries
-
-### Modes
-
-- default (native CLI): one SQL action per process — a single agent step
-- `--mode pipe`: a long-lived JSONL session with `id` correlation and named sessions for multi-step work
-- `--mode psql`: run existing `psql` scripts unchanged — flags are translated, runtime output stays JSONL
-
-### Query Sources and Parameters
-
-- use `--sql` for inline SQL or `--sql-file` for a file
-- use repeatable `--param N=value` for positional binds
-- placeholder count is validated from prepared-statement metadata, not by SQL text scanning
-
-### Connection Sources
-
-- `--dsn-secret` for a PostgreSQL URI
-- `--conninfo-secret` for libpq-style conninfo
-- or discrete `--host`, `--port`, `--user`, `--dbname`, `--password-secret`
-- every `*-secret` flag has a `*-secret-env` partner that reads the value from a named environment variable
-- every secret slot also has a `*-secret-config FILE DOT_PATH` source for JSON, TOML, YAML, or dotenv
-- add `--ssh user@server` when PostgreSQL is reachable only from the server boundary
-- with `--ssh`, DSN/conninfo endpoints are interpreted from the final SSH host and secrets stay local
-- SSH and container transports currently require one PostgreSQL endpoint, not a multi-host failover list
-- add `--container TARGET` when PostgreSQL is reachable only from inside a container boundary
-- use named container scope flags instead of raw driver option passthrough
-- use `--container-driver docker|podman|nerdctl|compose|kubectl` for the exec syntax
-- combine `--ssh user@server --container TARGET` for containers on an SSH host
-- agent-first environment fallbacks: `AFPSQL_*`
-- PostgreSQL environment fallbacks: `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGSSLMODE`
-
-### Result Shaping
-
-- default mode buffers a bounded inline result
-- use `--stream-rows` for large result sets, with `--batch-rows` and `--batch-bytes` to tune chunk size
-- `--output json|yaml|plain` changes rendering only, not the runtime schema
-
-### Examples
-
-```text
-afpsql --sql "select now() as now_rfc3339"
-afpsql --sql-file ./query.sql
-afpsql --sql 'select * from users where id = $1' --param 1=123
-afpsql --dsn-secret-env DATABASE_URL --sql "select 1"
-afpsql --dsn-secret-config config.yaml database.url --sql "select 1"
-afpsql --ssh user@server --dsn-secret-config config.yaml database.url --sql "select 1"
-afpsql --container pg-container --dsn-secret-env DATABASE_URL --sql "select 1"
-afpsql --ssh root@server --container app --host host.container.internal --port 5432 --user app --dbname appdb --sql "select 1"
-afpsql --mode psql -h 127.0.0.1 -p 5432 -U app -d appdb -c "select 1"
-afpsql --sql "select * from big_table" --stream-rows --batch-rows 1000
-afpsql --mode pipe
-afpsql psql status
-afpsql psql install
-afpsql skill status
-afpsql skill install
-```
-
-### Exit Codes
-
-- `0`: query completed successfully
-- `1`: SQL error or runtime error
-- `2`: invalid CLI arguments
-"#]
-#[derive(Parser)]
-#[command(
-    name = env!("DISPLAY_NAME"),
-    bin_name = "afpsql",
-    verbatim_doc_comment,
-    about = env!("CARGO_PKG_DESCRIPTION"),
-    disable_help_flag = true,
-    disable_version_flag = true,
-    disable_help_subcommand = true,
-)]
-pub struct AfdCli {
-    /// Inline SQL string to execute.
-    #[arg(long, allow_hyphen_values = true, help_heading = "Query")]
-    sql: Option<String>,
-    /// Read SQL from a file.
-    #[arg(long = "sql-file", allow_hyphen_values = true, help_heading = "Query")]
-    sql_file: Option<String>,
-    /// Positional bind parameter in `N=value` form. Repeat for additional parameters.
-    #[arg(long = "param", help_heading = "Query")]
-    param: Vec<String>,
-    /// Stream large results as `result_rows` batches.
-    ///
-    /// Avoids buffering one large inline result.
-    #[arg(long = "stream-rows", help_heading = "Query")]
-    stream_rows: bool,
-    /// Maximum rows per streamed batch.
-    #[arg(long = "batch-rows", help_heading = "Query")]
-    batch_rows: Option<usize>,
-    /// Soft byte target per streamed batch.
-    #[arg(long = "batch-bytes", help_heading = "Query")]
-    batch_bytes: Option<usize>,
-    /// Per-query statement timeout in milliseconds.
-    #[arg(long = "statement-timeout-ms", help_heading = "Query")]
-    statement_timeout_ms: Option<u64>,
-    /// Per-query lock timeout in milliseconds.
-    #[arg(long = "lock-timeout-ms", help_heading = "Query")]
-    lock_timeout_ms: Option<u64>,
-    /// Maximum inline rows before returning `result_too_large`.
-    #[arg(long = "inline-max-rows", help_heading = "Query")]
-    inline_max_rows: Option<usize>,
-    /// Maximum inline payload bytes before returning `result_too_large`.
-    #[arg(long = "inline-max-bytes", help_heading = "Query")]
-    inline_max_bytes: Option<usize>,
-    /// Query permission policy.
-    ///
-    /// Defaults to read, ssh-read with --ssh, or container-read with
-    /// --container.
-    #[arg(long = "permission", value_enum, help_heading = "Query")]
-    permission: Option<Permission>,
-    /// Preview the query without executing it
-    #[arg(long, help_heading = "Query")]
-    dry_run: bool,
-    /// Wrap the query in EXPLAIN (FORMAT JSON) and return the plan tree instead
-    /// of executing the user's SQL.
-    #[arg(
-        long = "explain",
-        help_heading = "Query",
-        conflicts_with = "explain_analyze"
-    )]
-    explain: bool,
-    /// Run EXPLAIN ANALYZE with JSON and buffer metrics.
-    ///
-    /// The underlying SQL actually runs; writes require the matching write
-    /// permission.
-    #[arg(long = "explain-analyze", help_heading = "Query")]
-    explain_analyze: bool,
-
-    /// PostgreSQL DSN URI. Redacted in structured output.
-    #[arg(
-        long = "dsn-secret",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with_all = ["dsn_secret_env", "dsn_secret_config"]
-    )]
-    dsn_secret: Option<String>,
-    /// Read PostgreSQL DSN URI from an environment variable.
-    #[arg(
-        long = "dsn-secret-env",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with = "dsn_secret_config"
-    )]
-    dsn_secret_env: Option<String>,
-    /// Read PostgreSQL DSN URI from FILE at DOT_PATH.
-    #[arg(
-        long = "dsn-secret-config",
-        global = true,
-        help_heading = "Connection",
-        value_names = ["FILE", "DOT_PATH"],
-        num_args = 2
-    )]
-    dsn_secret_config: Option<Vec<String>>,
-    /// libpq-style conninfo string. Redacted in structured output.
-    #[arg(
-        long = "conninfo-secret",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with_all = ["conninfo_secret_env", "conninfo_secret_config"]
-    )]
-    conninfo_secret: Option<String>,
-    /// Read libpq-style conninfo string from an environment variable.
-    #[arg(
-        long = "conninfo-secret-env",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with = "conninfo_secret_config"
-    )]
-    conninfo_secret_env: Option<String>,
-    /// Read libpq-style conninfo from FILE at DOT_PATH.
-    #[arg(
-        long = "conninfo-secret-config",
-        global = true,
-        help_heading = "Connection",
-        value_names = ["FILE", "DOT_PATH"],
-        num_args = 2
-    )]
-    conninfo_secret_config: Option<Vec<String>>,
-    /// PostgreSQL host.
-    #[arg(long, global = true, help_heading = "Connection")]
-    host: Option<String>,
-    /// PostgreSQL port.
-    #[arg(long, global = true, help_heading = "Connection")]
-    port: Option<u16>,
-    /// PostgreSQL user name.
-    #[arg(long, global = true, help_heading = "Connection")]
-    user: Option<String>,
-    /// PostgreSQL database name.
-    #[arg(long, global = true, help_heading = "Connection")]
-    dbname: Option<String>,
-    /// PostgreSQL password. Redacted in structured output.
-    #[arg(
-        long = "password-secret",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with_all = ["password_secret_env", "password_secret_config"]
-    )]
-    password_secret: Option<String>,
-    /// Read PostgreSQL password from an environment variable.
-    #[arg(
-        long = "password-secret-env",
-        global = true,
-        help_heading = "Connection",
-        conflicts_with = "password_secret_config"
-    )]
-    password_secret_env: Option<String>,
-    /// Read PostgreSQL password from FILE at DOT_PATH.
-    #[arg(
-        long = "password-secret-config",
-        global = true,
-        help_heading = "Connection",
-        value_names = ["FILE", "DOT_PATH"],
-        num_args = 2
-    )]
-    password_secret_config: Option<Vec<String>>,
-    /// Open an SSH transport to USER@HOST before connecting to PostgreSQL.
-    #[arg(long = "ssh", global = true, help_heading = "SSH Transport")]
-    ssh: Option<String>,
-    /// SSH hop to reach before the final --ssh destination. Repeat for multiple hops.
-    #[arg(long = "ssh-via", global = true, help_heading = "SSH Transport")]
-    ssh_via: Vec<String>,
-    /// Additional OpenSSH -o option. Repeat for multiple options.
-    #[arg(long = "ssh-option", global = true, help_heading = "SSH Transport")]
-    ssh_options: Vec<String>,
-    /// Local bind host for the SSH tunnel.
-    #[arg(long = "ssh-local-host", global = true, help_heading = "SSH Transport")]
-    ssh_local_host: Option<String>,
-    /// Local bind port for the SSH tunnel. Defaults to an ephemeral port.
-    #[arg(long = "ssh-local-port", global = true, help_heading = "SSH Transport")]
-    ssh_local_port: Option<u16>,
-    /// Explicit remote PostgreSQL Unix socket path for SSH forwarding.
-    #[arg(
-        long = "ssh-remote-socket",
-        global = true,
-        help_heading = "SSH Transport"
-    )]
-    ssh_remote_socket: Option<String>,
-    /// Remote OS user for sudo -n Unix-socket bridge mode; requires an explicit socket.
-    #[arg(long = "ssh-sudo-user", global = true, help_heading = "SSH Transport")]
-    ssh_sudo_user: Option<String>,
-
-    /// Run a container exec stdio bridge in TARGET before connecting to PostgreSQL.
-    #[arg(
-        long = "container",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container: Option<String>,
-    /// Container exec driver: docker, podman, nerdctl, compose, or kubectl.
-    #[arg(
-        long = "container-driver",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_driver: Option<String>,
-    /// Runtime command for the selected container driver. Defaults to the driver command.
-    #[arg(
-        long = "container-runtime",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_runtime: Option<String>,
-    /// OS user passed to drivers that support exec user selection.
-    #[arg(
-        long = "container-user",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_user: Option<String>,
-    /// Kubernetes namespace for kubectl exec.
-    #[arg(
-        long = "container-namespace",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_namespace: Option<String>,
-    /// Docker or Kubernetes context for the selected driver.
-    #[arg(
-        long = "container-context",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_context: Option<String>,
-    /// Compose file passed before compose exec. Repeat for multiple files.
-    #[arg(
-        long = "container-compose-file",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_compose_files: Vec<String>,
-    /// Compose project name passed before compose exec.
-    #[arg(
-        long = "container-compose-project",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_compose_project: Option<String>,
-    /// Kubernetes container name for multi-container pods.
-    #[arg(
-        long = "container-pod-container",
-        global = true,
-        help_heading = "Container Transport"
-    )]
-    container_pod_container: Option<String>,
-
-    /// Output format: json (default), yaml, or plain.
-    #[arg(long, default_value = "json", global = true, help_heading = "Runtime")]
-    output: String,
-    /// Output routing: split, stdout, or stderr.
-    ///
-    /// Defaults to split for a finite query, and to stdout for --mode pipe and
-    /// --stream-rows, whose ordered event stream must stay on one stream.
-    #[arg(long = "output-to", global = true, help_heading = "Runtime")]
-    output_to: Option<String>,
-    /// Redirect stdout bytes to this file.
-    #[arg(
-        long = "stdout-file",
-        value_name = "PATH",
-        global = true,
-        help_heading = "Runtime"
-    )]
-    stdout_file: Option<String>,
-    /// Redirect stderr bytes to this file.
-    #[arg(
-        long = "stderr-file",
-        value_name = "PATH",
-        global = true,
-        help_heading = "Runtime"
-    )]
-    stderr_file: Option<String>,
-    /// Diagnostic log filters (comma-separated).
-    ///
-    /// Use startup, connect, query, transport, mode, an exact event such as
-    /// `query.error`, or `all`.
-    #[arg(
-        long = "log",
-        value_delimiter = ',',
-        global = true,
-        help_heading = "Runtime"
-    )]
-    log: Vec<String>,
-    /// Runtime mode: canonical cli, pipe, or `psql` translation mode.
-    #[arg(long, value_enum, default_value_t = RuntimeMode::Cli, help_heading = "Runtime")]
-    mode: RuntimeMode,
-
-    #[command(subcommand)]
-    command: Option<AfdCommand>,
-}
-
-pub fn parse_args(bin_name: &str) -> Result<Mode, String> {
-    let raw: Vec<String> = std::env::args().collect();
-    if is_psql_mode_requested(&raw) {
-        return parse_psql_mode(&raw);
+impl ParseError {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+            hint: None,
+        }
     }
-    let startup_requested = startup_requested_from_raw(&raw);
 
-    let build = match env!("GIT_SHA") {
-        "unknown" => None,
-        sha => Some(sha),
-    };
-    match agent_first_data::cli_handle_version_or_help_or_continue(
-        &raw,
-        &command_for_bin(bin_name),
-        &agent_first_data::HelpConfig::output_aware(),
-        bin_name,
-        Some(env!("DISPLAY_NAME")),
-        env!("CARGO_PKG_VERSION"),
-        build,
-    ) {
-        Ok(Some(rendered)) => {
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// A failure about the named world, not about the argv shape.
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(crate::protocol::error_code::INVALID_REQUEST, message)
+    }
+
+    /// The parser's own classification for a value it could not accept. Reused
+    /// rather than duplicated: the registry has no single-character, unsigned,
+    /// or `N=value` type, so those checks land here and must not invent a
+    /// second spelling for what is the same rejection.
+    fn invalid_value(message: impl Into<String>) -> Self {
+        Self::new("cli_invalid_argument_value", message)
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(message: String) -> Self {
+        Self::invalid_request(message)
+    }
+}
+
+/// What `parse_args` resolved, plus the stream redirection it installed.
+///
+/// The guard belongs to the caller: dropping it restores the process fds, so
+/// it has to outlive every event the selected mode is about to write.
+pub struct Parsed {
+    pub mode: Mode,
+    pub redirect: Option<agent_first_data::stream_redirect::InstalledStreamRedirect>,
+}
+
+const PERMISSIONS: [&str; 6] = [
+    "read",
+    "write",
+    "ssh-read",
+    "ssh-write",
+    "container-read",
+    "container-write",
+];
+
+/// Every argument that can open a PostgreSQL session, plus `--log`.
+///
+/// A closed registry has no global arguments: an argument belongs to the
+/// command that accepts it, which is what makes one `<command> --help` a
+/// complete answer instead of a pointer to a parent. This is that one list,
+/// applied to each command that can open a session.
+const CONNECTION_IDS: [&str; 33] = [
+    "dsn",
+    "conninfo",
+    "host",
+    "port",
+    "user",
+    "dbname",
+    "password",
+    "ssh",
+    "ssh_via",
+    "ssh_option",
+    "ssh_remote_socket",
+    "ssh_sudo_user",
+    "container_docker_name",
+    "container_docker_user",
+    "container_docker_context",
+    "container_docker_runtime",
+    "container_podman_name",
+    "container_podman_user",
+    "container_podman_runtime",
+    "container_nerdctl_name",
+    "container_nerdctl_user",
+    "container_nerdctl_runtime",
+    "container_compose_service",
+    "container_compose_user",
+    "container_compose_file",
+    "container_compose_project",
+    "container_compose_runtime",
+    "container_kubectl_pod",
+    "container_kubectl_container",
+    "container_kubectl_namespace",
+    "container_kubectl_context",
+    "container_kubectl_runtime",
+    "log",
+];
+
+/// A finite call: at most one terminal event, so results and diagnostics can
+/// safely take different streams.
+fn finite_output() -> OutputSpec {
+    OutputSpec::protocol_finite(
+        ["json", "yaml", "plain"],
+        ["split", "stdout", "stderr"],
+        "json",
+        "split",
+    )
+    .file_sinks(["stdout", "stderr"])
+}
+
+/// An ordered event stream, which must stay on one stream: splitting it across
+/// stdout and stderr loses the ordering that makes it a stream. `split` is
+/// therefore absent from the contract rather than rejected once the process is
+/// already running.
+fn stream_output() -> OutputSpec {
+    OutputSpec::protocol_stream(
+        ["json", "yaml", "plain"],
+        ["stdout", "stderr"],
+        "json",
+        "stdout",
+    )
+    .file_sinks(["stdout", "stderr"])
+}
+
+/// The whole canonical CLI: one registry that is the single source for argv
+/// parsing, typed values, which argument mixes are legal, each mix's output
+/// contract, `--help`, and `docs/cli.md`.
+pub fn build_cli(bin_name: &str) -> Result<BuiltCliSpec, CliSpecError> {
+    let mut spec =
+        CliSpec::new(bin_name, env!("CARGO_PKG_VERSION"))
+            .about(env!("CARGO_PKG_DESCRIPTION"))
+            .display_name(env!("DISPLAY_NAME"))
+            .lifecycle_output(finite_output())
+            .command(root_command())
+            .command(CommandSpec::new(["inspect"]).about(
+                "Schema discovery: databases, schemas, tables, views, indexes, or a full snapshot.",
+            ))
+            .command(inspect_databases_command())
+            .command(inspect_simple_command(
+                "database",
+                "Summarize the connected database: schema/table/view/sequence counts and size.",
+                "inspect_database",
+            ))
+            .command(inspect_simple_command(
+                "schemas",
+                "List user-visible schemas with owner, object counts, and size.",
+                "inspect_schemas",
+            ))
+            .command(inspect_like_command(
+                "schema",
+                "Export full schema metadata for one schema.",
+                "inspect_schema",
+                "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
+            ))
+            .command(inspect_like_command(
+                "snapshot",
+                "Export a stable full-schema snapshot for machine consumption.",
+                "inspect_snapshot",
+                "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
+            ))
+            .command(inspect_like_command(
+                "tables",
+                "List tables in a schema with owner, estimated rows, and size.",
+                "inspect_tables",
+                "Optional `LIKE` pattern matched against the table name (`%` is the wildcard)",
+            ))
+            .command(inspect_like_command(
+                "views",
+                "List views (regular and materialized) in a schema with owner.",
+                "inspect_views",
+                "Optional `LIKE` pattern matched against the view name (`%` is the wildcard)",
+            ))
+            .command(inspect_indexes_command())
+            .command(inspect_table_command())
+            .command(
+                CommandSpec::new(["psql"])
+                    .about("Manage the local psql wrapper that forwards to `--mode psql`."),
+            )
+            .command(psql_admin_command(
+                "status",
+                "Show whether the afpsql-managed psql wrapper is installed and active.",
+            ))
+            .command(psql_admin_command(
+                "install",
+                "Install an afpsql-managed psql wrapper.",
+            ))
+            .command(psql_admin_command(
+                "uninstall",
+                "Remove an afpsql-managed psql wrapper.",
+            ))
+            .command(CommandSpec::new(["skill"]).about(
+                "Manage Agent-First PSQL skills for Codex, Claude Code, opencode, and Hermes.",
+            ))
+            .command(skill_command(
+                "status",
+                "Show whether the Agent-First PSQL skill is installed, valid, and up to date.",
+                false,
+            ))
+            .command(skill_command(
+                "install",
+                "Install the Agent-First PSQL skill.",
+                true,
+            ))
+            .command(skill_command(
+                "uninstall",
+                "Remove an afpsql-managed Agent-First PSQL skill.",
+                true,
+            ));
+    // Absent from a source tarball with no reachable .git, and the version
+    // payload omits it rather than reporting the literal "unknown".
+    if let Some(build) = Some(env!("GIT_SHA")).filter(|sha| *sha != "unknown") {
+        spec = spec.build_id(build);
+    }
+    build_afdata_cli(spec)
+}
+
+/// Arguments that any connecting command accepts, declared once.
+fn with_connection_args(command: CommandSpec) -> CommandSpec {
+    command
+        .arg(ArgSpec::option("--dsn", "SOURCE").about(
+            "PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or \
+                 literal:VALUE for a literal starting with a source prefix",
+        ))
+        .arg(ArgSpec::option("--conninfo", "SOURCE").about(
+            "libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or \
+                 literal:VALUE for a literal starting with a source prefix",
+        ))
+        .arg(ArgSpec::option("--host", "HOST").about("PostgreSQL host"))
+        .arg(ArgSpec::option_i64("--port", "PORT").about("PostgreSQL port"))
+        .arg(ArgSpec::option("--user", "USER").about("PostgreSQL user name"))
+        .arg(ArgSpec::option("--dbname", "DBNAME").about("PostgreSQL database name"))
+        .arg(ArgSpec::option("--password", "SOURCE").about(
+            "PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or \
+                 literal:VALUE for a literal starting with a source prefix",
+        ))
+        .arg(
+            ArgSpec::option("--ssh", "USER@HOST")
+                .about("Open an SSH transport to USER@HOST before connecting to PostgreSQL"),
+        )
+        .arg(
+            ArgSpec::option("--ssh-via", "USER@HOST")
+                .repeatable()
+                .about("SSH hop to reach before the final --ssh destination; repeat for more hops"),
+        )
+        .arg(
+            ArgSpec::option("--ssh-option", "OPTION")
+                .repeatable()
+                .about("Additional OpenSSH -o option; repeat for more options"),
+        )
+        .arg(
+            ArgSpec::option("--ssh-remote-socket", "PATH")
+                .about("Explicit remote PostgreSQL Unix socket path for SSH forwarding"),
+        )
+        .arg(
+            ArgSpec::option("--ssh-sudo-user", "USER").about(
+                "Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket",
+            ),
+        )
+        .arg(
+            ArgSpec::option("--container-docker-name", "NAME")
+                .about("Run a docker exec stdio bridge in this container before connecting"),
+        )
+        .arg(
+            ArgSpec::option("--container-docker-user", "USER")
+                .about("Container OS user to run the docker exec bridge as"),
+        )
+        .arg(
+            ArgSpec::option("--container-docker-context", "CONTEXT")
+                .about("Docker context to run the exec against"),
+        )
+        .arg(
+            ArgSpec::option("--container-docker-runtime", "COMMAND")
+                .about("Docker runtime command; defaults to docker"),
+        )
+        .arg(
+            ArgSpec::option("--container-podman-name", "NAME")
+                .about("Run a podman exec stdio bridge in this container before connecting"),
+        )
+        .arg(
+            ArgSpec::option("--container-podman-user", "USER")
+                .about("Container OS user to run the podman exec bridge as"),
+        )
+        .arg(
+            ArgSpec::option("--container-podman-runtime", "COMMAND")
+                .about("Podman runtime command; defaults to podman"),
+        )
+        .arg(
+            ArgSpec::option("--container-nerdctl-name", "NAME")
+                .about("Run a nerdctl exec stdio bridge in this container before connecting"),
+        )
+        .arg(
+            ArgSpec::option("--container-nerdctl-user", "USER")
+                .about("Container OS user to run the nerdctl exec bridge as"),
+        )
+        .arg(
+            ArgSpec::option("--container-nerdctl-runtime", "COMMAND")
+                .about("Nerdctl runtime command; defaults to nerdctl"),
+        )
+        .arg(
+            ArgSpec::option("--container-compose-service", "NAME")
+                .about("Run a compose exec stdio bridge in this service before connecting"),
+        )
+        .arg(
+            ArgSpec::option("--container-compose-user", "USER")
+                .about("Container OS user to run the compose exec bridge as"),
+        )
+        .arg(
+            ArgSpec::option("--container-compose-file", "FILE")
+                .repeatable()
+                .about("Compose file passed before compose exec; repeat for more files"),
+        )
+        .arg(
+            ArgSpec::option("--container-compose-project", "NAME")
+                .about("Compose project name passed before compose exec"),
+        )
+        .arg(
+            ArgSpec::option("--container-compose-runtime", "COMMAND")
+                .about("Compose runtime command; defaults to docker, use docker-compose for v1"),
+        )
+        .arg(
+            ArgSpec::option("--container-kubectl-pod", "NAME")
+                .about("Run a kubectl exec stdio bridge in this pod before connecting"),
+        )
+        .arg(
+            ArgSpec::option("--container-kubectl-container", "NAME")
+                .about("Container within a multi-container pod to exec into"),
+        )
+        .arg(
+            ArgSpec::option("--container-kubectl-namespace", "NAMESPACE")
+                .about("Kubernetes namespace to run the exec in"),
+        )
+        .arg(
+            ArgSpec::option("--container-kubectl-context", "CONTEXT")
+                .about("Kubernetes context to run the exec against"),
+        )
+        .arg(
+            ArgSpec::option("--container-kubectl-runtime", "COMMAND")
+                .about("Kubectl runtime command; defaults to kubectl"),
+        )
+        .arg(ArgSpec::option("--log", "FILTER").repeatable().about(
+            "Diagnostic log filter: startup, connect, query, transport, mode, an exact \
+                     event such as query.error, or all. Comma-separated or repeated",
+        ))
+}
+
+/// Arguments every SQL query shape shares, whatever its source or lifecycle.
+fn query_shared_optional() -> Vec<&'static str> {
+    vec![
+        "param",
+        "permission",
+        "statement_timeout_ms",
+        "lock_timeout_ms",
+        "explain",
+    ]
+}
+
+fn query_optional(extra: &[&'static str]) -> Vec<&'static str> {
+    let mut ids = query_shared_optional();
+    ids.extend_from_slice(extra);
+    ids.extend_from_slice(&CONNECTION_IDS);
+    ids
+}
+
+fn root_command() -> CommandSpec {
+    let command = CommandSpec::root()
+        .about("Run one SQL action per process, or open a long-lived pipe session.")
+        .arg(ArgSpec::option("--sql", "SQL").about("Inline SQL to execute"))
+        .arg(
+            ArgSpec::option("--sql-file", "PATH")
+                .about("File to read SQL from; `-` reads it from stdin"),
+        )
+        .arg(ArgSpec::option("--param", "N=VALUE").repeatable().about(
+            "Positional bind parameter in N=value form; repeat for more parameters. \
+                     Bare null/true/false bind as JSON null/booleans; prefix with `text:` to \
+                     bind any value as a literal string",
+        ))
+        .arg(
+            ArgSpec::flag("--stream-rows")
+                .about("Stream the result as ordered result_rows batches instead of one payload"),
+        )
+        .arg(ArgSpec::option_i64("--batch-rows", "N").about("Maximum rows per streamed batch"))
+        .arg(ArgSpec::option_i64("--batch-bytes", "N").about("Soft byte target per streamed batch"))
+        .arg(
+            ArgSpec::option_i64("--statement-timeout-ms", "MS")
+                .about("Per-query statement timeout in milliseconds"),
+        )
+        .arg(
+            ArgSpec::option_i64("--lock-timeout-ms", "MS")
+                .about("Per-query lock timeout in milliseconds"),
+        )
+        .arg(
+            ArgSpec::option_i64("--inline-max-rows", "N")
+                .about("Maximum inline rows before returning a truncated result"),
+        )
+        .arg(
+            ArgSpec::option_i64("--inline-max-bytes", "N")
+                .about("Maximum inline payload bytes before returning a truncated result"),
+        )
+        .arg(
+            ArgSpec::option_enum("--permission", PERMISSIONS)
+                .value_name("PERMISSION")
+                .about(
+                    "Query permission policy; defaults to read, ssh-read with --ssh, or \
+                     container-read with a --container-<driver>-* flag",
+                ),
+        )
+        .arg(
+            ArgSpec::flag("--dry-run")
+                .about("Prepare the query and report its shape without running it"),
+        )
+        .arg(
+            ArgSpec::option_enum("--explain", ["plan", "analyze"])
+                .value_name("EXPLAIN")
+                .about(
+                    "Return the plan instead of the rows: `plan` wraps the SQL in EXPLAIN \
+                     (FORMAT JSON); `analyze` runs it and buffers metrics",
+                ),
+        )
+        .arg(
+            ArgSpec::option_enum("--mode", ["cli", "pipe", "psql"])
+                .value_name("MODE")
+                .default("cli")
+                .about(
+                    "Runtime mode: one SQL action, a long-lived JSONL session, or psql \
+                     argument translation",
+                ),
+        );
+
+    with_connection_args(command)
+        .combination(
+            Combination::new("query-inline")
+                .action("query")
+                .about("Run inline --sql and return one bounded result")
+                .fixed("mode", "cli")
+                .required(["sql"])
+                .optional(query_optional(&[
+                    "dry_run",
+                    "inline_max_rows",
+                    "inline_max_bytes",
+                ]))
+                .output(finite_output()),
+        )
+        .combination(
+            Combination::new("query-file")
+                .action("query")
+                .about("Run SQL read from --sql-file and return one bounded result")
+                .fixed("mode", "cli")
+                .required(["sql_file"])
+                .optional(query_optional(&[
+                    "dry_run",
+                    "inline_max_rows",
+                    "inline_max_bytes",
+                ]))
+                .output(finite_output()),
+        )
+        .combination(
+            Combination::new("query-inline-stream")
+                .action("query")
+                .about("Stream inline --sql as ordered row batches on one stream")
+                .fixed("mode", "cli")
+                .required(["sql", "stream_rows"])
+                .optional(query_optional(&["batch_rows", "batch_bytes"]))
+                .output(stream_output()),
+        )
+        .combination(
+            Combination::new("query-file-stream")
+                .action("query")
+                .about("Stream SQL read from --sql-file as ordered row batches on one stream")
+                .fixed("mode", "cli")
+                .required(["sql_file", "stream_rows"])
+                .optional(query_optional(&["batch_rows", "batch_bytes"]))
+                .output(stream_output()),
+        )
+        .combination(
+            Combination::new("pipe")
+                .action("pipe")
+                .about("Open a long-lived JSONL session that reads requests from stdin")
+                .fixed("mode", "pipe")
+                .optional(CONNECTION_IDS)
+                .output(stream_output()),
+        )
+        .combination(
+            Combination::new("psql-translation")
+                .action("psql_mode")
+                .about(
+                    "Translate a psql command line: every remaining argument is psql's own \
+                     (-c, -f, -l, -h, -p, -U, -d, -v, DBNAME USERNAME), parsed by the \
+                     compatibility layer rather than by this registry",
+                )
+                .fixed("mode", "psql")
+                .output(finite_output()),
+        )
+}
+
+fn inspect_command(name: &'static str, about: &'static str) -> CommandSpec {
+    with_connection_args(CommandSpec::new(["inspect", name]).about(about))
+}
+
+fn inspect_combination(id: &'static str, extra: &[&'static str]) -> Combination {
+    let mut optional: Vec<&str> = extra.to_vec();
+    optional.extend_from_slice(&CONNECTION_IDS);
+    Combination::new(id)
+        .action(id)
+        .optional(optional)
+        .output(finite_output())
+}
+
+fn inspect_simple_command(
+    name: &'static str,
+    about: &'static str,
+    id: &'static str,
+) -> CommandSpec {
+    inspect_command(name, about).combination(inspect_combination(id, &[]))
+}
+
+fn inspect_databases_command() -> CommandSpec {
+    inspect_command(
+        "databases",
+        "List databases on the connected server with size, encoding, and connection facts.",
+    )
+    .arg(ArgSpec::flag("--all").about("Include template databases (template0/template1)"))
+    .combination(inspect_combination("inspect_databases", &["all"]))
+}
+
+fn inspect_like_command(
+    name: &'static str,
+    about: &'static str,
+    id: &'static str,
+    like_about: &'static str,
+) -> CommandSpec {
+    inspect_command(name, about)
+        .arg(
+            ArgSpec::option("--schema", "SCHEMA")
+                .default("public")
+                .about("Schema to inspect"),
+        )
+        .arg(ArgSpec::option("--like", "PATTERN").about(like_about))
+        .combination(inspect_combination(id, &["schema", "like"]))
+}
+
+fn inspect_indexes_command() -> CommandSpec {
+    inspect_command(
+        "indexes",
+        "List indexes with definitions, size, validity, and optional usage stats.",
+    )
+    .arg(
+        ArgSpec::option("--schema", "SCHEMA")
+            .default("public")
+            .about("Schema to filter on"),
+    )
+    .arg(
+        ArgSpec::option("--table", "TABLE")
+            .about("Table to filter on; `schema.table` overrides --schema"),
+    )
+    .arg(
+        ArgSpec::flag("--stats")
+            .about("Include PostgreSQL's built-in pg_stat_user_indexes usage counters"),
+    )
+    .combination(inspect_combination(
+        "inspect_indexes",
+        &["schema", "table", "stats"],
+    ))
+}
+
+fn inspect_table_command() -> CommandSpec {
+    // Declared before the connection arguments so the usage line reads the way
+    // the call is written: the table name comes first.
+    let command = CommandSpec::new(["inspect", "table"])
+        .about("Describe a table's columns: types, nullability, defaults, primary key, comments.")
+        .arg(
+            ArgSpec::positional("name", 0, "NAME")
+                .about("Table name; `schema.table` overrides the default `public` schema"),
+        )
+        .arg(
+            ArgSpec::flag("--full")
+                .about("Also return constraints, indexes, triggers, and sequence/default metadata"),
+        );
+    with_connection_args(command).combination({
+        let mut optional: Vec<&str> = vec!["full"];
+        optional.extend_from_slice(&CONNECTION_IDS);
+        Combination::new("inspect_table")
+            .action("inspect_table")
+            .required(["name"])
+            .optional(optional)
+            .output(finite_output())
+    })
+}
+
+fn psql_admin_command(verb: &'static str, about: &'static str) -> CommandSpec {
+    CommandSpec::new(["psql", verb])
+        .about(about)
+        .arg(ArgSpec::option("--bin-dir", "DIR").about(
+            "Directory that holds the psql wrapper; defaults to the afpsql executable directory",
+        ))
+        .combination(
+            Combination::new(format!("psql-{verb}"))
+                .action(format!("psql_{verb}"))
+                .optional(["bin_dir"])
+                .output(finite_output()),
+        )
+}
+
+/// One skill verb, as two shapes.
+///
+/// `--skills-dir` names a single directory, so it is meaningless when the verb
+/// fans out across every agent. Registering that as two shapes rather than one
+/// shape plus a runtime check means the illegal mix is rejected by the parser,
+/// and both legal mixes are visible in one `--help`.
+fn skill_command(verb: &'static str, about: &'static str, force: bool) -> CommandSpec {
+    let mut command = CommandSpec::new(["skill", verb])
+        .about(about)
+        .arg(
+            ArgSpec::option_enum(
+                "--agent",
+                ["all", "codex", "claude-code", "opencode", "hermes"],
+            )
+            .value_name("AGENT")
+            .default("all")
+            .about("Agent to manage"),
+        )
+        .arg(
+            ArgSpec::option_enum("--scope", ["personal", "workspace"])
+                .value_name("SCOPE")
+                .default("personal")
+                .about("Skill scope"),
+        )
+        .arg(ArgSpec::option("--skills-dir", "DIR").about("Directory that contains skill folders"));
+
+    let mut every: Vec<&str> = vec!["scope"];
+    let mut named: Vec<&str> = vec!["scope", "skills_dir"];
+    if force {
+        command =
+            command.arg(ArgSpec::flag("--force").about(
+                "Overwrite or remove an unmanaged Agent-First PSQL skill at the target path",
+            ));
+        every.push("force");
+        named.push("force");
+    }
+
+    command
+        .combination(
+            Combination::new(format!("skill-{verb}-every-agent"))
+                .action(format!("skill_{verb}"))
+                .about("Target every agent that supports the scope")
+                .fixed("agent", "all")
+                .optional(every)
+                .output(finite_output()),
+        )
+        .combination(
+            Combination::new(format!("skill-{verb}-one-agent"))
+                .action(format!("skill_{verb}"))
+                .about("Target one named agent; only this shape accepts --skills-dir")
+                .fixed_one_of("agent", ["codex", "claude-code", "opencode", "hermes"])
+                .optional(named)
+                .output(finite_output()),
+        )
+}
+
+type ActionResult = Result<Mode, ParseError>;
+type ActionHandler = fn(&ResolvedInvocation) -> ActionResult;
+
+fn actions() -> Vec<(&'static str, ActionHandler)> {
+    vec![
+        ("query", run_query as ActionHandler),
+        ("pipe", run_pipe),
+        ("psql_mode", run_psql_mode),
+        ("inspect_databases", run_inspect_databases),
+        ("inspect_database", run_inspect_database),
+        ("inspect_schemas", run_inspect_schemas),
+        ("inspect_schema", run_inspect_schema),
+        ("inspect_snapshot", run_inspect_snapshot),
+        ("inspect_tables", run_inspect_tables),
+        ("inspect_views", run_inspect_views),
+        ("inspect_indexes", run_inspect_indexes),
+        ("inspect_table", run_inspect_table),
+        ("psql_status", run_psql_status),
+        ("psql_install", run_psql_install),
+        ("psql_uninstall", run_psql_uninstall),
+        ("skill_status", run_skill_status),
+        ("skill_install", run_skill_install),
+        ("skill_uninstall", run_skill_uninstall),
+    ]
+}
+
+/// Resolve argv into one mode, or answer `--help`/`--version`/`--docs`.
+pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
+    let cli = build_cli(bin_name)
+        .map_err(|error| ParseError::new("cli_spec_invalid", error.to_string()))?;
+    let raw: Vec<String> = std::env::args().collect();
+    // The one invocation this registry cannot parse: psql's option grammar has
+    // clustered shorts and positional dbname/username, so it is translated
+    // rather than registered. The registered `psql-translation` shape and this
+    // branch agree on what `--mode psql` alone means.
+    if is_psql_mode_requested(&raw) {
+        let (mode, routing) = parse_psql_mode_full(&raw)?;
+        let redirect = install_redirect(routing.stdout_file, routing.stderr_file)?;
+        crate::emit::set_output_to(routing.output_to);
+        return Ok(Parsed { mode, redirect });
+    }
+
+    let app = cli
+        .bind_actions(actions())
+        .map_err(|error| ParseError::new("cli_actions_invalid", error.to_string()))?;
+    let outcome = app
+        .resolve_from(std::env::args_os())
+        .map_err(|error| ParseError {
+            code: error.rule.code().to_string(),
+            message: error.message.clone(),
+            hint: Some(error.hint.clone()),
+        })?;
+
+    match outcome {
+        CliOutcome::Run(invocation) => {
+            let redirect = redirect_for(invocation.output_plan())?;
+            crate::emit::set_output_to(destination_of(invocation.output_plan()));
+            let mode = app.execute(&invocation)?;
+            Ok(Parsed { mode, redirect })
+        }
+        // `--docs` renders the whole registry as Markdown, so it carries no
+        // format of its own and never becomes a protocol event.
+        CliOutcome::Docs(docs) => {
+            let _redirect = redirect_for(docs.output_plan())?;
+            crate::emit::set_output_to(OutputTo::Stdout);
+            let rendered = agent_first_data::render_cli_reference(&cli).replace(
+                "| 2 | The invocation was rejected before anything ran. `error.code` is one of the `cli_*` codes below. |",
+                "| 2 | The invocation was rejected before anything ran. `error.code` is one of the `cli_*` codes below. |\n| 4 | A terminal event could not be written; the requested outcome is unknown to the caller. |",
+            );
             let _ = crate::emit::write_result_text(&rendered);
             std::process::exit(0);
         }
-        Ok(None) => {}
-        Err(err) => {
-            let _ = crate::emit::emit_value(err, OutputFormat::Json);
-            std::process::exit(2);
+        CliOutcome::Help(help) => {
+            let _redirect = redirect_for(help.output_plan())?;
+            let format = format_of_plan(help.output_plan())?;
+            crate::emit::set_output_to(destination_of(help.output_plan()));
+            if format == OutputFormat::Plain {
+                let _ = crate::emit::write_result_text(&help.plain());
+            } else {
+                let _ = crate::emit::emit_event(agent_first_data::cli_help_event(&help), format);
+            }
+            std::process::exit(0);
+        }
+        CliOutcome::Version(version) => {
+            let _redirect = redirect_for(version.output_plan())?;
+            let format = format_of_plan(version.output_plan())?;
+            crate::emit::set_output_to(destination_of(version.output_plan()));
+            let _ = crate::emit::emit_event(agent_first_data::cli_version_event(&version), format);
+            std::process::exit(0);
+        }
+    }
+}
+
+fn redirect_for(
+    plan: &OutputPlan,
+) -> Result<Option<agent_first_data::stream_redirect::InstalledStreamRedirect>, ParseError> {
+    install_redirect(
+        plan.stdout_file().map(std::path::Path::to_path_buf),
+        plan.stderr_file().map(std::path::Path::to_path_buf),
+    )
+}
+
+fn install_redirect(
+    stdout_file: Option<std::path::PathBuf>,
+    stderr_file: Option<std::path::PathBuf>,
+) -> Result<Option<agent_first_data::stream_redirect::InstalledStreamRedirect>, ParseError> {
+    let config =
+        agent_first_data::stream_redirect::StreamRedirectConfig::new(stdout_file, stderr_file)
+            .map_err(|error| ParseError::invalid_request(error.to_string()))?;
+    config
+        .as_ref()
+        .map(agent_first_data::stream_redirect::install)
+        .transpose()
+        .map_err(|error| ParseError::invalid_request(error.to_string()))
+}
+
+fn destination_of(plan: &OutputPlan) -> OutputTo {
+    plan.destination()
+        .and_then(|destination| OutputTo::parse(destination).ok())
+        .unwrap_or(OutputTo::Split)
+}
+
+fn format_of_plan(plan: &OutputPlan) -> Result<OutputFormat, ParseError> {
+    match plan.format() {
+        None => Ok(OutputFormat::Json),
+        Some(format) => cli_parse_output(format).map_err(ParseError::invalid_value),
+    }
+}
+
+fn format_of(invocation: &ResolvedInvocation) -> Result<OutputFormat, ParseError> {
+    format_of_plan(invocation.output_plan())
+}
+
+fn optional_string(invocation: &ResolvedInvocation, id: &str) -> Option<String> {
+    invocation
+        .optional(id)
+        .and_then(CliValue::as_str)
+        .map(str::to_string)
+}
+
+fn required_string(invocation: &ResolvedInvocation, id: &str) -> String {
+    invocation
+        .required(id)
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {
+    invocation
+        .optional(id)
+        .and_then(CliValue::as_bool)
+        .unwrap_or(false)
+}
+
+fn repeated_strings(invocation: &ResolvedInvocation, id: &str) -> Vec<String> {
+    invocation
+        .repeated(id)
+        .iter()
+        .filter_map(CliValue::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// A count the registry can only type as `i64`, because it has no unsigned
+/// type. The check reports the parser's own classification.
+fn count_of(
+    invocation: &ResolvedInvocation,
+    id: &str,
+    flag_name: &str,
+) -> Result<Option<usize>, ParseError> {
+    match invocation.optional(id).and_then(CliValue::as_i64) {
+        None => Ok(None),
+        Some(value) => usize::try_from(value).map(Some).map_err(|_| {
+            ParseError::invalid_value(format!("{flag_name} must not be negative"))
+                .hint(format!("pass zero or a positive count to {flag_name}"))
+        }),
+    }
+}
+
+fn millis_of(
+    invocation: &ResolvedInvocation,
+    id: &str,
+    flag_name: &str,
+) -> Result<Option<u64>, ParseError> {
+    match invocation.optional(id).and_then(CliValue::as_i64) {
+        None => Ok(None),
+        Some(value) => u64::try_from(value).map(Some).map_err(|_| {
+            ParseError::invalid_value(format!("{flag_name} must not be negative"))
+                .hint(format!("pass zero or a positive duration to {flag_name}"))
+        }),
+    }
+}
+
+fn port_of(
+    invocation: &ResolvedInvocation,
+    id: &str,
+    flag_name: &str,
+) -> Result<Option<u16>, ParseError> {
+    match invocation.optional(id).and_then(CliValue::as_i64) {
+        None => Ok(None),
+        Some(value) => u16::try_from(value).map(Some).map_err(|_| {
+            ParseError::invalid_value(format!("{flag_name} must be a port between 0 and 65535"))
+                .hint(format!("pass a TCP port in 0..=65535 to {flag_name}"))
+        }),
+    }
+}
+
+/// The `--log` filters, accepting both repetition and comma-separated lists.
+fn log_entries(invocation: &ResolvedInvocation) -> Vec<String> {
+    split_log_entries(&repeated_strings(invocation, "log"))
+}
+
+fn split_log_entries(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
+/// Whether the caller asked for the startup log line.
+fn startup_requested(entries: &[String]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            entry.trim().to_ascii_lowercase().as_str(),
+            "startup" | "all" | "*"
+        )
+    })
+}
+
+/// One resolved connection, plus the source metadata the startup log reports.
+struct Connection {
+    session: SessionConfig,
+    sources: Value,
+}
+
+enum TypedSecretSource {
+    Literal(String),
+    Env(String),
+    File(SecretConfigRef),
+}
+
+impl TypedSecretSource {
+    fn parse(flag: &str, raw: Option<String>) -> Result<Option<Self>, ParseError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        // Escape hatch for a literal secret that itself starts with a source
+        // prefix; without it such a value would be unrepresentable.
+        if let Some(value) = raw.strip_prefix("literal:") {
+            return Ok(Some(Self::Literal(value.to_string())));
+        }
+        if let Some(name) = raw.strip_prefix("env:") {
+            if name.is_empty() {
+                return Err(ParseError::invalid_value(format!(
+                    "{flag} env source requires a variable name"
+                )));
+            }
+            return Ok(Some(Self::Env(name.to_string())));
+        }
+        if let Some(file_source) = raw.strip_prefix("file:") {
+            let Some((file, path)) = file_source.rsplit_once('#') else {
+                return Err(ParseError::invalid_value(format!(
+                    "{flag} file source must be file:PATH#DOT_PATH"
+                )));
+            };
+            if file.is_empty() || path.is_empty() {
+                return Err(ParseError::invalid_value(format!(
+                    "{flag} file source requires both PATH and DOT_PATH"
+                )));
+            }
+            return Ok(Some(Self::File(SecretConfigRef {
+                file: std::path::PathBuf::from(file),
+                path: path.to_string(),
+            })));
+        }
+        Ok(Some(Self::Literal(raw)))
+    }
+
+    fn resolve(&self, flag: &str) -> Result<String, ParseError> {
+        match self {
+            Self::Literal(value) => Ok(value.clone()),
+            Self::Env(name) => std::env::var(name).map_err(|_| {
+                ParseError::invalid_value(format!(
+                    "{flag} references an unset environment variable"
+                ))
+            }),
+            Self::File(reference) => {
+                resolve_config_secret(flag, reference).map_err(ParseError::invalid_value)
+            }
         }
     }
 
-    let cli = match command_for_bin(bin_name)
-        .try_get_matches_from(&raw)
-        .and_then(|matches| AfdCli::from_arg_matches(&matches))
-    {
-        Ok(c) => c,
-        Err(e) => {
-            use clap::error::ErrorKind;
-            if matches!(e.kind(), ErrorKind::DisplayVersion | ErrorKind::DisplayHelp) {
-                let _ = crate::emit::write_result_text(&e.to_string());
-                std::process::exit(0);
-            }
-            return Err(e.to_string());
+    fn metadata(&self) -> Value {
+        match self {
+            Self::Literal(_) => json!({"kind": "direct"}),
+            Self::Env(name) => json!({"kind": "env", "name": name}),
+            Self::File(reference) => reference.safe_metadata(),
         }
-    };
-    let _stream_redirect_args = (&cli.stdout_file, &cli.stderr_file);
-    let output = parse_output(&cli.output)?;
-    // The destination is resolved before clap in `emit::install_output_to_from_raw`,
-    // which also knows the consumption mode. Re-parse here so an invalid value is
-    // rejected as a clap-time usage error too.
-    if let Some(value) = &cli.output_to {
-        let _ = OutputTo::parse(value)?;
     }
-    let log = parse_log_categories(&cli.log);
-    let dsn_config = SecretConfigRef::from_values("--dsn-secret-config", cli.dsn_secret_config)?;
-    let conninfo_config =
-        SecretConfigRef::from_values("--conninfo-secret-config", cli.conninfo_secret_config)?;
-    let password_config =
-        SecretConfigRef::from_values("--password-secret-config", cli.password_secret_config)?;
-    let connection_sources = connection_source_metadata([
-        (
-            "dsn",
-            cli.dsn_secret.is_some(),
-            cli.dsn_secret_env.as_deref(),
-            dsn_config.as_ref(),
-        ),
-        (
-            "conninfo",
-            cli.conninfo_secret.is_some(),
-            cli.conninfo_secret_env.as_deref(),
-            conninfo_config.as_ref(),
-        ),
-        (
-            "password",
-            cli.password_secret.is_some(),
-            cli.password_secret_env.as_deref(),
-            password_config.as_ref(),
-        ),
-    ]);
-    let dsn_secret = resolve_secret_value(
-        "--dsn-secret",
-        cli.dsn_secret,
-        cli.dsn_secret_env.as_deref(),
-        dsn_config.as_ref(),
-    )?;
-    let password_secret = resolve_secret_value(
-        "--password-secret",
-        cli.password_secret,
-        cli.password_secret_env.as_deref(),
-        password_config.as_ref(),
-    )?;
-    let conninfo_secret = resolve_secret_value(
-        "--conninfo-secret",
-        cli.conninfo_secret,
-        cli.conninfo_secret_env.as_deref(),
-        conninfo_config.as_ref(),
-    )?;
+}
+
+fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseError> {
+    let dsn = TypedSecretSource::parse("--dsn", optional_string(invocation, "dsn"))?;
+    let conninfo = TypedSecretSource::parse("--conninfo", optional_string(invocation, "conninfo"))?;
+    let password = TypedSecretSource::parse("--password", optional_string(invocation, "password"))?;
+    let mut source_fields = serde_json::Map::new();
+    for (name, source) in [
+        ("dsn", dsn.as_ref()),
+        ("conninfo", conninfo.as_ref()),
+        ("password", password.as_ref()),
+    ] {
+        if let Some(source) = source {
+            source_fields.insert(name.to_string(), source.metadata());
+        }
+    }
+    let sources = Value::Object(source_fields);
+
     let session = SessionConfig {
         // Caller-supplied, so the ordinary environment fallbacks still apply;
         // only a locked administrator profile pins the endpoint.
         profile_pinned: false,
-        dsn_secret,
-        conninfo_secret,
-        host: cli.host,
-        port: cli.port,
-        user: cli.user,
-        dbname: cli.dbname,
-        password_secret,
+        dsn_secret: dsn
+            .as_ref()
+            .map(|source| source.resolve("--dsn"))
+            .transpose()?,
+        conninfo_secret: conninfo
+            .as_ref()
+            .map(|source| source.resolve("--conninfo"))
+            .transpose()?,
+        host: optional_string(invocation, "host"),
+        port: port_of(invocation, "port", "--port")?,
+        user: optional_string(invocation, "user"),
+        dbname: optional_string(invocation, "dbname"),
+        password_secret: password
+            .as_ref()
+            .map(|source| source.resolve("--password"))
+            .transpose()?,
         ssh: SshConfig {
-            destination: cli.ssh.or_else(|| std::env::var("AFPSQL_SSH").ok()),
-            via: if cli.ssh_via.is_empty() {
-                parse_csv_env("AFPSQL_SSH_VIA")
-            } else {
-                cli.ssh_via
-            },
-            options: cli.ssh_options,
-            local_host: cli
-                .ssh_local_host
-                .or_else(|| std::env::var("AFPSQL_SSH_LOCAL_HOST").ok()),
-            local_port: cli.ssh_local_port.or_else(|| {
-                std::env::var("AFPSQL_SSH_LOCAL_PORT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            }),
-            remote_socket: cli
-                .ssh_remote_socket
-                .or_else(|| std::env::var("AFPSQL_SSH_REMOTE_SOCKET").ok()),
-            sudo_user: cli
-                .ssh_sudo_user
-                .or_else(|| std::env::var("AFPSQL_SSH_SUDO_USER").ok()),
+            destination: optional_string(invocation, "ssh")
+                .or_else(|| crate::runtime_env::nonempty("AFPSQL_SSH")),
+            via: non_empty_or_env(repeated_strings(invocation, "ssh_via"), "AFPSQL_SSH_VIA"),
+            options: repeated_strings(invocation, "ssh_option"),
+            local_host: None,
+            local_port: None,
+            remote_socket: optional_string(invocation, "ssh_remote_socket")
+                .or_else(|| crate::runtime_env::nonempty("AFPSQL_SSH_REMOTE_SOCKET")),
+            sudo_user: optional_string(invocation, "ssh_sudo_user")
+                .or_else(|| crate::runtime_env::nonempty("AFPSQL_SSH_SUDO_USER")),
         },
-        container: ContainerConfig {
-            target: cli
-                .container
-                .or_else(|| std::env::var("AFPSQL_CONTAINER").ok()),
-            driver: cli
-                .container_driver
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_DRIVER").ok()),
-            runtime: cli
-                .container_runtime
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_RUNTIME").ok()),
-            user: cli
-                .container_user
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_USER").ok()),
-            namespace: cli
-                .container_namespace
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_NAMESPACE").ok()),
-            context: cli
-                .container_context
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_CONTEXT").ok()),
-            compose_files: resolve_container_compose_files(cli.container_compose_files),
-            compose_project: cli
-                .container_compose_project
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_COMPOSE_PROJECT").ok()),
-            pod_container: cli
-                .container_pod_container
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_POD_CONTAINER").ok()),
-        },
+        container: cli_container_config(ContainerConfig {
+            docker_name: optional_string(invocation, "container_docker_name"),
+            docker_user: optional_string(invocation, "container_docker_user"),
+            docker_context: optional_string(invocation, "container_docker_context"),
+            docker_runtime: optional_string(invocation, "container_docker_runtime"),
+            podman_name: optional_string(invocation, "container_podman_name"),
+            podman_user: optional_string(invocation, "container_podman_user"),
+            podman_runtime: optional_string(invocation, "container_podman_runtime"),
+            nerdctl_name: optional_string(invocation, "container_nerdctl_name"),
+            nerdctl_user: optional_string(invocation, "container_nerdctl_user"),
+            nerdctl_runtime: optional_string(invocation, "container_nerdctl_runtime"),
+            compose_service: optional_string(invocation, "container_compose_service"),
+            compose_user: optional_string(invocation, "container_compose_user"),
+            compose_files: repeated_strings(invocation, "container_compose_file"),
+            compose_project: optional_string(invocation, "container_compose_project"),
+            compose_runtime: optional_string(invocation, "container_compose_runtime"),
+            kubectl_pod: optional_string(invocation, "container_kubectl_pod"),
+            kubectl_container: optional_string(invocation, "container_kubectl_container"),
+            kubectl_namespace: optional_string(invocation, "container_kubectl_namespace"),
+            kubectl_context: optional_string(invocation, "container_kubectl_context"),
+            kubectl_runtime: optional_string(invocation, "container_kubectl_runtime"),
+        }),
     };
-    let mode_name = match cli.mode {
-        RuntimeMode::Cli => "cli",
-        RuntimeMode::Pipe => "pipe",
-        RuntimeMode::Psql => "psql",
-    };
-    let startup_env = startup_env_snapshot();
+    // Which driver runs is inferred from the flag family used, so mixing two
+    // families names no driver. Rejected here rather than at connect time: it
+    // is a fact about the arguments, not about the world they point at.
+    session
+        .container
+        .selected_driver()
+        .map_err(ParseError::invalid_value)?;
+    Ok(Connection { session, sources })
+}
 
-    if let Some(command) = cli.command {
-        return match command {
-            AfdCommand::Psql(psql) => Ok(Mode::PsqlAdmin(PsqlAdminRequest {
-                action: psql_admin_action(psql.action),
-                output,
-            })),
-            AfdCommand::Skill(skill) => Ok(Mode::SkillAdmin(SkillAdminRequest {
-                action: skill_admin_action(skill.action),
-                output,
-            })),
-            AfdCommand::Inspect(inspect) => {
-                let (sql, params) = build_inspect_sql(inspect.action);
-                let startup_args = with_connection_sources(
-                    startup_args(mode_name, Some(&sql), None, params.len()),
-                    &connection_sources,
-                );
-                Ok(Mode::Cli(CliRequest {
-                    sql,
-                    params,
-                    options: QueryOptions::default(),
-                    session,
-                    output,
-                    log,
-                    startup_args,
-                    startup_env,
-                    startup_requested,
-                    dry_run: false,
-                    psql_mode: false,
-                }))
-            }
-        };
-    }
+/// Fill unset container fields from the environment.
+///
+/// CLI mode resolves the environment while parsing so `startup` reports the
+/// session it will actually connect with; a pinned readonly profile replaces
+/// this whole session later and reads no environment at all.
+fn cli_container_config(container: ContainerConfig) -> ContainerConfig {
+    crate::container_transport::container_config_with_env(&container, false)
+}
 
-    match cli.mode {
-        RuntimeMode::Pipe => {
-            return Ok(Mode::Pipe(PipeInit {
-                output,
-                session,
-                log: log.clone(),
-                startup_args: with_connection_sources(
-                    startup_args(mode_name, None, None, 0),
-                    &connection_sources,
-                ),
-                startup_env,
-                startup_requested,
-            }));
-        }
-        RuntimeMode::Cli | RuntimeMode::Psql => {}
-    }
-
-    let startup_sql_file = cli.sql_file.clone();
-    let user_sql = load_sql(cli.sql, cli.sql_file)?;
-    let params = parse_params(&cli.param)?;
-    let sql = if cli.explain {
-        wrap_explain_sql(&user_sql, false)
-    } else if cli.explain_analyze {
-        wrap_explain_sql(&user_sql, true)
+fn non_empty_or_env(values: Vec<String>, key: &str) -> Vec<String> {
+    if values.is_empty() {
+        parse_csv_env(key)
     } else {
-        user_sql
+        values
+    }
+}
+
+fn run_query(invocation: &ResolvedInvocation) -> ActionResult {
+    let output = format_of(invocation)?;
+    let entries = log_entries(invocation);
+    let connection = connection_from(invocation)?;
+    let sql_file = optional_string(invocation, "sql_file");
+    let user_sql = load_sql(optional_string(invocation, "sql"), sql_file.clone())?;
+    let params =
+        parse_params(&repeated_strings(invocation, "param")).map_err(ParseError::invalid_value)?;
+    let sql = match optional_string(invocation, "explain").as_deref() {
+        Some("analyze") => wrap_explain_sql(&user_sql, true),
+        Some(_) => wrap_explain_sql(&user_sql, false),
+        None => user_sql,
     };
     let startup_args = with_connection_sources(
-        startup_args(
-            mode_name,
-            Some(&sql),
-            startup_sql_file.as_deref(),
-            params.len(),
-        ),
-        &connection_sources,
+        startup_args("cli", Some(&sql), sql_file.as_deref(), params.len()),
+        &connection.sources,
     );
-
-    let options = QueryOptions {
-        stream_rows: cli.stream_rows,
-        batch_rows: cli.batch_rows,
-        batch_bytes: cli.batch_bytes,
-        statement_timeout_ms: cli.statement_timeout_ms,
-        lock_timeout_ms: cli.lock_timeout_ms,
-        permission: cli.permission,
-        inline_max_rows: cli.inline_max_rows,
-        inline_max_bytes: cli.inline_max_bytes,
-    };
 
     Ok(Mode::Cli(CliRequest {
         sql,
         params,
-        options,
-        session,
+        options: QueryOptions {
+            stream_rows: flag(invocation, "stream_rows"),
+            batch_rows: count_of(invocation, "batch_rows", "--batch-rows")?,
+            batch_bytes: count_of(invocation, "batch_bytes", "--batch-bytes")?,
+            statement_timeout_ms: millis_of(
+                invocation,
+                "statement_timeout_ms",
+                "--statement-timeout-ms",
+            )?,
+            lock_timeout_ms: millis_of(invocation, "lock_timeout_ms", "--lock-timeout-ms")?,
+            permission: permission_of(invocation),
+            inline_max_rows: count_of(invocation, "inline_max_rows", "--inline-max-rows")?,
+            inline_max_bytes: count_of(invocation, "inline_max_bytes", "--inline-max-bytes")?,
+        },
+        session: connection.session,
         output,
-        log,
+        log: parse_log_categories(&entries),
         startup_args,
-        startup_env,
-        startup_requested,
-        dry_run: cli.dry_run,
+        startup_env: startup_env_snapshot(),
+        startup_requested: startup_requested(&entries),
+        dry_run: flag(invocation, "dry_run"),
         psql_mode: false,
     }))
 }
 
-fn command_for_bin(bin_name: &str) -> clap::Command {
-    match bin_name {
-        "afpsql-readonly" => AfdCli::command()
-            .name("afpsql-readonly")
-            .bin_name("afpsql-readonly"),
-        _ => AfdCli::command().name("afpsql").bin_name("afpsql"),
-    }
+fn permission_of(invocation: &ResolvedInvocation) -> Option<Permission> {
+    optional_string(invocation, "permission")
+        .as_deref()
+        .and_then(|value| value.parse().ok())
 }
 
-fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
-    let startup_requested = startup_requested_from_raw(raw);
+fn run_pipe(invocation: &ResolvedInvocation) -> ActionResult {
+    let output = format_of(invocation)?;
+    let entries = log_entries(invocation);
+    let connection = connection_from(invocation)?;
+    Ok(Mode::Pipe(PipeInit {
+        output,
+        session: connection.session,
+        log: parse_log_categories(&entries),
+        startup_args: with_connection_sources(
+            startup_args("pipe", None, None, 0),
+            &connection.sources,
+        ),
+        startup_env: startup_env_snapshot(),
+        startup_requested: startup_requested(&entries),
+    }))
+}
+
+/// Both routes into psql translation end here.
+///
+/// `parse_args` short-circuits to the translator whenever argv asks for psql
+/// mode, because psql's option grammar is not expressible in this registry. The
+/// registered shape binds to this handler, which runs that same translator on
+/// that same argv — so the registry's account of `--mode psql` and what the
+/// process actually does cannot drift apart.
+fn run_psql_mode(_invocation: &ResolvedInvocation) -> ActionResult {
+    let raw: Vec<String> = std::env::args().collect();
+    Ok(parse_psql_mode_full(&raw).map(|(mode, _)| mode)?)
+}
+
+fn run_inspect(invocation: &ResolvedInvocation, action: InspectAction) -> ActionResult {
+    let output = format_of(invocation)?;
+    let entries = log_entries(invocation);
+    let connection = connection_from(invocation)?;
+    let (sql, params) = build_inspect_sql(action);
+    let startup_args = with_connection_sources(
+        startup_args("cli", Some(&sql), None, params.len()),
+        &connection.sources,
+    );
+    Ok(Mode::Cli(CliRequest {
+        sql,
+        params,
+        options: QueryOptions::default(),
+        session: connection.session,
+        output,
+        log: parse_log_categories(&entries),
+        startup_args,
+        startup_env: startup_env_snapshot(),
+        startup_requested: startup_requested(&entries),
+        dry_run: false,
+        psql_mode: false,
+    }))
+}
+
+fn schema_of(invocation: &ResolvedInvocation) -> String {
+    optional_string(invocation, "schema").unwrap_or_else(|| "public".to_string())
+}
+
+fn run_inspect_databases(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Databases(InspectDatabasesArgs {
+            all: flag(invocation, "all"),
+        }),
+    )
+}
+
+fn run_inspect_database(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(invocation, InspectAction::Database)
+}
+
+fn run_inspect_schemas(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(invocation, InspectAction::Schemas)
+}
+
+fn run_inspect_schema(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Schema(InspectSchemaArgs {
+            schema: schema_of(invocation),
+            like: optional_string(invocation, "like"),
+        }),
+    )
+}
+
+fn run_inspect_snapshot(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Snapshot(InspectSchemaArgs {
+            schema: schema_of(invocation),
+            like: optional_string(invocation, "like"),
+        }),
+    )
+}
+
+fn run_inspect_tables(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Tables(InspectTablesArgs {
+            schema: schema_of(invocation),
+            like: optional_string(invocation, "like"),
+        }),
+    )
+}
+
+fn run_inspect_views(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Views(InspectViewsArgs {
+            schema: schema_of(invocation),
+            like: optional_string(invocation, "like"),
+        }),
+    )
+}
+
+fn run_inspect_indexes(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Indexes(InspectIndexesArgs {
+            schema: schema_of(invocation),
+            table: optional_string(invocation, "table"),
+            stats: flag(invocation, "stats"),
+        }),
+    )
+}
+
+fn run_inspect_table(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Table(InspectTableArgs {
+            name: required_string(invocation, "name"),
+            full: flag(invocation, "full"),
+        }),
+    )
+}
+
+fn psql_admin_request(
+    invocation: &ResolvedInvocation,
+    action: fn(Option<String>) -> PsqlAdminAction,
+) -> ActionResult {
+    Ok(Mode::PsqlAdmin(PsqlAdminRequest {
+        action: action(optional_string(invocation, "bin_dir")),
+        output: format_of(invocation)?,
+    }))
+}
+
+fn run_psql_status(invocation: &ResolvedInvocation) -> ActionResult {
+    psql_admin_request(invocation, |bin_dir| PsqlAdminAction::Status { bin_dir })
+}
+
+fn run_psql_install(invocation: &ResolvedInvocation) -> ActionResult {
+    psql_admin_request(invocation, |bin_dir| PsqlAdminAction::Install { bin_dir })
+}
+
+fn run_psql_uninstall(invocation: &ResolvedInvocation) -> ActionResult {
+    psql_admin_request(invocation, |bin_dir| PsqlAdminAction::Uninstall { bin_dir })
+}
+
+fn skill_request(
+    invocation: &ResolvedInvocation,
+    action: fn(SkillAdminOptions) -> SkillAdminAction,
+) -> ActionResult {
+    let options = SkillAdminOptions {
+        agent: match optional_string(invocation, "agent").as_deref() {
+            Some("codex") => SkillAgentSelection::Codex,
+            Some("claude-code") => SkillAgentSelection::ClaudeCode,
+            Some("opencode") => SkillAgentSelection::Opencode,
+            Some("hermes") => SkillAgentSelection::Hermes,
+            _ => SkillAgentSelection::All,
+        },
+        scope: match optional_string(invocation, "scope").as_deref() {
+            Some("workspace") => SkillScope::Workspace,
+            _ => SkillScope::Personal,
+        },
+        skills_dir: optional_string(invocation, "skills_dir"),
+        force: flag(invocation, "force"),
+    };
+    Ok(Mode::SkillAdmin(SkillAdminRequest {
+        action: action(options),
+        output: format_of(invocation)?,
+    }))
+}
+
+fn run_skill_status(invocation: &ResolvedInvocation) -> ActionResult {
+    skill_request(invocation, SkillAdminAction::Status)
+}
+
+fn run_skill_install(invocation: &ResolvedInvocation) -> ActionResult {
+    skill_request(invocation, SkillAdminAction::Install)
+}
+
+fn run_skill_uninstall(invocation: &ResolvedInvocation) -> ActionResult {
+    skill_request(invocation, SkillAdminAction::Uninstall)
+}
+
+/// Where a translated psql invocation writes, decided by the translator rather
+/// than by the registry's output contract.
+struct PsqlRouting {
+    output_to: OutputTo,
+    stdout_file: Option<std::path::PathBuf>,
+    stderr_file: Option<std::path::PathBuf>,
+}
+
+fn parse_psql_mode_full(raw: &[String]) -> Result<(Mode, PsqlRouting), String> {
     let mut state = PsqlModeState::default();
 
     let mut i = 1usize;
@@ -959,8 +1535,18 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         i += 1;
     }
 
+    let routing = PsqlRouting {
+        output_to: state.output_to.unwrap_or(OutputTo::Split),
+        stdout_file: state.stdout_file.clone().map(std::path::PathBuf::from),
+        stderr_file: state.stderr_file.clone().map(std::path::PathBuf::from),
+    };
+    let startup_requested = startup_requested(&state.log_entries);
+
     if let Some(reason) = state.interactive_reason {
-        return Ok(Mode::PsqlUnsupported(PsqlUnsupportedRequest { reason }));
+        return Ok((
+            Mode::PsqlUnsupported(PsqlUnsupportedRequest { reason }),
+            routing,
+        ));
     }
 
     apply_psql_positionals(&mut state)?;
@@ -969,49 +1555,42 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         state.sql_file = None;
     }
     if state.sql.is_none() && state.sql_file.is_none() {
-        return Ok(Mode::PsqlUnsupported(PsqlUnsupportedRequest {
-            reason: "no -c/--command, -f/--file, or -l/--list was provided".to_string(),
-        }));
+        return Ok((
+            Mode::PsqlUnsupported(PsqlUnsupportedRequest {
+                reason: "no -c/--command, -f/--file, or -l/--list was provided".to_string(),
+            }),
+            routing,
+        ));
     }
 
-    let connection_sources = connection_source_metadata([
-        (
-            "dsn",
-            state.dsn_secret.is_some(),
-            state.dsn_secret_env.as_deref(),
-            state.dsn_secret_config.as_ref(),
-        ),
-        (
-            "conninfo",
-            state.conninfo_secret.is_some(),
-            state.conninfo_secret_env.as_deref(),
-            state.conninfo_secret_config.as_ref(),
-        ),
-        (
-            "password",
-            state.password_secret.is_some(),
-            state.password_secret_env.as_deref(),
-            state.password_secret_config.as_ref(),
-        ),
-    ]);
-    let dsn_secret = resolve_secret_value(
-        "--dsn-secret",
-        state.dsn_secret,
-        state.dsn_secret_env.as_deref(),
-        state.dsn_secret_config.as_ref(),
-    )?;
-    let password_secret = resolve_secret_value(
-        "--password-secret",
-        state.password_secret,
-        state.password_secret_env.as_deref(),
-        state.password_secret_config.as_ref(),
-    )?;
-    let conninfo_secret = resolve_secret_value(
-        "--conninfo-secret",
-        state.conninfo_secret,
-        state.conninfo_secret_env.as_deref(),
-        state.conninfo_secret_config.as_ref(),
-    )?;
+    let dsn = TypedSecretSource::parse("--dsn", state.dsn_secret).map_err(|error| error.message)?;
+    let conninfo = TypedSecretSource::parse("--conninfo", state.conninfo_secret)
+        .map_err(|error| error.message)?;
+    let password = TypedSecretSource::parse("--password", state.password_secret)
+        .map_err(|error| error.message)?;
+    let mut source_fields = serde_json::Map::new();
+    for (name, source) in [
+        ("dsn", dsn.as_ref()),
+        ("conninfo", conninfo.as_ref()),
+        ("password", password.as_ref()),
+    ] {
+        if let Some(source) = source {
+            source_fields.insert(name.to_string(), source.metadata());
+        }
+    }
+    let connection_sources = Value::Object(source_fields);
+    let dsn_secret = dsn
+        .as_ref()
+        .map(|source| source.resolve("--dsn").map_err(|error| error.message))
+        .transpose()?;
+    let conninfo_secret = conninfo
+        .as_ref()
+        .map(|source| source.resolve("--conninfo").map_err(|error| error.message))
+        .transpose()?;
+    let password_secret = password
+        .as_ref()
+        .map(|source| source.resolve("--password").map_err(|error| error.message))
+        .transpose()?;
     let session = SessionConfig {
         // Caller-supplied, so the ordinary environment fallbacks still apply;
         // only a locked administrator profile pins the endpoint.
@@ -1024,34 +1603,9 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         dbname: state.dbname,
         password_secret,
         ssh: SshConfig::default(),
-        container: ContainerConfig {
-            target: state
-                .container
-                .or_else(|| std::env::var("AFPSQL_CONTAINER").ok()),
-            driver: state
-                .container_driver
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_DRIVER").ok()),
-            runtime: state
-                .container_runtime
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_RUNTIME").ok()),
-            user: state
-                .container_user
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_USER").ok()),
-            namespace: state
-                .container_namespace
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_NAMESPACE").ok()),
-            context: state
-                .container_context
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_CONTEXT").ok()),
-            compose_files: resolve_container_compose_files(state.container_compose_files),
-            compose_project: state
-                .container_compose_project
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_COMPOSE_PROJECT").ok()),
-            pod_container: state
-                .container_pod_container
-                .or_else(|| std::env::var("AFPSQL_CONTAINER_POD_CONTAINER").ok()),
-        },
+        container: cli_container_config(state.container),
     };
+    session.container.selected_driver()?;
 
     let startup_sql_file = state.sql_file.clone();
     let sql = load_sql(state.sql, state.sql_file)?;
@@ -1065,26 +1619,29 @@ fn parse_psql_mode(raw: &[String]) -> Result<Mode, String> {
         }),
         &connection_sources,
     );
-    Ok(Mode::Cli(CliRequest {
-        sql,
-        params,
-        options: QueryOptions {
-            permission: Some(if session.uses_container_transport() {
-                Permission::ContainerWrite
-            } else {
-                Permission::Write
-            }),
-            ..Default::default()
-        },
-        session,
-        output: state.output,
-        log: parse_log_categories(&state.log_entries),
-        startup_args,
-        startup_env: startup_env_snapshot(),
-        startup_requested,
-        dry_run: false,
-        psql_mode: true,
-    }))
+    Ok((
+        Mode::Cli(CliRequest {
+            sql,
+            params,
+            options: QueryOptions {
+                permission: Some(if session.uses_container_transport() {
+                    Permission::ContainerWrite
+                } else {
+                    Permission::Write
+                }),
+                ..Default::default()
+            },
+            session,
+            output: state.output,
+            log: parse_log_categories(&state.log_entries),
+            startup_args,
+            startup_env: startup_env_snapshot(),
+            startup_requested,
+            dry_run: false,
+            psql_mode: true,
+        }),
+        routing,
+    ))
 }
 
 struct PsqlModeState {
@@ -1095,25 +1652,14 @@ struct PsqlModeState {
     user: Option<String>,
     dbname: Option<String>,
     dsn_secret: Option<String>,
-    dsn_secret_env: Option<String>,
-    dsn_secret_config: Option<SecretConfigRef>,
     conninfo_secret: Option<String>,
-    conninfo_secret_env: Option<String>,
-    conninfo_secret_config: Option<SecretConfigRef>,
     password_secret: Option<String>,
-    password_secret_env: Option<String>,
-    password_secret_config: Option<SecretConfigRef>,
-    container: Option<String>,
-    container_driver: Option<String>,
-    container_runtime: Option<String>,
-    container_user: Option<String>,
-    container_namespace: Option<String>,
-    container_context: Option<String>,
-    container_compose_files: Vec<String>,
-    container_compose_project: Option<String>,
-    container_pod_container: Option<String>,
+    container: ContainerConfig,
     params_kv: Vec<String>,
     output: OutputFormat,
+    output_to: Option<OutputTo>,
+    stdout_file: Option<String>,
+    stderr_file: Option<String>,
     log_entries: Vec<String>,
     list_databases: bool,
     positionals: Vec<String>,
@@ -1130,25 +1676,14 @@ impl Default for PsqlModeState {
             user: None,
             dbname: None,
             dsn_secret: None,
-            dsn_secret_env: None,
-            dsn_secret_config: None,
             conninfo_secret: None,
-            conninfo_secret_env: None,
-            conninfo_secret_config: None,
             password_secret: None,
-            password_secret_env: None,
-            password_secret_config: None,
-            container: None,
-            container_driver: None,
-            container_runtime: None,
-            container_user: None,
-            container_namespace: None,
-            container_context: None,
-            container_compose_files: vec![],
-            container_compose_project: None,
-            container_pod_container: None,
+            container: ContainerConfig::default(),
             params_kv: vec![],
             output: OutputFormat::Json,
+            output_to: None,
+            stdout_file: None,
+            stderr_file: None,
             log_entries: vec![],
             list_databases: false,
             positionals: vec![],
@@ -1211,6 +1746,14 @@ fn parse_psql_long_arg(
     if arg == "--version" {
         emit_psql_mode_version();
         std::process::exit(0);
+    }
+    if let Some(source) = arg.strip_prefix("--password=") {
+        if source.is_empty() {
+            return Err("--password=SOURCE requires a non-empty source".to_string());
+        }
+        state.password_secret = Some(source.to_string());
+        *i += 1;
+        return Ok(());
     }
 
     match long_name(arg) {
@@ -1291,70 +1834,76 @@ fn parse_psql_long_arg(
             *i += 1;
             Ok(())
         }
-        "--dsn-secret" => {
-            state.dsn_secret = Some(take_long_arg_value(raw, i, "--dsn-secret")?);
+        "--dsn" => {
+            state.dsn_secret = Some(take_long_arg_value(raw, i, "--dsn")?);
             Ok(())
         }
-        "--dsn-secret-env" => {
-            state.dsn_secret_env = Some(take_long_arg_value(raw, i, "--dsn-secret-env")?);
+        "--conninfo" => {
+            state.conninfo_secret = Some(take_long_arg_value(raw, i, "--conninfo")?);
             Ok(())
         }
-        "--dsn-secret-config" => {
-            state.dsn_secret_config = Some(take_secret_config_ref(raw, i, "--dsn-secret-config")?);
+        "--container-docker-name" => {
+            state.container.docker_name =
+                Some(take_long_arg_value(raw, i, "--container-docker-name")?);
             Ok(())
         }
-        "--conninfo-secret" => {
-            state.conninfo_secret = Some(take_long_arg_value(raw, i, "--conninfo-secret")?);
+        "--container-docker-user" => {
+            state.container.docker_user =
+                Some(take_long_arg_value(raw, i, "--container-docker-user")?);
             Ok(())
         }
-        "--conninfo-secret-env" => {
-            state.conninfo_secret_env = Some(take_long_arg_value(raw, i, "--conninfo-secret-env")?);
+        "--container-docker-context" => {
+            state.container.docker_context =
+                Some(take_long_arg_value(raw, i, "--container-docker-context")?);
             Ok(())
         }
-        "--conninfo-secret-config" => {
-            state.conninfo_secret_config =
-                Some(take_secret_config_ref(raw, i, "--conninfo-secret-config")?);
+        "--container-docker-runtime" => {
+            state.container.docker_runtime =
+                Some(take_long_arg_value(raw, i, "--container-docker-runtime")?);
             Ok(())
         }
-        "--password-secret" => {
-            state.password_secret = Some(take_long_arg_value(raw, i, "--password-secret")?);
+        "--container-podman-name" => {
+            state.container.podman_name =
+                Some(take_long_arg_value(raw, i, "--container-podman-name")?);
             Ok(())
         }
-        "--password-secret-env" => {
-            state.password_secret_env = Some(take_long_arg_value(raw, i, "--password-secret-env")?);
+        "--container-podman-user" => {
+            state.container.podman_user =
+                Some(take_long_arg_value(raw, i, "--container-podman-user")?);
             Ok(())
         }
-        "--password-secret-config" => {
-            state.password_secret_config =
-                Some(take_secret_config_ref(raw, i, "--password-secret-config")?);
+        "--container-podman-runtime" => {
+            state.container.podman_runtime =
+                Some(take_long_arg_value(raw, i, "--container-podman-runtime")?);
             Ok(())
         }
-        "--container" => {
-            state.container = Some(take_long_arg_value(raw, i, "--container")?);
+        "--container-nerdctl-name" => {
+            state.container.nerdctl_name =
+                Some(take_long_arg_value(raw, i, "--container-nerdctl-name")?);
             Ok(())
         }
-        "--container-driver" => {
-            state.container_driver = Some(take_long_arg_value(raw, i, "--container-driver")?);
+        "--container-nerdctl-user" => {
+            state.container.nerdctl_user =
+                Some(take_long_arg_value(raw, i, "--container-nerdctl-user")?);
             Ok(())
         }
-        "--container-runtime" => {
-            state.container_runtime = Some(take_long_arg_value(raw, i, "--container-runtime")?);
+        "--container-nerdctl-runtime" => {
+            state.container.nerdctl_runtime =
+                Some(take_long_arg_value(raw, i, "--container-nerdctl-runtime")?);
             Ok(())
         }
-        "--container-user" => {
-            state.container_user = Some(take_long_arg_value(raw, i, "--container-user")?);
+        "--container-compose-service" => {
+            state.container.compose_service =
+                Some(take_long_arg_value(raw, i, "--container-compose-service")?);
             Ok(())
         }
-        "--container-namespace" => {
-            state.container_namespace = Some(take_long_arg_value(raw, i, "--container-namespace")?);
-            Ok(())
-        }
-        "--container-context" => {
-            state.container_context = Some(take_long_arg_value(raw, i, "--container-context")?);
+        "--container-compose-user" => {
+            state.container.compose_user =
+                Some(take_long_arg_value(raw, i, "--container-compose-user")?);
             Ok(())
         }
         "--container-compose-file" => {
-            state.container_compose_files.push(take_long_arg_value(
+            state.container.compose_files.push(take_long_arg_value(
                 raw,
                 i,
                 "--container-compose-file",
@@ -1362,22 +1911,57 @@ fn parse_psql_long_arg(
             Ok(())
         }
         "--container-compose-project" => {
-            state.container_compose_project =
+            state.container.compose_project =
                 Some(take_long_arg_value(raw, i, "--container-compose-project")?);
             Ok(())
         }
-        "--container-pod-container" => {
-            state.container_pod_container =
-                Some(take_long_arg_value(raw, i, "--container-pod-container")?);
+        "--container-compose-runtime" => {
+            state.container.compose_runtime =
+                Some(take_long_arg_value(raw, i, "--container-compose-runtime")?);
             Ok(())
         }
-        "--stdout-file" | "--stderr-file" => {
-            let _ = take_long_arg_value(raw, i, long_name(arg))?;
+        "--container-kubectl-pod" => {
+            state.container.kubectl_pod =
+                Some(take_long_arg_value(raw, i, "--container-kubectl-pod")?);
+            Ok(())
+        }
+        "--container-kubectl-container" => {
+            state.container.kubectl_container = Some(take_long_arg_value(
+                raw,
+                i,
+                "--container-kubectl-container",
+            )?);
+            Ok(())
+        }
+        "--container-kubectl-namespace" => {
+            state.container.kubectl_namespace = Some(take_long_arg_value(
+                raw,
+                i,
+                "--container-kubectl-namespace",
+            )?);
+            Ok(())
+        }
+        "--container-kubectl-context" => {
+            state.container.kubectl_context =
+                Some(take_long_arg_value(raw, i, "--container-kubectl-context")?);
+            Ok(())
+        }
+        "--container-kubectl-runtime" => {
+            state.container.kubectl_runtime =
+                Some(take_long_arg_value(raw, i, "--container-kubectl-runtime")?);
+            Ok(())
+        }
+        "--stdout-file" => {
+            state.stdout_file = Some(take_long_arg_value(raw, i, "--stdout-file")?);
+            Ok(())
+        }
+        "--stderr-file" => {
+            state.stderr_file = Some(take_long_arg_value(raw, i, "--stderr-file")?);
             Ok(())
         }
         "--output-to" => {
             let value = take_long_arg_value(raw, i, "--output-to")?;
-            let _ = OutputTo::parse(&value)?;
+            state.output_to = Some(OutputTo::parse(&value)?);
             Ok(())
         }
         "--log" => {
@@ -1484,39 +2068,6 @@ fn take_long_arg_value(raw: &[String], i: &mut usize, flag: &str) -> Result<Stri
         return Ok(value.to_string());
     }
     take_arg_value(raw, i, flag)
-}
-
-fn take_secret_config_ref(
-    raw: &[String],
-    i: &mut usize,
-    flag: &str,
-) -> Result<SecretConfigRef, String> {
-    if raw[*i].contains('=') {
-        return Err(format!(
-            "{flag} requires space-separated values: {flag} <FILE> <DOT_PATH>"
-        ));
-    }
-    let file = take_long_arg_value(raw, i, flag)?;
-    let path = raw
-        .get(*i)
-        .filter(|value| !value.starts_with('-'))
-        .ok_or_else(|| format!("{flag} requires exactly two values: <FILE> <DOT_PATH>"))?
-        .clone();
-    *i += 1;
-    if raw.get(*i).is_some_and(|value| !value.starts_with('-')) {
-        return Err(format!(
-            "{flag} accepts exactly two values: <FILE> <DOT_PATH>"
-        ));
-    }
-    if file.is_empty() || path.is_empty() {
-        return Err(format!(
-            "{flag} requires exactly two non-empty values: <FILE> <DOT_PATH>"
-        ));
-    }
-    Ok(SecretConfigRef {
-        file: file.into(),
-        path,
-    })
 }
 
 fn take_short_arg_value(
@@ -1652,42 +2203,15 @@ Human-interactive psql modes and psql meta-commands are not supported by this wr
     ));
 }
 
-fn psql_admin_action(action: PsqlCliAction) -> PsqlAdminAction {
-    match action {
-        PsqlCliAction::Status(args) => PsqlAdminAction::Status {
-            bin_dir: args.bin_dir,
-        },
-        PsqlCliAction::Install(args) => PsqlAdminAction::Install {
-            bin_dir: args.bin_dir,
-        },
-        PsqlCliAction::Uninstall(args) => PsqlAdminAction::Uninstall {
-            bin_dir: args.bin_dir,
-        },
-    }
-}
-
-fn skill_admin_action(action: SkillCliAction) -> SkillAdminAction {
-    match action {
-        SkillCliAction::Status(args) => SkillAdminAction::Status(skill_options(args, false)),
-        SkillCliAction::Install(args) => {
-            SkillAdminAction::Install(skill_options(args.target, args.force))
-        }
-        SkillCliAction::Uninstall(args) => {
-            SkillAdminAction::Uninstall(skill_options(args.target, args.force))
-        }
-    }
-}
-
-fn skill_options(args: SkillTargetArgs, force: bool) -> SkillAdminOptions {
-    SkillAdminOptions {
-        agent: args.agent,
-        scope: args.scope,
-        skills_dir: args.skills_dir,
-        force,
-    }
-}
-
+/// Whether this argv asks for psql translation rather than the registry.
+///
+/// The scan skips each option's value using the registry's own knowledge of
+/// which long arguments take one, so this decision and the parser can never
+/// disagree about which token is a flag — `--sql --mode` names a value, not a
+/// mode. It stops at the first subcommand token, because `--mode` is a
+/// root-only argument.
 fn is_psql_mode_requested(raw: &[String]) -> bool {
+    let takes_value = root_value_arguments();
     let mut i = 1usize;
     while i < raw.len() {
         let arg = raw[i].as_str();
@@ -1695,20 +2219,18 @@ fn is_psql_mode_requested(raw: &[String]) -> bool {
             break;
         }
         if arg == "--mode" {
-            if let Some(v) = raw.get(i + 1) {
-                return v == "psql";
-            }
-            return false;
+            return raw.get(i + 1).is_some_and(|value| value == "psql");
         }
         if arg == "--mode=psql" {
             return true;
         }
-        if top_level_arg_consumes_two_values(arg) {
-            i += if arg.contains('=') { 2 } else { 3 };
-            continue;
-        }
-        if top_level_arg_consumes_value(arg) {
-            i += if arg.contains('=') { 1 } else { 2 };
+        if arg.starts_with("--") {
+            let name = long_name(arg);
+            i += if arg.contains('=') || !takes_value.contains(name) {
+                1
+            } else {
+                2
+            };
             continue;
         }
         if arg.starts_with('-') {
@@ -1720,76 +2242,24 @@ fn is_psql_mode_requested(raw: &[String]) -> bool {
     false
 }
 
-pub(crate) fn top_level_arg_consumes_two_values(arg: &str) -> bool {
-    let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
-    matches!(
-        name,
-        "--dsn-secret-config" | "--conninfo-secret-config" | "--password-secret-config"
-    )
-}
-
-pub(crate) fn top_level_arg_consumes_value(arg: &str) -> bool {
-    let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
-    matches!(
-        name,
-        "--sql"
-            | "--sql-file"
-            | "--param"
-            | "--batch-rows"
-            | "--batch-bytes"
-            | "--statement-timeout-ms"
-            | "--lock-timeout-ms"
-            | "--inline-max-rows"
-            | "--inline-max-bytes"
-            | "--permission"
-            | "--dsn-secret"
-            | "--dsn-secret-env"
-            | "--conninfo-secret"
-            | "--conninfo-secret-env"
-            | "--host"
-            | "--port"
-            | "--user"
-            | "--dbname"
-            | "--password-secret"
-            | "--password-secret-env"
-            | "--ssh"
-            | "--ssh-via"
-            | "--ssh-option"
-            | "--ssh-local-host"
-            | "--ssh-local-port"
-            | "--ssh-remote-socket"
-            | "--ssh-sudo-user"
-            | "--container"
-            | "--container-driver"
-            | "--container-runtime"
-            | "--container-user"
-            | "--container-namespace"
-            | "--container-context"
-            | "--container-compose-file"
-            | "--container-compose-project"
-            | "--container-pod-container"
-            | "--output"
-            | "--output-to"
-            | "--stdout-file"
-            | "--stderr-file"
-            | "--log"
-    )
-}
-
-fn resolve_container_compose_files(cli_files: Vec<String>) -> Vec<String> {
-    if !cli_files.is_empty() {
-        return cli_files;
-    }
-    std::env::var("AFPSQL_CONTAINER_COMPOSE_FILE")
-        .ok()
-        .map(|value| {
-            value
-                .split(':')
-                .filter(|part| !part.is_empty())
-                .map(std::string::ToString::to_string)
-                .collect()
+/// Every root-level long argument that consumes a following token.
+///
+/// Derived from the registry plus the four output arguments AFDATA injects
+/// into it, so adding an argument cannot leave this scanner behind.
+fn root_value_arguments() -> std::collections::BTreeSet<String> {
+    let mut names: std::collections::BTreeSet<String> = root_command()
+        .arguments
+        .iter()
+        .filter(|argument| argument.value_type != agent_first_data::ArgValueType::Flag)
+        .filter_map(|argument| match &argument.syntax {
+            agent_first_data::ArgSyntax::Long { name } => Some(name.clone()),
+            agent_first_data::ArgSyntax::Positional { .. } => None,
         })
-        .unwrap_or_default()
+        .collect();
+    for injected in ["--output", "--output-to", "--stdout-file", "--stderr-file"] {
+        names.insert(injected.to_string());
+    }
+    names
 }
 
 fn load_sql(sql: Option<String>, sql_file: Option<String>) -> Result<String, String> {
@@ -1837,10 +2307,6 @@ fn sql_size_error() -> String {
     format!("sql exceeds maximum size; maximum SQL size is {MAX_SQL_BYTES} bytes")
 }
 
-fn parse_output(v: &str) -> Result<OutputFormat, String> {
-    cli_parse_output(v)
-}
-
 fn parse_log_categories(entries: &[String]) -> LogFilters {
     cli_parse_log_filters(entries)
 }
@@ -1858,34 +2324,6 @@ fn parse_csv_env(name: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
-}
-
-fn startup_requested_from_raw(raw: &[String]) -> bool {
-    let mut i = 1usize;
-    while i < raw.len() {
-        if raw[i] == "--log" {
-            if let Some(values) = raw.get(i + 1) {
-                for part in values.split(',') {
-                    let v = part.trim().to_ascii_lowercase();
-                    if matches!(v.as_str(), "startup" | "all" | "*") {
-                        return true;
-                    }
-                }
-            }
-            i += 2;
-            continue;
-        }
-        if let Some(values) = raw[i].strip_prefix("--log=") {
-            for part in values.split(',') {
-                let v = part.trim().to_ascii_lowercase();
-                if matches!(v.as_str(), "startup" | "all" | "*") {
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
-    false
 }
 
 fn startup_env_snapshot() -> Value {
@@ -1925,27 +2363,6 @@ fn with_connection_sources(mut args: Value, sources: &Value) -> Value {
         );
     }
     args
-}
-
-fn connection_source_metadata<const N: usize>(
-    sources: [(&str, bool, Option<&str>, Option<&SecretConfigRef>); N],
-) -> Value {
-    let mut metadata = serde_json::Map::new();
-    for (slot, direct, env_name, config) in sources {
-        let value = if let Some(reference) = config {
-            Some(reference.safe_metadata())
-        } else if let Some(env_name) = env_name {
-            Some(json!({"kind": "env", "name": env_name}))
-        } else if direct {
-            Some(json!({"kind": "direct"}))
-        } else {
-            None
-        };
-        if let Some(value) = value {
-            metadata.insert(slot.to_string(), value);
-        }
-    }
-    Value::Object(metadata)
 }
 
 fn startup_sql_summary(sql: Option<&str>, sql_file: Option<&str>) -> Value {
@@ -2015,42 +2432,6 @@ fn psql_startup_args(args: PsqlStartupArgs<'_>) -> Value {
     )
 }
 
-fn resolve_secret_value(
-    flag_name: &str,
-    direct: Option<String>,
-    env_name: Option<&str>,
-    config: Option<&SecretConfigRef>,
-) -> Result<Option<String>, String> {
-    let source_count = usize::from(direct.is_some())
-        + usize::from(env_name.is_some())
-        + usize::from(config.is_some());
-    if source_count > 1 {
-        return Err(format!(
-            "{flag_name}, {flag_name}-env, and {flag_name}-config are mutually exclusive"
-        ));
-    }
-    match (direct, env_name, config) {
-        (Some(value), None, None) => Ok(Some(value)),
-        (None, Some(name), None) => {
-            if name.is_empty() {
-                return Err(format!(
-                    "{flag_name}-env requires a non-empty variable name"
-                ));
-            }
-            std::env::var(name).map(Some).map_err(|_| {
-                format!("{flag_name}-env references unset environment variable: {name}")
-            })
-        }
-        (None, None, Some(reference)) => {
-            resolve_config_secret(&format!("{flag_name}-config"), reference).map(Some)
-        }
-        (None, None, None) => Ok(None),
-        _ => Err(format!(
-            "{flag_name}, {flag_name}-env, and {flag_name}-config are mutually exclusive"
-        )),
-    }
-}
-
 pub fn parse_params(entries: &[String]) -> Result<Vec<Value>, String> {
     if entries.len() > MAX_PARAMS {
         return Err(format!("too many params; maximum params is {MAX_PARAMS}"));
@@ -2099,6 +2480,9 @@ fn split_index_value(entry: &str) -> Result<(usize, &str), String> {
 }
 
 fn parse_param_value(v: &str) -> Value {
+    if let Some(text) = v.strip_prefix("text:") {
+        return Value::String(text.to_string());
+    }
     if v == "null" {
         return Value::Null;
     }
@@ -2115,7 +2499,7 @@ fn parse_param_value(v: &str) -> Value {
 }
 
 fn wrap_explain_sql(user_sql: &str, analyze: bool) -> String {
-    let body = user_sql.trim_end_matches([';', ' ', '\n', '\t', '\r']);
+    let body = crate::db::trim_trailing_statement_terminators(user_sql);
     if analyze {
         format!("explain (analyze true, format json, buffers true) {body}")
     } else {

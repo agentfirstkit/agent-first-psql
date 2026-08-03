@@ -23,18 +23,7 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
         tx,
         crate::Capability::ReadWrite,
     ));
-    let opts = ResolvedOptions {
-        stream_rows: false,
-        batch_rows: 10,
-        batch_bytes: 1024,
-        statement_timeout_ms: 100,
-        lock_timeout_ms: 100,
-        read_only: false,
-        inline_max_rows: 100,
-        inline_max_bytes: 1000,
-    };
-
-    let status = emit_rows_result(
+    let trace = emit_rows_result(
         &app,
         Some("q_empty".to_string()),
         Some("default".to_string()),
@@ -42,10 +31,9 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
         vec![],
         InlineTruncation::default(),
         std::time::Instant::now(),
-        &opts,
     )
     .await;
-    assert!(matches!(status, RowEmitStatus::Sent { .. }));
+    assert_eq!(trace.row_count, Some(0));
     let out_opt = rx.recv().await;
     assert!(out_opt.is_some());
     if let Some(out) = out_opt {
@@ -57,7 +45,7 @@ async fn emit_rows_uses_db_columns_even_when_rows_empty() {
 }
 
 #[tokio::test]
-async fn emit_rows_result_paths() {
+async fn emit_rows_result_preserves_soft_truncation() {
     let (tx, mut rx) = mpsc::channel(64);
     let app = Arc::new(App::new(
         RuntimeConfig::default(),
@@ -65,51 +53,10 @@ async fn emit_rows_result_paths() {
         crate::Capability::ReadWrite,
     ));
 
-    let stream_opts = ResolvedOptions {
-        stream_rows: true,
-        batch_rows: 2,
-        batch_bytes: 1024,
-        statement_timeout_ms: 100,
-        lock_timeout_ms: 100,
-        read_only: false,
-        inline_max_rows: 100,
-        inline_max_bytes: 100000,
-    };
-    let status = emit_rows_result(
-        &app,
-        Some("q1".to_string()),
-        Some("default".to_string()),
-        vec![ColumnInfo {
-            name: "n".to_string(),
-            type_name: "int4".to_string(),
-        }],
-        vec![
-            serde_json::json!({"n":1}),
-            serde_json::json!({"n":2}),
-            serde_json::json!({"n":3}),
-        ],
-        InlineTruncation::default(),
-        std::time::Instant::now(),
-        &stream_opts,
-    )
-    .await;
-    assert!(matches!(status, RowEmitStatus::Sent { .. }));
-    while rx.try_recv().is_ok() {}
-
     // Soft-truncation case: emit_rows_result now passes the collector's
     // `truncated`/`truncated_at_rows` straight through; the inline cap is
     // enforced upstream in the row collector, not here.
-    let inline_opts = ResolvedOptions {
-        stream_rows: false,
-        batch_rows: 100,
-        batch_bytes: 1024,
-        statement_timeout_ms: 100,
-        lock_timeout_ms: 100,
-        read_only: false,
-        inline_max_rows: 1,
-        inline_max_bytes: 10000,
-    };
-    let status = emit_rows_result(
+    let trace = emit_rows_result(
         &app,
         Some("q2".to_string()),
         Some("default".to_string()),
@@ -124,10 +71,9 @@ async fn emit_rows_result_paths() {
             at_bytes: None,
         },
         std::time::Instant::now(),
-        &inline_opts,
     )
     .await;
-    assert!(matches!(status, RowEmitStatus::Sent { .. }));
+    assert_eq!(trace.row_count, Some(1));
     let event = rx.recv().await;
     let Some(Output::Result {
         truncated,
@@ -145,11 +91,15 @@ async fn emit_rows_result_paths() {
 
 struct MockExecutor {
     result: Mutex<Option<Result<ExecOutcome, ExecError>>>,
+    execute_count: AtomicU64,
+    explicit_tx_open: bool,
 }
 
 #[async_trait]
 impl DbExecutor for MockExecutor {
     async fn execute(&self, _req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
+        self.execute_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.result
             .lock()
             .await
@@ -166,6 +116,10 @@ impl DbExecutor for MockExecutor {
             columns: vec![],
         })
     }
+
+    async fn explicit_tx_open(&self, _session_name: &str) -> bool {
+        self.explicit_tx_open
+    }
 }
 
 fn test_app_with_executor(
@@ -179,6 +133,8 @@ fn test_app_with_executor(
         config: RwLock::new(cfg),
         executor: Arc::new(MockExecutor {
             result: Mutex::new(Some(result)),
+            execute_count: AtomicU64::new(0),
+            explicit_tx_open: false,
         }),
         writer: tx,
         in_flight: Mutex::new(std::collections::HashMap::new()),
@@ -186,6 +142,57 @@ fn test_app_with_executor(
         start_time: std::time::Instant::now(),
     });
     (app, rx)
+}
+
+#[tokio::test]
+async fn session_info_does_not_probe_inside_an_explicit_transaction() {
+    let cfg = RuntimeConfig::default();
+    let executor = Arc::new(MockExecutor {
+        result: Mutex::new(Some(Ok(ExecOutcome::Rows {
+            columns: vec![],
+            rows: vec![serde_json::json!({
+                "database": "must_not_be_read",
+                "user": "must_not_be_read"
+            })],
+            truncated: false,
+            truncated_at_rows: None,
+            truncated_at_bytes: None,
+        }))),
+        execute_count: AtomicU64::new(0),
+        explicit_tx_open: true,
+    });
+    let (tx, mut rx) = mpsc::channel(8);
+    let app = Arc::new(App {
+        capability: crate::Capability::ReadWrite,
+        locked_readonly_profile: std::sync::atomic::AtomicBool::new(false),
+        config: RwLock::new(cfg),
+        executor: executor.clone(),
+        writer: tx,
+        in_flight: Mutex::new(std::collections::HashMap::new()),
+        requests_total: AtomicU64::new(0),
+        start_time: std::time::Instant::now(),
+    });
+
+    handle_session_info(&app, Some("info".to_string()), None).await;
+
+    assert_eq!(
+        executor
+            .execute_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    let Some(Output::SessionInfo {
+        database,
+        user,
+        server_version,
+        ..
+    }) = rx.recv().await
+    else {
+        unreachable!("expected session_info")
+    };
+    assert_eq!(database, None);
+    assert_eq!(user, None);
+    assert_eq!(server_version, None);
 }
 
 #[tokio::test]
@@ -257,7 +264,7 @@ async fn session_info_reports_ssh_and_container_transports() {
         "via_container".to_string(),
         SessionConfig {
             container: ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             host: Some("127.0.0.1".to_string()),
@@ -336,7 +343,7 @@ async fn session_info_unknown_session_emits_invalid_request_with_hint() {
 }
 
 #[tokio::test]
-async fn execute_query_unknown_session_emits_connect_failed() {
+async fn execute_query_unknown_session_emits_invalid_request() {
     let cfg = RuntimeConfig {
         default_session: "missing".to_string(),
         ..Default::default()
@@ -357,7 +364,7 @@ async fn execute_query_unknown_session_emits_connect_failed() {
     if let Some(msg) = msg_opt {
         assert!(matches!(msg, Output::Error { .. }));
         if let Output::Error { error_code, .. } = msg {
-            assert_eq!(error_code, "connect_failed");
+            assert_eq!(error_code, "invalid_request");
         }
     }
 }
@@ -386,10 +393,6 @@ async fn execute_query_maps_executor_outcomes() {
             hint: Some("use sslmode=require".to_string()),
         }),
         Err(ExecError::InvalidParams("bad".to_string())),
-        Err(ExecError::ResultTooLarge {
-            row_count: 2,
-            payload_bytes: 200,
-        }),
         Err(ExecError::Sql {
             sqlstate: "22023".to_string(),
             message: "bad".to_string(),
@@ -412,6 +415,48 @@ async fn execute_query_maps_executor_outcomes() {
         .await;
         let msg_opt = rx.recv().await;
         assert!(msg_opt.is_some());
+    }
+}
+
+#[tokio::test]
+async fn execute_query_marks_transient_sqlstates_retryable() {
+    let cfg = RuntimeConfig::default();
+    for (sqlstate, expected) in [
+        ("40001", true),
+        ("40P01", true),
+        ("57014", true),
+        ("23505", false),
+    ] {
+        let (app, mut rx) = test_app_with_executor(
+            cfg.clone(),
+            Err(ExecError::Sql {
+                sqlstate: sqlstate.to_string(),
+                message: "database rejected statement".to_string(),
+                detail: None,
+                hint: None,
+                position: None,
+            }),
+        );
+        execute_query(
+            &app,
+            Some("q".to_string()),
+            Some("default".to_string()),
+            "select 1".to_string(),
+            vec![],
+            QueryOptions::default(),
+            None,
+        )
+        .await;
+        let Some(Output::SqlError {
+            retryable,
+            sqlstate: emitted,
+            ..
+        }) = rx.recv().await
+        else {
+            unreachable!("expected sql_error")
+        };
+        assert_eq!(emitted, sqlstate);
+        assert_eq!(retryable, expected, "{sqlstate}");
     }
 }
 
@@ -468,46 +513,6 @@ async fn execute_query_emits_structured_connect_error_details() {
                 .contains("--user postgres")
         );
         assert!(!retryable);
-    }
-}
-
-#[tokio::test]
-async fn execute_query_maps_executor_result_too_large() {
-    let mut cfg = RuntimeConfig::default();
-    cfg.sessions
-        .insert("default".to_string(), SessionConfig::default());
-    let (app, mut rx) = test_app_with_executor(
-        cfg,
-        Err(ExecError::ResultTooLarge {
-            row_count: 3,
-            payload_bytes: 300,
-        }),
-    );
-
-    execute_query(
-        &app,
-        Some("q1".to_string()),
-        Some("default".to_string()),
-        "select 1".to_string(),
-        vec![],
-        QueryOptions::default(),
-        None,
-    )
-    .await;
-
-    let msg_opt = rx.recv().await;
-    assert!(matches!(msg_opt, Some(Output::Error { .. })));
-    if let Some(Output::Error {
-        error_code,
-        retryable,
-        trace,
-        ..
-    }) = msg_opt
-    {
-        assert_eq!(error_code, "result_too_large");
-        assert!(!retryable);
-        assert_eq!(trace.row_count, Some(3));
-        assert_eq!(trace.payload_bytes, Some(300));
     }
 }
 
@@ -606,7 +611,7 @@ async fn execute_query_rejects_permission_mismatched_to_container_transport() {
         "default".to_string(),
         SessionConfig {
             container: ContainerConfig {
-                target: Some("pg".to_string()),
+                docker_name: Some("pg".to_string()),
                 ..Default::default()
             },
             ..Default::default()

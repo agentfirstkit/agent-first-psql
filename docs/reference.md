@@ -18,6 +18,9 @@ line is an Agent-First Data envelope tagged by a top-level `kind`; see
 
 This protocol is the only runtime interface.
 
+- the CLI is a closed `cli-spec-v1` registry: an invocation runs only when it
+  matches exactly one registered shape, there are no short flags, and a command
+  path comes before its arguments (`afpsql --docs` renders the whole registry)
 - `psql mode` is CLI argument translation only; runtime protocol is unchanged
 - no legacy text interpolation
 - no table/text output contract
@@ -48,7 +51,7 @@ a general local-process sandbox.
 | `skill status/install/uninstall` | allowed on the ordinary entrypoint |
 | `--stdout-file`, `--stderr-file`, local `--sql-file` | allowed on the ordinary entrypoint |
 | arbitrary explicit `--*-secret-env NAME` | allowed on the ordinary entrypoint |
-| `--*-secret-config FILE DOT_PATH` | allowed on the ordinary entrypoint |
+| `--*-secret-config FILE --*-secret-config-path DOT_PATH` | allowed on the ordinary entrypoint |
 | SSH options and custom container runtime | allowed on the ordinary entrypoint |
 | transaction control sent as query SQL | `invalid_request`; use typed pipe transaction requests |
 
@@ -121,14 +124,14 @@ Each secret slot has three mutually exclusive explicit sources:
 
 | Slot | Direct | Environment | Config file |
 |---|---|---|---|
-| DSN URI | `--dsn-secret` | `--dsn-secret-env NAME` | `--dsn-secret-config FILE DOT_PATH` |
-| libpq conninfo | `--conninfo-secret` | `--conninfo-secret-env NAME` | `--conninfo-secret-config FILE DOT_PATH` |
-| password | `--password-secret` | `--password-secret-env NAME` | `--password-secret-config FILE DOT_PATH` |
+| DSN URI | `--dsn` | `--dsn env:NAME` | `--dsn file:FILE#DOT_PATH` |
+| libpq conninfo | `--conninfo` | `--conninfo env:NAME` | `--conninfo file:FILE#DOT_PATH` |
+| password | `--password` | `--password env:NAME` | `--password file:FILE#DOT_PATH` |
 
 Config files may be JSON (`.json`), TOML (`.toml`), YAML (`.yaml`/`.yml`), or
-dotenv (`.env`, `.env.*`, `*.env`). The config argument requires two
-space-separated values; `--flag=FILE PATH` is rejected consistently by both
-canonical and psql-compatible parsers. The path must resolve to a non-empty
+dotenv (`.env`, `.env.*`, `*.env`). A config source is one typed argument
+containing both the file and dot path; malformed sources are refused consistently
+by both the canonical registry and the psql-compatible translator. The path must resolve to a non-empty
 string; the value is returned verbatim — never trimmed, coerced from another
 type, or URL-decoded, so percent-encode reserved characters in a DSN (`%40` for
 `@`). Note that a double-quoted dotenv value or a TOML basic `"..."` string still
@@ -201,7 +204,9 @@ Unsupported:
 
 CLI mapping notes:
 
-- `--param N=value` maps to this `params` array
+- `--param N=value` maps to this `params` array. Bare `null`, `true`, and
+  `false` bind JSON primitives; prefix with `text:` to bind those spellings as
+  literal strings (for example `--param 1=text:null`).
 - in `psql mode`, numeric `-v N=value` may be translated to `params[N]`
 
 ### `config`
@@ -231,57 +236,82 @@ Session connection shape supports:
 - `ssh`
 - `ssh_via`
 - `ssh_options`
-- `ssh_local_host`
-- `ssh_local_port`
 - `ssh_remote_socket`
 - `ssh_sudo_user`
-- `container`
-- `container_driver`
-- `container_runtime`
-- `container_user`
-- `container_namespace`
-- `container_context`
-- `container_compose_files`
-- `container_compose_project`
-- `container_pod_container`
+- `docker_name`
+- `docker_user`
+- `docker_context`
+- `docker_runtime`
+- `podman_name`
+- `podman_user`
+- `podman_runtime`
+- `nerdctl_name`
+- `nerdctl_user`
+- `nerdctl_runtime`
+- `compose_service`
+- `compose_user`
+- `compose_files`
+- `compose_project`
+- `compose_runtime`
+- `kubectl_pod`
+- `kubectl_container`
+- `kubectl_namespace`
+- `kubectl_context`
+- `kubectl_runtime`
+
+`session_info` is ordered through the named session's FIFO. While an explicit
+transaction is open it reports configured defaults without probing PostgreSQL,
+so identity fields may be null; this avoids adding savepoints or otherwise
+mutating the caller's transaction.
 
 Supported TLS settings supplied in `dsn_secret` or `conninfo_secret` are
 honored. afpsql currently accepts `sslmode=disable/prefer/require`; unsupported
 libpq TLS modes/options such as `verify-ca`, `verify-full`, `sslrootcert`,
 `sslcert`, and `sslkey` fail with structured errors and hints.
 
-SSH transport fields start a local OpenSSH tunnel or Unix-socket bridge before
+SSH transport fields start an OpenSSH stdio bridge before
 connecting. SSH accepts `dsn_secret`, `conninfo_secret`, or discrete connection
 fields. afpsql parses DSN/conninfo locally, interprets its PostgreSQL endpoint
 from the final SSH host, and preserves authentication, database, startup-option,
-and supported TLS settings when connecting through the tunnel. The source must
+and supported TLS settings when connecting through the bridge. The source must
 resolve to one PostgreSQL host and port; multi-host failover lists return a
 structured non-retryable connection error.
 
-Container transport fields start a no-TTY exec bridge through the selected
-driver (`docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a small
-stdio bridge inside the container. The PostgreSQL host/port or Unix socket is
+The bridge is carried over the `ssh` child process's stdin/stdout, so afpsql
+opens no local listening port and no other process on the workstation can reach
+the connection. In exchange, the host running the bridge needs `sh` plus one of
+`python3`, `python`, or `perl` — any one is enough, and they are tried in that
+order. A host with none of them fails with exit 127 and a message naming all
+three. For `--ssh-via` chains the bridge runs on the final `--ssh` host, and
+only that host needs an interpreter.
+
+Container transport fields start a no-TTY exec bridge through one driver
+(`docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a small stdio
+bridge inside the container. The PostgreSQL host/port or Unix socket is
 interpreted inside the container. Container transport can use `dsn_secret`,
 `conninfo_secret`, or discrete connection fields and likewise requires one
 PostgreSQL endpoint.
 
-Container driver scope is configured with named fields, not raw argv
-passthrough: `container_context` applies to Docker and kubectl,
-`container_namespace` applies to kubectl, and `container_compose_files` /
-`container_compose_project` apply to Compose. `container_pod_container` applies
-to kubectl multi-container pods and is emitted as `-c CTR` before `--`.
-`AFPSQL_CONTAINER_COMPOSE_FILE` may supply colon-separated Compose files when no
-`container_compose_files` are configured.
+The driver is not named separately: it is the family of fields used. Each field
+is scoped to one driver by its own name, so a driver cannot be asked for an
+option it does not have — there is no `kubectl_user` because `kubectl exec` has
+no exec-as-user option, and no `podman_context` because Podman selects no
+context. `kubectl_container` picks one container in a multi-container pod and is
+emitted as `-c CTR` before `--`. `AFPSQL_CONTAINER_COMPOSE_FILE` may supply
+colon-separated Compose files when no `compose_files` are configured.
 
-When both `ssh` and `container` are set, afpsql uses SSH to run the container
-exec command on the remote host, then bridges from inside the container. In this
-combined mode, only `ssh` and `ssh_options` apply; SSH tunnel and sudo bridge
-fields are for non-container SSH transport. The permission family remains
-container (`container-read` / `container-write`).
+Fields from two families cannot be combined: two families name two drivers, so
+the session is rejected with an error naming both offending fields.
+
+When a driver family is combined with `ssh`, afpsql uses SSH to run the
+container exec command on the remote host, then bridges from inside the
+container. In this combined mode, only `ssh` and `ssh_options` apply; SSH socket
+and sudo bridge fields are for non-container SSH transport. The permission family
+remains container (`container-read` / `container-write`).
 
 CLI translation notes:
 
-- agent-first mode uses direct agent-first flags (`--dsn-secret`, `--host`, ...)
+- agent-first mode uses direct agent-first flags (`--dsn`, `--host`, ...)
 - `psql mode` may translate legacy flags (`-h`, `-p`, `-U`, `-d`, `-c`, `-f`)
   into these same canonical fields
 - `psql mode` does not expose afpsql permission flags and preserves psql's
@@ -351,8 +381,8 @@ events on the same session run inside the open transaction until a matching
 | `code` | yes | `"begin"`, `"commit"`, or `"rollback"` |
 | `id` | no | client correlation id, echoed on the response |
 | `session` | no | session id; default session if omitted |
-| `read_only` | no, `begin` only | when `true`, send `BEGIN READ ONLY` |
-| `permission` | no, `begin` only | required when `read_only:false` on a session whose default permission is read; `write` / `ssh-write` / `container-write` |
+| `read_only` | no, `begin` only | defaults to `true`; set explicitly to `false` for a read-write transaction |
+| `permission` | no, `begin` only | required when `read_only:false`; use the matching `write` / `ssh-write` / `container-write` permission |
 
 The response is a `code:"result"` event with `command_tag` set to `"BEGIN"`,
 `"COMMIT"`, or `"ROLLBACK"`. Failures (e.g. `begin` while already in a tx,
@@ -364,6 +394,11 @@ and rolled back individually, so the user's outer transaction is NOT
 aborted by a single bad query — the agent can retry or move on without
 losing prior progress. Send `rollback` to discard the whole transaction or
 `commit` to persist the work done so far.
+
+Every query inside a read-write explicit transaction must repeat the matching
+write permission. A query that declares a read permission is rejected before
+SQL execution. A read-only explicit transaction remains enforced by
+PostgreSQL, including when a query supplies a write permission.
 
 Tx control runs through the same session FIFO as `query`, so the order an
 agent writes events to stdin is the order PostgreSQL sees them.
@@ -414,6 +449,13 @@ When `truncated: true`, the underlying SQL still executed in full. For
 `UPDATE ... RETURNING`, this means the writes happened and the RETURNING
 projection delivered to the agent is the first N rows. To collect the
 full result, narrow the query with `WHERE` or switch to `--stream-rows`.
+
+Bounded row results are produced through a CTE/JSON wrapper. PostgreSQL does
+not guarantee that an outer read preserves ordering established only inside
+that CTE, so callers must not treat the returned prefix as a contractual
+ordered prefix—even when the submitted query contains `ORDER BY`. If exact
+ordering is part of correctness, return an explicit ordinal/key and sort or
+verify the rows in the caller.
 
 ### `result_start`
 
@@ -505,8 +547,18 @@ Canonical `error.code` values:
 - `invalid_request`
 - `invalid_params`
 - `connect_failed`
-- `result_too_large`
 - `cancelled`
+- `internal_error`
+
+`internal_error` means the failure is `afpsql`'s own, not the request's and not
+PostgreSQL's; the hint asks the caller to retry and then restart the session.
+Treat it as a bug report, not as something to work around.
+
+An invocation rejected before anything ran carries the parser's own
+classification instead, always on stderr and always exiting 2:
+`cli_unknown_command`, `cli_unknown_argument`, `cli_unregistered_combination`,
+`cli_missing_argument_value`, `cli_invalid_argument_value`,
+`cli_duplicate_argument`, `cli_unexpected_positional`, `cli_invalid_utf8`.
 
 For connection setup failures, `kind` remains `"error"` and `error.code` remains
 `"connect_failed"`. If PostgreSQL returns a server diagnostic during startup
@@ -612,6 +664,36 @@ Optional runtime fallback variables:
 - `AFPSQL_USER`
 - `AFPSQL_DBNAME`
 - `AFPSQL_PASSWORD_SECRET`
+- `AFPSQL_SSH`
+- `AFPSQL_SSH_VIA`
+- `AFPSQL_SSH_REMOTE_SOCKET`
+- `AFPSQL_SSH_SUDO_USER`
+- `AFPSQL_CONTAINER_DOCKER_NAME`
+- `AFPSQL_CONTAINER_DOCKER_USER`
+- `AFPSQL_CONTAINER_DOCKER_CONTEXT`
+- `AFPSQL_CONTAINER_DOCKER_RUNTIME`
+- `AFPSQL_CONTAINER_PODMAN_NAME`
+- `AFPSQL_CONTAINER_PODMAN_USER`
+- `AFPSQL_CONTAINER_PODMAN_RUNTIME`
+- `AFPSQL_CONTAINER_NERDCTL_NAME`
+- `AFPSQL_CONTAINER_NERDCTL_USER`
+- `AFPSQL_CONTAINER_NERDCTL_RUNTIME`
+- `AFPSQL_CONTAINER_COMPOSE_SERVICE`
+- `AFPSQL_CONTAINER_COMPOSE_USER`
+- `AFPSQL_CONTAINER_COMPOSE_FILE` (colon-separated)
+- `AFPSQL_CONTAINER_COMPOSE_PROJECT`
+- `AFPSQL_CONTAINER_COMPOSE_RUNTIME`
+- `AFPSQL_CONTAINER_KUBECTL_POD`
+- `AFPSQL_CONTAINER_KUBECTL_CONTAINER`
+- `AFPSQL_CONTAINER_KUBECTL_NAMESPACE`
+- `AFPSQL_CONTAINER_KUBECTL_CONTEXT`
+- `AFPSQL_CONTAINER_KUBECTL_RUNTIME`
+
+Variables from two driver families are rejected the same way flags from two
+families are: they name two drivers.
+
+Administrator-locked readonly profiles ignore every connection, SSH, and
+container environment fallback.
 
 Standard PostgreSQL environment fallback (lower precedence):
 

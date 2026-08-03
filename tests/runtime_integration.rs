@@ -32,7 +32,7 @@ fn unique_suffix() -> String {
 
 fn run_write_sql(sql: &str) -> std::process::Output {
     Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -60,7 +60,7 @@ fn split_error_event(output: &std::process::Output) -> Value {
 #[test]
 fn cli_closes_backend_connection_before_exit() {
     let first = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select pg_backend_pid() as pid")
@@ -78,7 +78,7 @@ fn cli_closes_backend_connection_before_exit() {
         .expect("backend pid");
 
     let check = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select count(*)::int as n from pg_stat_activity where pid = $1::int")
@@ -103,7 +103,7 @@ fn cli_closes_backend_connection_before_exit() {
 #[test]
 fn cli_invalid_param_count_returns_error() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select $1::int")
@@ -123,7 +123,7 @@ fn cli_invalid_param_count_returns_error() {
 #[test]
 fn cli_inline_max_rows_soft_truncates() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select x from generate_series(1,5) as x")
@@ -162,7 +162,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
         format!("insert into {table}(id) select x from generate_series(1,3) as x"),
     ] {
         let out = Command::new(bin())
-            .arg("--dsn-secret")
+            .arg("--dsn")
             .arg(test_dsn())
             .arg("--permission")
             .arg("write")
@@ -180,7 +180,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
     let update_sql =
         format!("update {table} set touched = true returning id, repeat('x', 16) as payload");
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -204,7 +204,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
 
     let check_sql = format!("select count(*)::int as n from {table} where touched");
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg(check_sql)
@@ -219,7 +219,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
     assert_eq!(v["result"]["rows"][0]["n"], 3);
 
     let _ = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -235,7 +235,7 @@ fn cli_returning_truncation_completes_update_but_caps_rows() {
 #[test]
 fn cli_default_permission_rejects_write() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("create temp table afpsql_ro_test(n int)")
@@ -256,7 +256,7 @@ fn cli_default_permission_rejects_write() {
 #[test]
 fn cli_statement_timeout_triggers_sql_error() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select pg_sleep(0.20)")
@@ -269,6 +269,8 @@ fn cli_statement_timeout_triggers_sql_error() {
     let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
     assert_eq!(v["error"]["code"], "sql_error");
+    assert_eq!(v["error"]["sqlstate"], "57014");
+    assert_eq!(v["error"]["retryable"], true);
 }
 
 #[cfg_attr(
@@ -288,7 +290,7 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .env_remove("AFPSQL_DSN_SECRET")
         .env_remove("AFPSQL_CONNINFO_SECRET")
@@ -321,7 +323,7 @@ fn pipe_handles_parse_error_cancel_ping_and_close() {
 #[test]
 fn cli_bytea_decodes_as_hex_string() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select '\\x48656c6c6f'::bytea as b")
@@ -343,7 +345,7 @@ fn cli_bytea_decodes_as_hex_string() {
 #[test]
 fn cli_text_array_decodes_as_json_array() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select array['a','b',null]::text[] as items")
@@ -365,15 +367,101 @@ fn cli_text_array_decodes_as_json_array() {
     ignore = "requires PostgreSQL test database"
 )]
 #[test]
+fn encoding_fallback_is_observable_and_never_executes_returning_twice() {
+    let table = format!("afpsql_fallback_once_{}", unique_suffix());
+    let run_write_logging = |sql: &str, log_filter: Option<&str>| {
+        let mut command = Command::new(bin());
+        command
+            .arg("--dsn")
+            .arg(test_dsn())
+            .arg("--permission")
+            .arg("write");
+        if let Some(filter) = log_filter {
+            command.arg("--log").arg(filter);
+        }
+        command
+            .arg("--sql")
+            .arg(sql)
+            .output()
+            .expect("run afpsql write")
+    };
+    let run_write = |sql: &str| run_write_logging(sql, Some("query.row_encoding_degraded"));
+
+    let create = run_write(&format!("create table {table}(n int)"));
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let explain = run_write(&format!(
+        "explain analyze insert into {table} values (1) returning n"
+    ));
+    assert!(
+        explain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&explain.stderr)
+            .contains("\"event\":\"query.row_encoding_degraded\""),
+        "fallback log missing: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+
+    let count = Command::new(bin())
+        .arg("--dsn")
+        .arg(test_dsn())
+        .arg("--sql")
+        .arg(format!("select count(*)::int as count from {table}"))
+        .output()
+        .expect("count fallback writes");
+    assert!(
+        count.status.success(),
+        "{}",
+        String::from_utf8_lossy(&count.stderr)
+    );
+    let count_event: Value = serde_json::from_slice(&count.stdout).expect("count event");
+    assert_eq!(count_event["result"]["rows"][0]["count"], 1);
+
+    // The notice is a log event, so it must honor --log like every other one:
+    // a caller that asked for no logs must not get one injected. `explain`
+    // triggers the same wrap failure without writing.
+    let unlogged = run_write_logging("explain select 1", None);
+    assert!(
+        unlogged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unlogged.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&unlogged.stderr).contains("query.row_encoding_degraded"),
+        "degraded event ignored the log filter: {}",
+        String::from_utf8_lossy(&unlogged.stderr)
+    );
+
+    let drop_table = run_write(&format!("drop table {table}"));
+    assert!(
+        drop_table.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drop_table.stderr)
+    );
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
 fn cli_explain_returns_plan_json() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select 1 as one")
         .arg("--explain")
+        .arg("plan")
         .output()
-        .expect("run afpsql --explain");
+        .expect("run afpsql --explain plan");
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -392,13 +480,14 @@ fn cli_explain_returns_plan_json() {
 #[test]
 fn cli_explain_analyze_reports_actual_timing() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select 1 as one")
-        .arg("--explain-analyze")
+        .arg("--explain")
+        .arg("analyze")
         .output()
-        .expect("run afpsql --explain-analyze");
+        .expect("run afpsql --explain analyze");
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -419,7 +508,7 @@ fn cli_explain_analyze_reports_actual_timing() {
 #[test]
 fn pipe_explicit_tx_commit_persists_changes() {
     let table = format!("afpsql_pipe_tx_{}", unique_suffix());
-    let payload = serde_json::json!({"code":"begin","id":"b","permission":"write"}).to_string()
+    let payload = serde_json::json!({"code":"begin","id":"b","read_only":false,"permission":"write"}).to_string()
         + "\n"
         + &serde_json::json!({"code":"query","id":"create","sql":format!("create table {table}(n int)"),"options":{"permission":"write"}}).to_string()
         + "\n"
@@ -437,7 +526,7 @@ fn pipe_explicit_tx_commit_persists_changes() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -473,7 +562,7 @@ fn pipe_explicit_tx_commit_persists_changes() {
 #[test]
 fn pipe_explicit_tx_rollback_discards_changes() {
     let table = format!("afpsql_pipe_rb_{}", unique_suffix());
-    let payload = serde_json::json!({"code":"begin","id":"b","permission":"write"}).to_string()
+    let payload = serde_json::json!({"code":"begin","id":"b","read_only":false,"permission":"write"}).to_string()
         + "\n"
         + &serde_json::json!({"code":"query","id":"create","sql":format!("create table {table}(n int)"),"options":{"permission":"write"}}).to_string()
         + "\n"
@@ -487,7 +576,7 @@ fn pipe_explicit_tx_rollback_discards_changes() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -541,7 +630,7 @@ fn pipe_explicit_tx_savepoint_isolates_failed_query() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -575,12 +664,147 @@ fn pipe_explicit_tx_savepoint_isolates_failed_query() {
     ignore = "requires PostgreSQL test database"
 )]
 #[test]
+fn pipe_explicit_tx_enforces_permission_on_begin_and_each_query() {
+    let payload = serde_json::json!({
+        "code":"begin",
+        "id":"bad_begin",
+        "read_only":false,
+        "permission":"read"
+    })
+    .to_string()
+        + "\n"
+        + &serde_json::json!({
+            "code":"begin",
+            "id":"begin",
+            "read_only":false,
+            "permission":"write"
+        })
+        .to_string()
+        + "\n"
+        + &serde_json::json!({
+            "code":"query",
+            "id":"bad_query",
+            "sql":"select 1 as value"
+        })
+        .to_string()
+        + "\n"
+        + &serde_json::json!({
+            "code":"query",
+            "id":"good_query",
+            "sql":"select 1 as value",
+            "options":{"permission":"write"}
+        })
+        .to_string()
+        + "\n"
+        + &serde_json::json!({"code":"rollback","id":"rollback"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let events: Vec<Value> = String::from_utf8(out.stdout)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event"))
+        .collect();
+    let event = |id: &str| {
+        events
+            .iter()
+            .find(|event| event["result"]["id"] == id || event["error"]["id"] == id)
+            .unwrap_or_else(|| panic!("missing event for {id}: {events:?}"))
+    };
+    assert_eq!(event("bad_begin")["error"]["code"], "invalid_request");
+    assert_eq!(event("begin")["result"]["command_tag"], "BEGIN");
+    assert_eq!(event("bad_query")["error"]["code"], "invalid_request");
+    assert_eq!(event("good_query")["result"]["rows"][0]["value"], 1);
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn pipe_explicit_tx_preserves_postgres_json_types_with_trailing_semicolon() {
+    let payload = serde_json::json!({"code":"begin","id":"begin"}).to_string()
+        + "\n"
+        + &serde_json::json!({
+            "code":"query",
+            "id":"typed",
+            "sql":"select 12.34::numeric as amount, '2026-07-31 10:00:00+00'::timestamptz as created_at, '123e4567-e89b-12d3-a456-426614174000'::uuid as id;"
+        })
+        .to_string()
+        + "\n"
+        + &serde_json::json!({"code":"rollback","id":"rollback"}).to_string()
+        + "\n"
+        + &serde_json::json!({"code":"close"}).to_string()
+        + "\n";
+
+    let mut child = Command::new(bin())
+        .arg("--mode")
+        .arg("pipe")
+        .arg("--dsn")
+        .arg(test_dsn())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn afpsql");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let typed: Value = String::from_utf8(out.stdout)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event"))
+        .find(|event| event["result"]["id"] == "typed")
+        .expect("typed result");
+    let row = &typed["result"]["rows"][0];
+    assert_eq!(row["amount"], serde_json::json!(12.34));
+    assert_eq!(row["created_at"], "2026-07-31T10:00:00+00:00");
+    assert_eq!(row["id"], "123e4567-e89b-12d3-a456-426614174000");
+}
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
 fn cli_inspect_schemas_lists_public() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("schemas")
+        .arg("--dsn")
+        .arg(test_dsn())
         .output()
         .expect("run afpsql inspect schemas");
     assert!(
@@ -602,10 +826,10 @@ fn cli_inspect_schemas_lists_public() {
 #[test]
 fn cli_inspect_database_summarizes_connected_db() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("database")
+        .arg("--dsn")
+        .arg(test_dsn())
         .output()
         .expect("run afpsql inspect database");
     assert!(
@@ -638,10 +862,10 @@ fn cli_inspect_database_summarizes_connected_db() {
 #[test]
 fn cli_inspect_databases_includes_size_and_encoding() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("databases")
+        .arg("--dsn")
+        .arg(test_dsn())
         .output()
         .expect("run afpsql inspect databases");
     assert!(
@@ -675,7 +899,7 @@ fn cli_inspect_table_describes_columns() {
     let drop = format!("drop table if exists {table}");
 
     let setup = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -690,15 +914,15 @@ fn cli_inspect_table_describes_columns() {
     );
 
     let out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("table")
+        .arg("--dsn")
+        .arg(test_dsn())
         .arg(&table)
         .output()
         .expect("run afpsql inspect table");
     let _ = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -768,10 +992,10 @@ fn cli_inspect_schema_table_full_and_index_stats_export_metadata() {
     }
 
     let schema_out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("schema")
+        .arg("--dsn")
+        .arg(test_dsn())
         .arg("--schema")
         .arg(&schema)
         .arg("--like")
@@ -779,19 +1003,19 @@ fn cli_inspect_schema_table_full_and_index_stats_export_metadata() {
         .output()
         .expect("run afpsql inspect schema");
     let table_full_out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("table")
+        .arg("--dsn")
+        .arg(test_dsn())
         .arg(format!("{schema}.child"))
         .arg("--full")
         .output()
         .expect("run afpsql inspect table --full");
     let indexes_out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("indexes")
+        .arg("--dsn")
+        .arg(test_dsn())
         .arg("--schema")
         .arg(&schema)
         .arg("--table")
@@ -875,7 +1099,7 @@ fn cli_inspect_tables_filters_by_schema_and_pattern() {
     let drop = format!("drop table if exists {table}");
 
     let setup = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -890,10 +1114,10 @@ fn cli_inspect_tables_filters_by_schema_and_pattern() {
     );
 
     let out = Command::new(bin())
-        .arg("--dsn-secret")
-        .arg(test_dsn())
         .arg("inspect")
         .arg("tables")
+        .arg("--dsn")
+        .arg(test_dsn())
         .arg("--schema")
         .arg("public")
         .arg("--like")
@@ -901,7 +1125,7 @@ fn cli_inspect_tables_filters_by_schema_and_pattern() {
         .output()
         .expect("run afpsql inspect tables");
     let _ = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--permission")
         .arg("write")
@@ -925,7 +1149,7 @@ fn cli_inspect_tables_filters_by_schema_and_pattern() {
 #[test]
 fn cli_dry_run_reports_param_types_and_columns() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select $1::int4 as n, $2::text as t")
@@ -957,7 +1181,7 @@ fn cli_dry_run_reports_param_types_and_columns() {
 #[test]
 fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select * from this_table_does_not_exist_xyz")
@@ -978,7 +1202,7 @@ fn cli_dry_run_surfaces_unknown_table_via_sql_error() {
 #[test]
 fn cli_param_preserves_string_form_for_text_column() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select $1::text as raw")
@@ -1004,7 +1228,7 @@ fn cli_numeric_param_preserves_precision() {
     // Cast result to text to bypass JSON-number precision limits; the goal is
     // to verify the bind path sent the literal to PG without f64 rounding.
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select ($1::numeric(40,20))::text as n")
@@ -1038,7 +1262,7 @@ fn pipe_session_info_reports_connection_identity() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1082,7 +1306,9 @@ fn cli_invalid_output_returns_exit_2() {
     assert_eq!(out.status.code(), Some(2));
     let v = split_error_event(&out);
     assert_eq!(v["kind"], "error");
-    assert_eq!(v["error"]["code"], "invalid_request");
+    // The format set is part of the shape's output contract, so an unlisted
+    // value is an invalid argument value, not a generic bad request.
+    assert_eq!(v["error"]["code"], "cli_invalid_argument_value");
 }
 
 #[cfg_attr(
@@ -1092,7 +1318,7 @@ fn cli_invalid_output_returns_exit_2() {
 #[test]
 fn cli_yaml_output_mode() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select 1 as n")
@@ -1112,7 +1338,7 @@ fn cli_yaml_output_mode() {
 #[test]
 fn cli_plain_output_mode() {
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg("select 1 as n")
@@ -1144,7 +1370,7 @@ fn pipe_query_then_close_timeout_path() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1193,7 +1419,7 @@ fn pipe_config_and_cancel_existing_query() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1270,7 +1496,7 @@ fn pipe_session_preserves_temp_table_across_queries() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1322,7 +1548,7 @@ fn pipe_same_session_queries_are_fifo() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1393,7 +1619,7 @@ fn pipe_cancel_queued_query_prevents_execution() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1430,7 +1656,7 @@ fn pipe_config_update_switches_session_connection() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1509,7 +1735,7 @@ fn pipe_config_patch_can_clear_dsn_secret() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1596,7 +1822,7 @@ fn pipe_cancel_after_query_finished_returns_invalid_request() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1675,7 +1901,7 @@ fn pipe_cancel_race_and_long_query() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1730,7 +1956,7 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1756,7 +1982,7 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     let mut saw_active = false;
     for _ in 0..50 {
         let out = Command::new(bin())
-            .arg("--dsn-secret")
+            .arg("--dsn")
             .arg(test_dsn())
             .arg("--sql")
             .arg(&activity_sql)
@@ -1793,7 +2019,7 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     );
 
     let out = Command::new(bin())
-        .arg("--dsn-secret")
+        .arg("--dsn")
         .arg(test_dsn())
         .arg("--sql")
         .arg(&activity_sql)
