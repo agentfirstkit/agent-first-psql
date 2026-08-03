@@ -62,6 +62,20 @@ expect_invalid_request "custom container runtime" --container-docker-name invali
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
+
+# Under Git Bash the binary is a native Windows executable, but `mktemp` hands
+# back an MSYS path (`/tmp/...`) that it cannot resolve. Paths the shell uses
+# for its own reads and writes stay as they are; paths handed to the binary go
+# through this. Without it the file-backed checks below never open their file
+# and pass for the wrong reason — a "not found" is still a non-zero exit and
+# still contains no secret.
+host_path() {
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW* | MSYS* | CYGWIN* | *NT*) cygpath -m "$1" ;;
+  *) printf '%s' "$1" ;;
+  esac
+}
+
 sql_path="$tmp_dir/query.sql"
 printf '%s\n' 'select 1' >"$sql_path"
 
@@ -112,12 +126,13 @@ MINGW* | MSYS* | CYGWIN* | *NT*)
   ;;
 esac
 
-expect_runtime_failure "local SQL file" --sql-file "$sql_path"
+expect_runtime_failure "local SQL file" --sql-file "$(host_path "$sql_path")"
 
 config_path="$tmp_dir/config.env"
+config_source="file:$(host_path "$config_path")#DATABASE_URL"
 canary="AFPSQL_RELEASE_SMOKE_SECRET_CANARY"
 printf '%s\n' "DATABASE_URL=postgresql://user:$canary@127.0.0.1:1/db" >"$config_path"
-run_readonly --dsn file:"$config_path"#DATABASE_URL \
+run_readonly --dsn "$config_source" \
   --sql 'select 1'
 if [ "$STATUS" -eq 0 ]; then
   echo "readonly config secret smoke unexpectedly succeeded" >&2
@@ -130,7 +145,7 @@ if grep -q "$canary" <<<"$OUT" || grep -q "$canary" <<<"$ERR"; then
   exit 1
 fi
 expect_invalid_request "config-backed write permission" \
-  --dsn file:"$config_path"#DATABASE_URL \
+  --dsn "$config_source" \
   --permission write --sql "select 1"
 
 # A structural rejection names its own rule, so the smoke also proves the parser

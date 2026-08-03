@@ -20,7 +20,7 @@
     "Carry SSH transport entirely over the ssh child process's stdio bridge, removing the local TCP listener so no other process on the workstation can reach the connection, and keep the bridge source valid on Python 2 where socket errors are not OSError",
     "Restore the row-encoding fallback on the explicit-transaction paths so EXPLAIN and SHOW run again, and report the narrower decoder as a structured query.row_encoding_degraded log event instead of a Rust Debug dump, starting the streaming sink only once the wrapper is known usable",
     "Bind bare null, true, and false --param values as JSON primitives, with a text: prefix to force the literal string",
-    "Run the release gate itself in CI with the container end-to-end suite folded into all, and make that suite fail rather than report green when its environment is unset",
+    "Run the release gate itself in CI with the container end-to-end suite folded into all, and fix the release smoke script handing MSYS paths to a native Windows binary, which failed the write-permission assertion and made the SQL-file and secret-canary checks pass without opening their files",
     "Upgrade to agent-first-data 0.29.2 with default features off and only the needed document formats enabled, routing raw help and docs output through afdata's write_raw"
   ],
   "bonds": [
