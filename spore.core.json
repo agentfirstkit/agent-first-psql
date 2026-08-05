@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,20 +13,16 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Compile the CLI from a closed-world registry of 17 commands and 23 shapes, so an invocation runs only when it matches one registered shape and illegal argument mixes become parse-time errors: connection arguments are no longer globals, arguments must follow their subcommand, --explain takes a plan|analyze value, and every rejection carries a typed cli_* error code",
-    "Replace the nine --*-secret[-env|-config] flags with three typed source arguments --dsn, --conninfo, and --password, each accepting a literal, env:NAME, file:PATH#DOT_PATH, or literal:VALUE, so a malformed source is refused rather than partially interpreted",
-    "Close the pipe-mode write hole: begin now asserts a write-family permission, read_only defaults to true, and every query inside a read-write transaction must repeat the write permission, where previously three JSONL lines with no permission field could delete rows",
-    "Scope container transport flags to one flag per (driver, option) pair, retiring --container and --container-driver along with the runtime compatibility matrix, so an option a driver does not have cannot be written and two driver families are rejected by name",
-    "Carry SSH transport entirely over the ssh child process's stdio bridge, removing the local TCP listener so no other process on the workstation can reach the connection, and keep the bridge source valid on Python 2 where socket errors are not OSError",
-    "Restore the row-encoding fallback on the explicit-transaction paths so EXPLAIN and SHOW run again, and report the narrower decoder as a structured query.row_encoding_degraded log event instead of a Rust Debug dump, starting the streaming sink only once the wrapper is known usable",
-    "Bind bare null, true, and false --param values as JSON primitives, with a text: prefix to force the literal string",
-    "Run the release gate itself in CI with the container end-to-end suite folded into all, and fix the release smoke script handing MSYS paths to a native Windows binary, which failed the write-permission assertion and made the SQL-file and secret-canary checks pass without opening their files",
-    "Upgrade to agent-first-data 0.29.2 with default features off and only the needed document formats enabled, routing raw help and docs output through afdata's write_raw"
+    "Upgrade to agent-first-data 0.31.0 and dispatch each resolved invocation through the handler bound to its own shape, so no second action lookup can disagree with what resolution matched",
+    "Add a test that drives all 23 registered shapes through their handlers with strict argument reads, so a handler asking for an argument id its shape never declares is named by the test suite instead of reading as an empty string in production",
+    "Report the tool misreading its own resolved invocation as cli_invocation_invalid at exit 1, naming the combination and argument id rather than continuing with an empty string that looks like a value the caller passed",
+    "Report an output sink that cannot be established as output_setup_failed at exit 1, matching afhttp and afpay, instead of invalid_request at exit 2, which claimed the command line was malformed and invited a retry that lands in the same place",
+    "Classify an unregistered short-form token as an unknown short argument instead of quoting it back, so a psql-style -d<DSN> typo can no longer echo its inline password into a logged error event"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.DybgBCZQ6YRTrjjif59swyURbRsA47mnfM3hyc37KMR7",
+      "uri": "cmn://agentfirstkit.com/b3.7Kf6i6HNpFxooXKQTCzfugkqq89rPCuM1mekg8hsKAQC",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

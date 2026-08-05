@@ -139,12 +139,11 @@ fn canonical_mode_rejects_psql_compatibility_shorts() {
             .expect("run afpsql compatibility short");
         assert_eq!(out.status.code(), Some(2));
         let value = split_error_event(&out);
-        // Not a rejected alias — the registry has no short syntax at all.
+        // Not a rejected alias — the registry has no short syntax at all. The
+        // rejection classifies the token without quoting it back, so
+        // `error.code` and the hint are what the caller acts on.
         assert_eq!(value["error"]["code"], "cli_unknown_argument");
-        assert_eq!(
-            value["error"]["message"],
-            format!("unknown argument `{short}`")
-        );
+        assert_eq!(value["error"]["message"], "unknown short argument");
     }
 }
 

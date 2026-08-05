@@ -1,4 +1,7 @@
 use super::*;
+// The unbound registry still resolves to `CliOutcome`; most of this file
+// checks shapes, which needs no handler binding.
+use agent_first_data::CliOutcome;
 
 fn raw_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
@@ -722,6 +725,21 @@ fn top_level_mode_scan_ignores_option_values() {
         "--bin-dir",
         "--mode=psql",
     ])));
+}
+
+/// Every declared shape, run through its own handler with strict argument
+/// reads: a handler that asks for an argument id its shape cannot supply names
+/// itself here rather than silently degrading to an empty string in production.
+///
+/// Safe to run because these handlers only project — none of them opens a
+/// connection, and the query they build is never sent.
+#[test]
+fn every_combination_reads_only_ids_its_shape_declares() {
+    let app = match registry().bind_actions(actions()) {
+        Ok(app) => app,
+        Err(error) => panic!("handlers must cover every action: {error}"),
+    };
+    app.call_every_combination();
 }
 
 #[test]

@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "agent-first-data"
-version = "0.29.2"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb898e1e060a49b18523d0f491b7845cca90a8b6d59f9f98177759869b675b79"
+checksum = "b098d164f5e06271dd65f990ff73d483a9f4f2f98b612abb0c8776492242c94a"
 dependencies = [
  "chrono",
  "libc",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-first-psql"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "agent-first-data",
  "async-trait",
@@ -528,9 +528,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libredox"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
+checksum = "2026a5056764a10b2bf5d56488cba40da507f5493a6a429340e2004d9ed085fa"
 dependencies = [
  "libc",
 ]

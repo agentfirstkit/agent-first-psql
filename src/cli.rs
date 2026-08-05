@@ -4,7 +4,7 @@ use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
 use crate::secret_config::{SecretConfigRef, resolve_config_secret};
 use crate::types::{ContainerConfig, Permission, QueryOptions, SessionConfig, SshConfig};
 use agent_first_data::{
-    ArgSpec, BuiltCliSpec, CliOutcome, CliSpec, CliSpecError, CliValue, Combination, CommandSpec,
+    ArgSpec, BoundOutcome, BuiltCliSpec, CliSpec, CliSpecError, CliValue, Combination, CommandSpec,
     LogFilters, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation,
     build_afdata_cli, cli_parse_log_filters, cli_parse_output,
 };
@@ -889,7 +889,7 @@ pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
     // branch agree on what `--mode psql` alone means.
     if is_psql_mode_requested(&raw) {
         let (mode, routing) = parse_psql_mode_full(&raw)?;
-        let redirect = install_redirect(routing.stdout_file, routing.stderr_file)?;
+        let redirect = install_redirect(routing.stdout_file, routing.stderr_file);
         crate::emit::set_output_to(routing.output_to);
         return Ok(Parsed { mode, redirect });
     }
@@ -906,16 +906,18 @@ pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
         })?;
 
     match outcome {
-        CliOutcome::Run(invocation) => {
-            let redirect = redirect_for(invocation.output_plan())?;
+        BoundOutcome::Run(invocation) => {
+            // The plan is readable before the handler runs, so the redirect and
+            // the destination are in place before anything can be written.
+            let redirect = redirect_for(invocation.output_plan());
             crate::emit::set_output_to(destination_of(invocation.output_plan()));
-            let mode = app.execute(&invocation)?;
+            let mode = invocation.run()?;
             Ok(Parsed { mode, redirect })
         }
         // `--docs` renders the whole registry as Markdown, so it carries no
         // format of its own and never becomes a protocol event.
-        CliOutcome::Docs(docs) => {
-            let _redirect = redirect_for(docs.output_plan())?;
+        BoundOutcome::Docs(docs) => {
+            let _redirect = redirect_for(docs.output_plan());
             crate::emit::set_output_to(OutputTo::Stdout);
             let rendered = agent_first_data::render_cli_reference(&cli).replace(
                 "| 2 | The invocation was rejected before anything ran. `error.code` is one of the `cli_*` codes below. |",
@@ -924,8 +926,8 @@ pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
             let _ = crate::emit::write_result_text(&rendered);
             std::process::exit(0);
         }
-        CliOutcome::Help(help) => {
-            let _redirect = redirect_for(help.output_plan())?;
+        BoundOutcome::Help(help) => {
+            let _redirect = redirect_for(help.output_plan());
             let format = format_of_plan(help.output_plan())?;
             crate::emit::set_output_to(destination_of(help.output_plan()));
             if format == OutputFormat::Plain {
@@ -935,8 +937,8 @@ pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
             }
             std::process::exit(0);
         }
-        CliOutcome::Version(version) => {
-            let _redirect = redirect_for(version.output_plan())?;
+        BoundOutcome::Version(version) => {
+            let _redirect = redirect_for(version.output_plan());
             let format = format_of_plan(version.output_plan())?;
             crate::emit::set_output_to(destination_of(version.output_plan()));
             let _ = crate::emit::emit_event(agent_first_data::cli_version_event(&version), format);
@@ -945,27 +947,77 @@ pub fn parse_args(bin_name: &str) -> Result<Parsed, ParseError> {
     }
 }
 
+/// Report a defect in this program, not in the command, and exit.
+///
+/// Exit 1 rather than the usage exit 2, because the caller has nothing to
+/// correct: the invocation was already accepted, so retrying it verbatim leads
+/// back here. Exit 2 with a `cli_*` code stays the answer that means "rewrite
+/// the command line"; these codes mean "report this".
+fn exit_program_defect(event: agent_first_data::Event) -> ! {
+    if crate::emit::emit_event(event, OutputFormat::Json).is_err() {
+        std::process::exit(4);
+    }
+    std::process::exit(1);
+}
+
 fn redirect_for(
     plan: &OutputPlan,
-) -> Result<Option<agent_first_data::stream_redirect::InstalledStreamRedirect>, ParseError> {
+) -> Option<agent_first_data::stream_redirect::InstalledStreamRedirect> {
     install_redirect(
         plan.stdout_file().map(std::path::Path::to_path_buf),
         plan.stderr_file().map(std::path::Path::to_path_buf),
     )
 }
 
+/// Point the process streams at the files the plan names, or stop.
+///
+/// A sink that cannot be established is `output_setup_failed` at exit 1: the
+/// events this run was going to write have nowhere to go, so reporting the
+/// failure as a usage error would invite a retry that lands in the same place.
 fn install_redirect(
     stdout_file: Option<std::path::PathBuf>,
     stderr_file: Option<std::path::PathBuf>,
-) -> Result<Option<agent_first_data::stream_redirect::InstalledStreamRedirect>, ParseError> {
-    let config =
-        agent_first_data::stream_redirect::StreamRedirectConfig::new(stdout_file, stderr_file)
-            .map_err(|error| ParseError::invalid_request(error.to_string()))?;
-    config
+) -> Option<agent_first_data::stream_redirect::InstalledStreamRedirect> {
+    let config = match agent_first_data::stream_redirect::StreamRedirectConfig::new(
+        stdout_file,
+        stderr_file,
+    ) {
+        Ok(config) => config,
+        Err(error) => exit_program_defect(output_setup_failed_event(&error.to_string())),
+    };
+    match config
         .as_ref()
         .map(agent_first_data::stream_redirect::install)
         .transpose()
-        .map_err(|error| ParseError::invalid_request(error.to_string()))
+    {
+        Ok(installed) => installed,
+        Err(error) => exit_program_defect(output_setup_failed_event(&error.to_string())),
+    }
+}
+
+/// The standard event for an output sink that could not be established.
+///
+/// Built here rather than taken from AFDATA, which supplies a constructor only
+/// for `cli_invocation_invalid`; the shape is the one AFDATA's CLI reference
+/// documents. An empty detail is the one thing that can fail the build, so the
+/// fallback replaces the detail and keeps the code — the classification is what
+/// the caller branches on.
+fn output_setup_failed_event(detail: &str) -> agent_first_data::Event {
+    build_output_setup_failed(detail)
+        .or_else(|_| build_output_setup_failed("an output sink could not be established"))
+        .unwrap_or_else(|_| {
+            agent_first_data::cli_invocation_invalid_event(
+                "an output sink could not be established",
+            )
+        })
+}
+
+fn build_output_setup_failed(
+    detail: &str,
+) -> Result<agent_first_data::Event, agent_first_data::BuildError> {
+    agent_first_data::json_error("output_setup_failed", detail)
+        .hint("this is a defect in the program or its environment, not in the command; report it")
+        .build()
 }
 
 fn destination_of(plan: &OutputPlan) -> OutputTo {
@@ -992,12 +1044,23 @@ fn optional_string(invocation: &ResolvedInvocation, id: &str) -> Option<String> 
         .map(str::to_string)
 }
 
+/// A value the matched shape declares as required or fixed.
+///
+/// Reading it cannot fail: the shape that matched supplies every id it
+/// declares. Asking for an id it does not declare is a defect in this file, not
+/// a value the caller omitted — `every_combination_reads_only_ids_its_shape_declares`
+/// names it from a test, and this says so at runtime rather than continuing
+/// with an empty string that reads like a value the caller passed.
 fn required_string(invocation: &ResolvedInvocation, id: &str) -> String {
-    invocation
-        .required(id)
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
+    match invocation.required(id).as_str() {
+        Some(value) => value.to_string(),
+        // Ids, not values: the detail names what this program declared, so it
+        // stays sayable even when the arguments hold secrets.
+        None => exit_program_defect(agent_first_data::cli_invocation_invalid_event(&format!(
+            "combination `{}` does not supply argument `{id}` as text",
+            invocation.combination_id()
+        ))),
+    }
 }
 
 fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {

@@ -451,3 +451,36 @@ fn docs_document_every_exit_code_the_binary_can_produce() {
         "the exit-4 row lost its description"
     );
 }
+
+#[test]
+fn an_unopenable_output_sink_is_a_defect_rather_than_a_usage_error() {
+    // The published reference names `output_setup_failed` at exit 1, and the
+    // difference from a `cli_*` rejection is the whole point: exit 2 tells an
+    // agent to rewrite the command line, while a sink that cannot be opened
+    // leaves the same command line with nowhere to write, so retrying it lands
+    // in the same place. Documenting the code without emitting it would leave
+    // the reference describing a binary that does not exist.
+    let absent_dir =
+        std::env::temp_dir().join(format!("afpsql_absent_sink_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&absent_dir);
+
+    let out = Command::new(bin())
+        .arg("--sql")
+        .arg("select 1")
+        .arg("--dsn")
+        .arg("postgresql://127.0.0.1:1/postgres")
+        .arg("--stdout-file")
+        .arg(absent_dir.join("out.jsonl"))
+        .output()
+        .expect("run afpsql with an unopenable sink");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "the failure was announced on the stream that could not be opened"
+    );
+    let text = String::from_utf8(out.stderr).expect("utf8 stderr");
+    let event: Value = serde_json::from_str(text.trim()).expect("json error event");
+    agent_first_data::validate_protocol_event(&event, true).expect("strict AFDATA event");
+    assert_eq!(event["error"]["code"], "output_setup_failed");
+}

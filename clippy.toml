@@ -10,9 +10,9 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 
 disallowed-macros = [
-  { path = "std::eprintln", reason = "Agent-First Data convention requires structured events on stdout only; stderr is not a protocol channel." },
+  { path = "std::eprintln", reason = "Runtime diagnostics must use the AFDATA emitter so kind-based routing, formatting, and redaction remain consistent." },
 ]
 
 disallowed-methods = [
-  { path = "std::io::stderr", reason = "Agent-First Data convention requires structured events on stdout only; stderr is not a protocol channel." },
+  { path = "std::io::stderr", reason = "Runtime diagnostics must use a sanctioned AFDATA sink so kind-based routing, formatting, and redaction remain consistent." },
 ]
