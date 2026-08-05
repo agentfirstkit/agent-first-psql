@@ -17,7 +17,8 @@
     "Add a test that drives all 23 registered shapes through their handlers with strict argument reads, so a handler asking for an argument id its shape never declares is named by the test suite instead of reading as an empty string in production",
     "Report the tool misreading its own resolved invocation as cli_invocation_invalid at exit 1, naming the combination and argument id rather than continuing with an empty string that looks like a value the caller passed",
     "Report an output sink that cannot be established as output_setup_failed at exit 1, matching afhttp and afpay, instead of invalid_request at exit 2, which claimed the command line was malformed and invited a retry that lands in the same place",
-    "Classify an unregistered short-form token as an unknown short argument instead of quoting it back, so a psql-style -d<DSN> typo can no longer echo its inline password into a logged error event"
+    "Classify an unregistered short-form token as an unknown short argument instead of quoting it back, so a psql-style -d<DSN> typo can no longer echo its inline password into a logged error event",
+    "Ask the container end-to-end readiness probe about TCP rather than the Unix socket, because the postgres image serves its initialization phase on the socket alone and the bridge connects over TCP, which made the suite fail at random and block a release"
   ],
   "bonds": [
     {

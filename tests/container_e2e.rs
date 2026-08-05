@@ -545,11 +545,32 @@ fn docker_success<const N: usize>(args: [&str; N], context: &str) {
     );
 }
 
+/// Wait until PostgreSQL accepts the connection the bridge is about to make.
+///
+/// `pg_isready` defaults to the Unix socket, and the postgres image runs its
+/// initialization server with `listen_addresses=''` — socket up, TCP
+/// deliberately off — before restarting the real one. A socket probe therefore
+/// reports "accepting connections" during a window in which every TCP connect
+/// is refused, which is the only connection this test makes: readiness has to
+/// be asked of the transport the caller uses, not of whichever one answers
+/// first.
 fn wait_for_postgres(name: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         let status = Command::new("docker")
-            .args(["exec", name, "pg_isready", "-U", "test", "-d", "test"])
+            .args([
+                "exec",
+                name,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-p",
+                "5432",
+                "-U",
+                "test",
+                "-d",
+                "test",
+            ])
             .status();
         if matches!(status, Ok(status) if status.success()) {
             return true;
