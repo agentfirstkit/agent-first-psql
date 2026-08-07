@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -84,6 +85,7 @@ impl Panel {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         }
+        ensure_fixture_object();
         Self {
             root,
             config_dir,
@@ -204,6 +206,38 @@ impl Drive {
     fn is_builtin_page(&self) -> bool {
         self.page.contains("<span class=\"name\">") && !self.page.contains("MY OWN SCHEMA PANEL")
     }
+}
+
+/// One object in `public`, created once per run and never dropped.
+///
+/// Every case here reads `ui schema public`, and the page these tests
+/// recognise as afpsql's own is the one that *lists objects*: an empty schema
+/// renders "No matching objects." instead, which carries none of the markers.
+/// The suite therefore passed on a developer's populated database and failed
+/// against a freshly-created one, which is the database CI has.
+///
+/// Deliberately one shared object rather than one per test, and deliberately
+/// never dropped. `ui schema public` enumerates the whole schema, so a fixture
+/// dropped at the end of one test is a relation that disappears underneath a
+/// panel another test is still enumerating — the suite runs in parallel, and
+/// that race fails as `relation ... does not exist`. A single stable object
+/// races with nothing.
+fn ensure_fixture_object() {
+    static FIXTURE: OnceLock<()> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let sql = "create table if not exists afpsql_ui_fixture(id int primary key, label text)";
+        let output = Command::new(binary())
+            .args(["--dsn", &test_env::required_test_dsn()])
+            .args(["--permission", "write"])
+            .args(["--sql", sql])
+            .output()
+            .expect("run fixture sql");
+        assert!(
+            output.status.success(),
+            "fixture statement failed: {sql}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
 }
 
 fn binary() -> PathBuf {
