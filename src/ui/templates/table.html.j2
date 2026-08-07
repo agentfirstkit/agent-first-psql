@@ -1,0 +1,15 @@
+{#-
+  `document.table` as a table: the columns PostgreSQL named, in its order, and
+  one cell per column per row. A NULL is its own thing rather than an empty
+  string, because in a database those are different answers.
+-#}
+<div class="scroll">
+<table>
+<thead>
+<tr>{% for column in document.table.columns %}<th><span class="name">{{ column.name }}</span><span class="type">{{ column.type_name }}</span></th>{% endfor %}</tr>
+</thead>
+<tbody>
+{% for row in document.table.rows %}<tr>{% for cell in row.cells %}{% if cell.is_null %}<td class="null">NULL</td>{% else %}<td>{{ cell.value }}</td>{% endif %}{% endfor %}</tr>
+{% endfor %}</tbody>
+</table>
+</div>

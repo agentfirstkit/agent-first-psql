@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,17 +13,20 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Upgrade to agent-first-data 0.31.0 and dispatch each resolved invocation through the handler bound to its own shape, so no second action lookup can disagree with what resolution matched",
-    "Add a test that drives all 23 registered shapes through their handlers with strict argument reads, so a handler asking for an argument id its shape never declares is named by the test suite instead of reading as an empty string in production",
-    "Report the tool misreading its own resolved invocation as cli_invocation_invalid at exit 1, naming the combination and argument id rather than continuing with an empty string that looks like a value the caller passed",
-    "Report an output sink that cannot be established as output_setup_failed at exit 1, matching afhttp and afpay, instead of invalid_request at exit 2, which claimed the command line was malformed and invited a retry that lands in the same place",
-    "Classify an unregistered short-form token as an unknown short argument instead of quoting it back, so a psql-style -d<DSN> typo can no longer echo its inline password into a logged error event",
-    "Ask the container end-to-end readiness probe about TCP rather than the Unix socket, because the postgres image serves its initialization phase on the socket alone and the bridge connects over TCP, which made the suite fail at random and block a release"
+    "Add afpsql ui with five panels: schema, table, indexes and connections open a window onto data a person reads and end when they close it, while plan shows one statement and returns their answer",
+    "Run in every view panel the exact SQL its inspect sibling runs, and execute an approved statement through the ordinary path with the same connection, transport, permission resolution and readonly policy, so the window and the agent cannot disagree",
+    "Execute a planned statement only on an explicit approval: closing the window, refusing, and letting the credential lapse are the same answer, reported as ui_plan_refused with executed:false, so absence of an answer is never consent",
+    "Refuse before a window opens rather than after a person approves, both for a statement afpsql-readonly was always going to reject and for an administrator-locked profile, which withholds the host capabilities that opening a browser requires",
+    "Ship no JavaScript from a watch panel by leaving script-src absent so default-src none governs, including the connections panel, which refreshes itself without any",
+    "Render every panel from a MiniJinja template a person may replace through the frontend overlay, making the typed document each panel builds a contract: what a panel computes belongs to afpsql, what it looks like does not",
+    "Add afpsql inspect connections with an --all flag, returning one row per server backend with its state, wait event and ages alongside the max_connections the count should be read against",
+    "Adopt the shared value-source grammar for connection secrets in place of a private implementation of the same rules",
+    "Move to agent-first-data 0.32.1 and agent-first-ui 0.3.1"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.7Kf6i6HNpFxooXKQTCzfugkqq89rPCuM1mekg8hsKAQC",
+      "uri": "cmn://agentfirstkit.com/b3.XWoP3CQVfssQGj63azRQnNKkSBEDVmaK5gdNHHAxffc",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

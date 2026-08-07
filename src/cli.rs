@@ -1,12 +1,11 @@
 use std::io::Read;
 
 use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
-use crate::secret_config::{SecretConfigRef, resolve_config_secret};
 use crate::types::{ContainerConfig, Permission, QueryOptions, SessionConfig, SshConfig};
 use agent_first_data::{
     ArgSpec, BoundOutcome, BuiltCliSpec, CliSpec, CliSpecError, CliValue, Combination, CommandSpec,
-    LogFilters, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation,
-    build_afdata_cli, cli_parse_log_filters, cli_parse_output,
+    LogFilters, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation, SourceSet,
+    ValueSource, build_afdata_cli, cli_parse_log_filters, cli_parse_output,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -57,6 +56,67 @@ pub enum Mode {
     PsqlAdmin(PsqlAdminRequest),
     SkillAdmin(SkillAdminRequest),
     PsqlUnsupported(PsqlUnsupportedRequest),
+    #[cfg(feature = "ui")]
+    Ui(UiRequest),
+}
+
+/// One panel handed to a person.
+///
+/// It carries the same connection and logging configuration as a `CliRequest`
+/// because it runs the same queries; what differs is the ending, which is a
+/// person closing a window — or answering — rather than a result on stdout.
+#[cfg(feature = "ui")]
+pub struct UiRequest {
+    pub panel: UiPanel,
+    pub session: SessionConfig,
+    pub output: OutputFormat,
+    pub log: LogFilters,
+    pub startup_args: Value,
+    pub startup_env: Value,
+    pub startup_requested: bool,
+}
+
+/// Which of AFUI's two session shapes this invocation asked for.
+#[cfg(feature = "ui")]
+pub enum UiPanel {
+    /// A view of one `inspect` query: the person reads it, and closing the
+    /// window is the whole ending.
+    View(UiView),
+    /// One statement waiting for a person's answer. Only an approval runs it.
+    Plan(UiPlan),
+}
+
+/// Which view panel to open. One variant per `ui_kind`.
+#[cfg(feature = "ui")]
+pub enum UiView {
+    Schema {
+        schema: String,
+    },
+    Table {
+        name: String,
+    },
+    Indexes {
+        schema: String,
+        table: Option<String>,
+    },
+    Connections {
+        all: bool,
+        /// Seconds between the page's own reloads. Presentation, not part of
+        /// the query — [`UiView::inspect_action`] ignores it.
+        refresh_seconds: u64,
+    },
+}
+
+/// The statement a `ui plan` window asks a person about.
+///
+/// Resolved once, here: the SQL is already text by the time this exists, so the
+/// statement shown in the window and the statement that runs after an approval
+/// are the same value, never two reads of the same file.
+#[cfg(feature = "ui")]
+pub struct UiPlan {
+    pub sql: String,
+    pub params: Vec<Value>,
+    pub options: QueryOptions,
 }
 
 pub struct PipeInit {
@@ -153,9 +213,17 @@ pub enum InspectAction {
     Views(InspectViewsArgs),
     Indexes(InspectIndexesArgs),
     Table(InspectTableArgs),
+    Connections(InspectConnectionsArgs),
 }
 
 pub struct InspectDatabasesArgs {
+    pub all: bool,
+}
+
+pub struct InspectConnectionsArgs {
+    /// Include the backends PostgreSQL runs for itself — autovacuum, the
+    /// checkpointer, logical workers. They are excluded by default because
+    /// `max_connections` does not govern them.
     pub all: bool,
 }
 
@@ -322,86 +390,101 @@ fn stream_output() -> OutputSpec {
 /// parsing, typed values, which argument mixes are legal, each mix's output
 /// contract, `--help`, and `docs/cli.md`.
 pub fn build_cli(bin_name: &str) -> Result<BuiltCliSpec, CliSpecError> {
-    let mut spec =
-        CliSpec::new(bin_name, env!("CARGO_PKG_VERSION"))
-            .about(env!("CARGO_PKG_DESCRIPTION"))
-            .display_name(env!("DISPLAY_NAME"))
-            .lifecycle_output(finite_output())
-            .command(root_command())
-            .command(CommandSpec::new(["inspect"]).about(
-                "Schema discovery: databases, schemas, tables, views, indexes, or a full snapshot.",
-            ))
-            .command(inspect_databases_command())
-            .command(inspect_simple_command(
-                "database",
-                "Summarize the connected database: schema/table/view/sequence counts and size.",
-                "inspect_database",
-            ))
-            .command(inspect_simple_command(
-                "schemas",
-                "List user-visible schemas with owner, object counts, and size.",
-                "inspect_schemas",
-            ))
-            .command(inspect_like_command(
-                "schema",
-                "Export full schema metadata for one schema.",
-                "inspect_schema",
-                "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
-            ))
-            .command(inspect_like_command(
-                "snapshot",
-                "Export a stable full-schema snapshot for machine consumption.",
-                "inspect_snapshot",
-                "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
-            ))
-            .command(inspect_like_command(
-                "tables",
-                "List tables in a schema with owner, estimated rows, and size.",
-                "inspect_tables",
-                "Optional `LIKE` pattern matched against the table name (`%` is the wildcard)",
-            ))
-            .command(inspect_like_command(
-                "views",
-                "List views (regular and materialized) in a schema with owner.",
-                "inspect_views",
-                "Optional `LIKE` pattern matched against the view name (`%` is the wildcard)",
-            ))
-            .command(inspect_indexes_command())
-            .command(inspect_table_command())
-            .command(
-                CommandSpec::new(["psql"])
-                    .about("Manage the local psql wrapper that forwards to `--mode psql`."),
-            )
-            .command(psql_admin_command(
-                "status",
-                "Show whether the afpsql-managed psql wrapper is installed and active.",
-            ))
-            .command(psql_admin_command(
-                "install",
-                "Install an afpsql-managed psql wrapper.",
-            ))
-            .command(psql_admin_command(
-                "uninstall",
-                "Remove an afpsql-managed psql wrapper.",
-            ))
-            .command(CommandSpec::new(["skill"]).about(
+    let spec = CliSpec::new(bin_name, env!("CARGO_PKG_VERSION"))
+        .about(env!("CARGO_PKG_DESCRIPTION"))
+        .display_name(env!("DISPLAY_NAME"))
+        .lifecycle_output(finite_output())
+        .command(root_command())
+        .command(CommandSpec::new(["inspect"]).about(
+            "Schema discovery: databases, schemas, tables, views, indexes, or a full snapshot.",
+        ))
+        .command(inspect_databases_command())
+        .command(inspect_simple_command(
+            "database",
+            "Summarize the connected database: schema/table/view/sequence counts and size.",
+            "inspect_database",
+        ))
+        .command(inspect_simple_command(
+            "schemas",
+            "List user-visible schemas with owner, object counts, and size.",
+            "inspect_schemas",
+        ))
+        .command(inspect_like_command(
+            "schema",
+            "Export full schema metadata for one schema.",
+            "inspect_schema",
+            "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
+        ))
+        .command(inspect_like_command(
+            "snapshot",
+            "Export a stable full-schema snapshot for machine consumption.",
+            "inspect_snapshot",
+            "Optional `LIKE` pattern matched against relation names (`%` is the wildcard)",
+        ))
+        .command(inspect_like_command(
+            "tables",
+            "List tables in a schema with owner, estimated rows, and size.",
+            "inspect_tables",
+            "Optional `LIKE` pattern matched against the table name (`%` is the wildcard)",
+        ))
+        .command(inspect_like_command(
+            "views",
+            "List views (regular and materialized) in a schema with owner.",
+            "inspect_views",
+            "Optional `LIKE` pattern matched against the view name (`%` is the wildcard)",
+        ))
+        .command(inspect_indexes_command())
+        .command(inspect_connections_command())
+        .command(inspect_table_command());
+    // The `ui` family is feature-gated, so a build without a window host does
+    // not advertise verbs it cannot run.
+    #[cfg(feature = "ui")]
+    let spec = spec
+        .command(CommandSpec::new(["ui"]).about(
+            "Open an isolated window: read schema or server activity, or answer one statement.",
+        ))
+        .command(ui_schema_command())
+        .command(ui_table_command())
+        .command(ui_indexes_command())
+        .command(ui_connections_command())
+        .command(ui_plan_command());
+    let mut spec = spec
+        .command(
+            CommandSpec::new(["psql"])
+                .about("Manage the local psql wrapper that forwards to `--mode psql`."),
+        )
+        .command(psql_admin_command(
+            "status",
+            "Show whether the afpsql-managed psql wrapper is installed and active.",
+        ))
+        .command(psql_admin_command(
+            "install",
+            "Install an afpsql-managed psql wrapper.",
+        ))
+        .command(psql_admin_command(
+            "uninstall",
+            "Remove an afpsql-managed psql wrapper.",
+        ))
+        .command(
+            CommandSpec::new(["skill"]).about(
                 "Manage Agent-First PSQL skills for Codex, Claude Code, opencode, and Hermes.",
-            ))
-            .command(skill_command(
-                "status",
-                "Show whether the Agent-First PSQL skill is installed, valid, and up to date.",
-                false,
-            ))
-            .command(skill_command(
-                "install",
-                "Install the Agent-First PSQL skill.",
-                true,
-            ))
-            .command(skill_command(
-                "uninstall",
-                "Remove an afpsql-managed Agent-First PSQL skill.",
-                true,
-            ));
+            ),
+        )
+        .command(skill_command(
+            "status",
+            "Show whether the Agent-First PSQL skill is installed, valid, and up to date.",
+            false,
+        ))
+        .command(skill_command(
+            "install",
+            "Install the Agent-First PSQL skill.",
+            true,
+        ))
+        .command(skill_command(
+            "uninstall",
+            "Remove an afpsql-managed Agent-First PSQL skill.",
+            true,
+        ));
     // Absent from a source tarball with no reachable .git, and the version
     // payload omits it rather than reporting the literal "unknown".
     if let Some(build) = Some(env!("GIT_SHA")).filter(|sha| *sha != "unknown") {
@@ -413,22 +496,25 @@ pub fn build_cli(bin_name: &str) -> Result<BuiltCliSpec, CliSpecError> {
 /// Arguments that any connecting command accepts, declared once.
 fn with_connection_args(command: CommandSpec) -> CommandSpec {
     command
-        .arg(ArgSpec::option("--dsn", "SOURCE").about(
-            "PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or \
-                 literal:VALUE for a literal starting with a source prefix",
-        ))
-        .arg(ArgSpec::option("--conninfo", "SOURCE").about(
-            "libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or \
-                 literal:VALUE for a literal starting with a source prefix",
-        ))
+        .arg(
+            ArgSpec::option("--dsn", "SOURCE")
+                .about("PostgreSQL DSN URI")
+                .sources(connection_secret_sources()),
+        )
+        .arg(
+            ArgSpec::option("--conninfo", "SOURCE")
+                .about("libpq conninfo string")
+                .sources(connection_secret_sources()),
+        )
         .arg(ArgSpec::option("--host", "HOST").about("PostgreSQL host"))
         .arg(ArgSpec::option_i64("--port", "PORT").about("PostgreSQL port"))
         .arg(ArgSpec::option("--user", "USER").about("PostgreSQL user name"))
         .arg(ArgSpec::option("--dbname", "DBNAME").about("PostgreSQL database name"))
-        .arg(ArgSpec::option("--password", "SOURCE").about(
-            "PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or \
-                 literal:VALUE for a literal starting with a source prefix",
-        ))
+        .arg(
+            ArgSpec::option("--password", "SOURCE")
+                .about("PostgreSQL password")
+                .sources(connection_secret_sources()),
+        )
         .arg(
             ArgSpec::option("--ssh", "USER@HOST")
                 .about("Open an SSH transport to USER@HOST before connecting to PostgreSQL"),
@@ -758,6 +844,18 @@ fn inspect_indexes_command() -> CommandSpec {
     ))
 }
 
+fn inspect_connections_command() -> CommandSpec {
+    inspect_command(
+        "connections",
+        "List server backends with state, wait event, age, and the max_connections limit.",
+    )
+    .arg(
+        ArgSpec::flag("--all")
+            .about("Include PostgreSQL's own background backends, not just client connections"),
+    )
+    .combination(inspect_combination("inspect_connections", &["all"]))
+}
+
 fn inspect_table_command() -> CommandSpec {
     // Declared before the connection arguments so the usage line reads the way
     // the call is written: the table name comes first.
@@ -780,6 +878,166 @@ fn inspect_table_command() -> CommandSpec {
             .optional(optional)
             .output(finite_output())
     })
+}
+
+/// One `ui` view, with the connection arguments every view needs.
+///
+/// The `ui` verbs are named for what the person looks at, because each view is
+/// a separate `ui_kind` that a user frontend can replace on its own. They stay
+/// separate from `inspect` rather than becoming a flag on it: an `inspect` call
+/// returns a result to the agent and exits, while a `ui` call blocks on a
+/// person and returns only once they close the window. One verb cannot own both
+/// endings.
+fn ui_view_command(name: &'static str, about: &'static str) -> CommandSpec {
+    with_connection_args(CommandSpec::new(["ui", name]).about(about))
+}
+
+fn ui_combination(id: &'static str, extra: &[&'static str]) -> Combination {
+    let mut optional: Vec<&str> = extra.to_vec();
+    optional.extend_from_slice(&CONNECTION_IDS);
+    Combination::new(id)
+        .action(id)
+        .optional(optional)
+        .output(stream_output())
+}
+
+fn ui_schema_command() -> CommandSpec {
+    ui_view_command(
+        "schema",
+        "Open a panel showing every relation in one schema and its columns.",
+    )
+    .arg(ArgSpec::positional("name", 0, "SCHEMA").about("Schema to inspect, for example `public`"))
+    .combination(ui_combination("ui_schema", &[]).required(["name"]))
+}
+
+fn ui_table_command() -> CommandSpec {
+    ui_view_command(
+        "table",
+        "Open a panel describing one table: columns, constraints, indexes, and triggers.",
+    )
+    .arg(
+        ArgSpec::positional("name", 0, "NAME")
+            .about("Table name; `schema.table` overrides the default `public` schema"),
+    )
+    .combination(ui_combination("ui_table", &[]).required(["name"]))
+}
+
+fn ui_indexes_command() -> CommandSpec {
+    ui_view_command(
+        "indexes",
+        "Open a panel listing indexes with their definitions, size, and validity.",
+    )
+    .arg(
+        ArgSpec::option("--schema", "SCHEMA")
+            .default("public")
+            .about("Schema to filter on"),
+    )
+    .arg(
+        ArgSpec::option("--table", "TABLE")
+            .about("Table to filter on; `schema.table` overrides --schema"),
+    )
+    .combination(ui_combination("ui_indexes", &["schema", "table"]))
+}
+
+/// How often the connection monitor reloads itself, and the floor under it.
+///
+/// The floor is not a guess about what is pretty: a page that reloads faster
+/// than a person can read it is a poll loop against someone's production server
+/// wearing a window as a disguise. Below it the invocation is refused rather
+/// than quietly clamped, because an agent that asked for 100ms should be told
+/// its number was not honoured.
+#[cfg(feature = "ui")]
+const DEFAULT_REFRESH_SECONDS: i64 = 5;
+#[cfg(feature = "ui")]
+const MIN_REFRESH_SECONDS: i64 = 2;
+
+#[cfg(feature = "ui")]
+fn ui_connections_command() -> CommandSpec {
+    ui_view_command(
+        "connections",
+        "Open a live panel counting server connections against max_connections; reloads itself.",
+    )
+    .arg(
+        ArgSpec::flag("--all")
+            .about("Include PostgreSQL's own background backends, not just client connections"),
+    )
+    .arg(
+        ArgSpec::option_i64("--refresh", "SECONDS")
+            .default_i64(DEFAULT_REFRESH_SECONDS)
+            .about(format!(
+                "Seconds between reloads; minimum {MIN_REFRESH_SECONDS}"
+            )),
+    )
+    .combination(ui_combination("ui_connections", &["all", "refresh"]))
+}
+
+/// `ui plan`, the one `ui` verb whose window returns an answer.
+///
+/// It takes the same statement arguments a query takes, because it runs the
+/// statement the same way once a person approves it. What it does not take is
+/// anything about a lifecycle it does not have: no `--stream-rows`, because the
+/// window's answer arrives before the rows do, and no `--dry-run`, because
+/// preparing the statement is what this panel already does to describe it.
+#[cfg(feature = "ui")]
+fn ui_plan_command() -> CommandSpec {
+    let command = ui_view_command(
+        "plan",
+        "Show one statement to a person and run it only if they approve; closing refuses.",
+    )
+    .arg(ArgSpec::option("--sql", "SQL").about("Inline SQL to show and, once approved, run"))
+    .arg(
+        ArgSpec::option("--sql-file", "PATH")
+            .about("File to read the statement from; `-` reads it from stdin"),
+    )
+    .arg(ArgSpec::option("--param", "N=VALUE").repeatable().about(
+        "Positional bind parameter in N=value form; repeat for more parameters. \
+             Bare null/true/false bind as JSON null/booleans; prefix with `text:` to \
+             bind any value as a literal string",
+    ))
+    .arg(
+        ArgSpec::option_enum("--permission", PERMISSIONS)
+            .value_name("PERMISSION")
+            .about(
+                "Query permission policy; defaults to read, ssh-read with --ssh, or \
+                 container-read with a --container-<driver>-* flag",
+            ),
+    )
+    .arg(
+        ArgSpec::option_i64("--statement-timeout-ms", "MS")
+            .about("Per-query statement timeout in milliseconds"),
+    )
+    .arg(
+        ArgSpec::option_i64("--lock-timeout-ms", "MS")
+            .about("Per-query lock timeout in milliseconds"),
+    )
+    .arg(
+        ArgSpec::option_i64("--inline-max-rows", "N")
+            .about("Maximum inline rows before returning a truncated result"),
+    )
+    .arg(
+        ArgSpec::option_i64("--inline-max-bytes", "N")
+            .about("Maximum inline payload bytes before returning a truncated result"),
+    );
+    let optional: Vec<&str> = vec![
+        "param",
+        "permission",
+        "statement_timeout_ms",
+        "lock_timeout_ms",
+        "inline_max_rows",
+        "inline_max_bytes",
+    ];
+    command
+        .combination(
+            ui_combination("ui_plan", &optional)
+                .about("Show inline --sql for approval")
+                .required(["sql"]),
+        )
+        .combination(
+            ui_combination("ui_plan_file", &optional)
+                .about("Show the statement read from --sql-file for approval")
+                .action("ui_plan")
+                .required(["sql_file"]),
+        )
 }
 
 fn psql_admin_command(verb: &'static str, about: &'static str) -> CommandSpec {
@@ -856,7 +1114,8 @@ type ActionResult = Result<Mode, ParseError>;
 type ActionHandler = fn(&ResolvedInvocation) -> ActionResult;
 
 fn actions() -> Vec<(&'static str, ActionHandler)> {
-    vec![
+    #[allow(unused_mut)]
+    let mut actions: Vec<(&'static str, ActionHandler)> = vec![
         ("query", run_query as ActionHandler),
         ("pipe", run_pipe),
         ("psql_mode", run_psql_mode),
@@ -868,6 +1127,7 @@ fn actions() -> Vec<(&'static str, ActionHandler)> {
         ("inspect_tables", run_inspect_tables),
         ("inspect_views", run_inspect_views),
         ("inspect_indexes", run_inspect_indexes),
+        ("inspect_connections", run_inspect_connections),
         ("inspect_table", run_inspect_table),
         ("psql_status", run_psql_status),
         ("psql_install", run_psql_install),
@@ -875,7 +1135,16 @@ fn actions() -> Vec<(&'static str, ActionHandler)> {
         ("skill_status", run_skill_status),
         ("skill_install", run_skill_install),
         ("skill_uninstall", run_skill_uninstall),
-    ]
+    ];
+    #[cfg(feature = "ui")]
+    actions.extend([
+        ("ui_schema", run_ui_schema as ActionHandler),
+        ("ui_table", run_ui_table),
+        ("ui_indexes", run_ui_indexes),
+        ("ui_connections", run_ui_connections),
+        ("ui_plan", run_ui_plan),
+    ]);
+    actions
 }
 
 /// Resolve argv into one mode, or answer `--help`/`--version`/`--docs`.
@@ -1154,76 +1423,61 @@ struct Connection {
     sources: Value,
 }
 
-enum TypedSecretSource {
-    Literal(String),
-    Env(String),
-    File(SecretConfigRef),
+/// The sources every connection secret accepts.
+///
+/// No stream sources: a DSN or a password is one short string the caller
+/// already keeps somewhere, and `afpsql` reads SQL on stdin. Prompting is out
+/// for the same reason — this CLI is run by agents and scripts, where blocking
+/// on a terminal is a hang rather than a question.
+fn connection_secret_sources() -> SourceSet {
+    SourceSet::config()
 }
 
-impl TypedSecretSource {
-    fn parse(flag: &str, raw: Option<String>) -> Result<Option<Self>, ParseError> {
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        // Escape hatch for a literal secret that itself starts with a source
-        // prefix; without it such a value would be unrepresentable.
-        if let Some(value) = raw.strip_prefix("literal:") {
-            return Ok(Some(Self::Literal(value.to_string())));
-        }
-        if let Some(name) = raw.strip_prefix("env:") {
-            if name.is_empty() {
-                return Err(ParseError::invalid_value(format!(
-                    "{flag} env source requires a variable name"
-                )));
-            }
-            return Ok(Some(Self::Env(name.to_string())));
-        }
-        if let Some(file_source) = raw.strip_prefix("file:") {
-            let Some((file, path)) = file_source.rsplit_once('#') else {
-                return Err(ParseError::invalid_value(format!(
-                    "{flag} file source must be file:PATH#DOT_PATH"
-                )));
-            };
-            if file.is_empty() || path.is_empty() {
-                return Err(ParseError::invalid_value(format!(
-                    "{flag} file source requires both PATH and DOT_PATH"
-                )));
-            }
-            return Ok(Some(Self::File(SecretConfigRef {
-                file: std::path::PathBuf::from(file),
-                path: path.to_string(),
-            })));
-        }
-        Ok(Some(Self::Literal(raw)))
-    }
+/// Classify one connection secret. The registry has already checked the same
+/// set while resolving argv; the psql-compatible translator parses its own
+/// argv, so it calls this itself.
+fn parse_secret_source(flag: &str, raw: Option<String>) -> Result<Option<ValueSource>, ParseError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    connection_secret_sources()
+        .parse(&raw)
+        .map(Some)
+        .map_err(|error| ParseError::invalid_value(format!("{flag} {error}")))
+}
 
-    fn resolve(&self, flag: &str) -> Result<String, ParseError> {
-        match self {
-            Self::Literal(value) => Ok(value.clone()),
-            Self::Env(name) => std::env::var(name).map_err(|_| {
-                ParseError::invalid_value(format!(
-                    "{flag} references an unset environment variable"
-                ))
-            }),
-            Self::File(reference) => {
-                resolve_config_secret(flag, reference).map_err(ParseError::invalid_value)
-            }
-        }
-    }
+fn read_secret_source(flag: &str, source: &ValueSource) -> Result<String, ParseError> {
+    source
+        .read_secret()
+        .map(|secret| secret.expose_secret().to_string())
+        .map_err(|error| ParseError::invalid_value(format!("{flag} {error}")))
+}
 
-    fn metadata(&self) -> Value {
-        match self {
-            Self::Literal(_) => json!({"kind": "direct"}),
-            Self::Env(name) => json!({"kind": "env", "name": name}),
-            Self::File(reference) => reference.safe_metadata(),
-        }
+/// Safe source metadata for the startup log: which kind, and for a file, which
+/// file and address. Never the value.
+fn source_metadata(source: &ValueSource) -> Value {
+    match source {
+        ValueSource::Env(name) => json!({"kind": "env", "name": name}),
+        ValueSource::File {
+            path,
+            dot_path,
+            format,
+        } => json!({
+            "kind": "config",
+            "config_file_path": path,
+            "dot_path": dot_path,
+            // Absent unless the caller named one; the file's own name says it
+            // otherwise, and the log should not claim a choice nobody made.
+            "config_format": format,
+        }),
+        _ => json!({"kind": "direct"}),
     }
 }
 
 fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseError> {
-    let dsn = TypedSecretSource::parse("--dsn", optional_string(invocation, "dsn"))?;
-    let conninfo = TypedSecretSource::parse("--conninfo", optional_string(invocation, "conninfo"))?;
-    let password = TypedSecretSource::parse("--password", optional_string(invocation, "password"))?;
+    let dsn = parse_secret_source("--dsn", optional_string(invocation, "dsn"))?;
+    let conninfo = parse_secret_source("--conninfo", optional_string(invocation, "conninfo"))?;
+    let password = parse_secret_source("--password", optional_string(invocation, "password"))?;
     let mut source_fields = serde_json::Map::new();
     for (name, source) in [
         ("dsn", dsn.as_ref()),
@@ -1231,7 +1485,7 @@ fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseE
         ("password", password.as_ref()),
     ] {
         if let Some(source) = source {
-            source_fields.insert(name.to_string(), source.metadata());
+            source_fields.insert(name.to_string(), source_metadata(source));
         }
     }
     let sources = Value::Object(source_fields);
@@ -1242,11 +1496,11 @@ fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseE
         profile_pinned: false,
         dsn_secret: dsn
             .as_ref()
-            .map(|source| source.resolve("--dsn"))
+            .map(|source| read_secret_source("--dsn", source))
             .transpose()?,
         conninfo_secret: conninfo
             .as_ref()
-            .map(|source| source.resolve("--conninfo"))
+            .map(|source| read_secret_source("--conninfo", source))
             .transpose()?,
         host: optional_string(invocation, "host"),
         port: port_of(invocation, "port", "--port")?,
@@ -1254,7 +1508,7 @@ fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseE
         dbname: optional_string(invocation, "dbname"),
         password_secret: password
             .as_ref()
-            .map(|source| source.resolve("--password"))
+            .map(|source| read_secret_source("--password", source))
             .transpose()?,
         ssh: SshConfig {
             destination: optional_string(invocation, "ssh")
@@ -1495,6 +1749,15 @@ fn run_inspect_indexes(invocation: &ResolvedInvocation) -> ActionResult {
     )
 }
 
+fn run_inspect_connections(invocation: &ResolvedInvocation) -> ActionResult {
+    run_inspect(
+        invocation,
+        InspectAction::Connections(InspectConnectionsArgs {
+            all: flag(invocation, "all"),
+        }),
+    )
+}
+
 fn run_inspect_table(invocation: &ResolvedInvocation) -> ActionResult {
     run_inspect(
         invocation,
@@ -1503,6 +1766,142 @@ fn run_inspect_table(invocation: &ResolvedInvocation) -> ActionResult {
             full: flag(invocation, "full"),
         }),
     )
+}
+
+#[cfg(feature = "ui")]
+fn run_ui(invocation: &ResolvedInvocation, view: UiView) -> ActionResult {
+    let (sql, _params) = build_inspect_sql(view.inspect_action());
+    ui_request(invocation, UiPanel::View(view), &sql, None, 0)
+}
+
+#[cfg(feature = "ui")]
+fn ui_request(
+    invocation: &ResolvedInvocation,
+    panel: UiPanel,
+    sql: &str,
+    sql_file: Option<&str>,
+    param_count: usize,
+) -> ActionResult {
+    let entries = log_entries(invocation);
+    let connection = connection_from(invocation)?;
+    let startup_args = with_connection_sources(
+        startup_args("ui", Some(sql), sql_file, param_count),
+        &connection.sources,
+    );
+    Ok(Mode::Ui(UiRequest {
+        panel,
+        session: connection.session,
+        output: format_of(invocation)?,
+        log: parse_log_categories(&entries),
+        startup_args,
+        startup_env: startup_env_snapshot(),
+        startup_requested: startup_requested(&entries),
+    }))
+}
+
+#[cfg(feature = "ui")]
+fn run_ui_schema(invocation: &ResolvedInvocation) -> ActionResult {
+    run_ui(
+        invocation,
+        UiView::Schema {
+            schema: required_string(invocation, "name"),
+        },
+    )
+}
+
+#[cfg(feature = "ui")]
+fn run_ui_table(invocation: &ResolvedInvocation) -> ActionResult {
+    run_ui(
+        invocation,
+        UiView::Table {
+            name: required_string(invocation, "name"),
+        },
+    )
+}
+
+#[cfg(feature = "ui")]
+fn run_ui_indexes(invocation: &ResolvedInvocation) -> ActionResult {
+    run_ui(
+        invocation,
+        UiView::Indexes {
+            schema: schema_of(invocation),
+            table: optional_string(invocation, "table"),
+        },
+    )
+}
+
+#[cfg(feature = "ui")]
+fn run_ui_connections(invocation: &ResolvedInvocation) -> ActionResult {
+    let refresh = invocation
+        .optional("refresh")
+        .and_then(CliValue::as_i64)
+        .unwrap_or(DEFAULT_REFRESH_SECONDS);
+    if refresh < MIN_REFRESH_SECONDS {
+        return Err(ParseError::invalid_value(format!(
+            "--refresh must be at least {MIN_REFRESH_SECONDS} seconds"
+        ))
+        .hint(
+            "a panel that reloads faster than a person reads is a poll loop against the server",
+        ));
+    }
+    run_ui(
+        invocation,
+        UiView::Connections {
+            all: flag(invocation, "all"),
+            // Non-negative by the check above, so the conversion cannot wrap.
+            refresh_seconds: refresh.unsigned_abs(),
+        },
+    )
+}
+
+/// Resolve the statement a `ui plan` window will ask about.
+///
+/// Everything the execution needs is decided here and carried as values: the
+/// SQL text (already read, so `--sql-file -` is consumed once rather than
+/// re-read after an approval), the bound parameters, and the permission policy.
+#[cfg(feature = "ui")]
+fn run_ui_plan(invocation: &ResolvedInvocation) -> ActionResult {
+    let sql_file = optional_string(invocation, "sql_file");
+    let sql = load_sql(optional_string(invocation, "sql"), sql_file.clone())?;
+    let params =
+        parse_params(&repeated_strings(invocation, "param")).map_err(ParseError::invalid_value)?;
+    let param_count = params.len();
+    let options = QueryOptions {
+        stream_rows: false,
+        batch_rows: None,
+        batch_bytes: None,
+        statement_timeout_ms: millis_of(
+            invocation,
+            "statement_timeout_ms",
+            "--statement-timeout-ms",
+        )?,
+        lock_timeout_ms: millis_of(invocation, "lock_timeout_ms", "--lock-timeout-ms")?,
+        permission: permission_of(invocation),
+        inline_max_rows: count_of(invocation, "inline_max_rows", "--inline-max-rows")?,
+        inline_max_bytes: count_of(invocation, "inline_max_bytes", "--inline-max-bytes")?,
+    };
+    let plan = UiPlan {
+        sql: sql.clone(),
+        params,
+        options,
+    };
+    ui_request(
+        invocation,
+        UiPanel::Plan(plan),
+        &sql,
+        sql_file.as_deref(),
+        param_count,
+    )
+}
+
+/// The SQL behind one inspection, shared by `inspect` and `ui`.
+///
+/// Exposed so a panel cannot drift from the subcommand an agent reads for the
+/// same object: both go through this one builder.
+#[cfg(feature = "ui")]
+#[must_use]
+pub fn inspect_sql_for(action: InspectAction) -> (String, Vec<Value>) {
+    build_inspect_sql(action)
 }
 
 fn psql_admin_request(
@@ -1626,11 +2025,11 @@ fn parse_psql_mode_full(raw: &[String]) -> Result<(Mode, PsqlRouting), String> {
         ));
     }
 
-    let dsn = TypedSecretSource::parse("--dsn", state.dsn_secret).map_err(|error| error.message)?;
-    let conninfo = TypedSecretSource::parse("--conninfo", state.conninfo_secret)
-        .map_err(|error| error.message)?;
-    let password = TypedSecretSource::parse("--password", state.password_secret)
-        .map_err(|error| error.message)?;
+    let dsn = parse_secret_source("--dsn", state.dsn_secret).map_err(|error| error.message)?;
+    let conninfo =
+        parse_secret_source("--conninfo", state.conninfo_secret).map_err(|error| error.message)?;
+    let password =
+        parse_secret_source("--password", state.password_secret).map_err(|error| error.message)?;
     let mut source_fields = serde_json::Map::new();
     for (name, source) in [
         ("dsn", dsn.as_ref()),
@@ -1638,21 +2037,21 @@ fn parse_psql_mode_full(raw: &[String]) -> Result<(Mode, PsqlRouting), String> {
         ("password", password.as_ref()),
     ] {
         if let Some(source) = source {
-            source_fields.insert(name.to_string(), source.metadata());
+            source_fields.insert(name.to_string(), source_metadata(source));
         }
     }
     let connection_sources = Value::Object(source_fields);
     let dsn_secret = dsn
         .as_ref()
-        .map(|source| source.resolve("--dsn").map_err(|error| error.message))
+        .map(|source| read_secret_source("--dsn", source).map_err(|error| error.message))
         .transpose()?;
     let conninfo_secret = conninfo
         .as_ref()
-        .map(|source| source.resolve("--conninfo").map_err(|error| error.message))
+        .map(|source| read_secret_source("--conninfo", source).map_err(|error| error.message))
         .transpose()?;
     let password_secret = password
         .as_ref()
-        .map(|source| source.resolve("--password").map_err(|error| error.message))
+        .map(|source| read_secret_source("--password", source).map_err(|error| error.message))
         .transpose()?;
     let session = SessionConfig {
         // Caller-supplied, so the ordinary environment fallbacks still apply;
@@ -2819,6 +3218,50 @@ fn build_table_full_sql(schema: String, name: String) -> (String, Vec<Value>) {
     )
 }
 
+/// One row per server backend, plus the server-wide facts that give the count a
+/// meaning.
+///
+/// Deliberately one statement rather than one per summary: every count a reader
+/// compares — states against each other, clients against `max_connections` —
+/// then comes from the same instant. Aggregating in SQL would mean several
+/// queries and several instants, and a monitor that adds up to a number the
+/// server never had is worse than no monitor.
+///
+/// `max_connections` and `snapshot_at` repeat on every row because a backend is
+/// what this returns rows of. Both are constants of the snapshot, and a reader
+/// takes them from any row.
+fn build_inspect_connections_sql(args: InspectConnectionsArgs) -> (String, Vec<Value>) {
+    let mut sql = String::from(
+        "select a.pid, \
+                a.datname as database, \
+                a.usename as \"user\", \
+                a.application_name, \
+                a.backend_type, \
+                a.state, \
+                a.wait_event_type, \
+                a.wait_event, \
+                a.client_addr::text as client_address, \
+                a.query, \
+                a.pid = pg_catalog.pg_backend_pid() as is_self, \
+                extract(epoch from (now() - a.backend_start))::bigint as connected_seconds, \
+                extract(epoch from (now() - a.xact_start))::bigint as transaction_seconds, \
+                extract(epoch from (now() - a.query_start))::bigint as query_seconds, \
+                extract(epoch from (now() - a.state_change))::bigint as state_seconds, \
+                current_setting('max_connections')::bigint as max_connections, \
+                to_char(now(), 'YYYY-MM-DD HH24:MI:SS.MS TZ') as snapshot_at \
+         from pg_catalog.pg_stat_activity a",
+    );
+    if !args.all {
+        sql.push_str(" where a.backend_type = 'client backend'");
+    }
+    sql.push_str(
+        " order by (a.backend_type = 'client backend') desc, \
+                   extract(epoch from (now() - a.query_start)) desc nulls last, \
+                   a.pid",
+    );
+    (sql, vec![])
+}
+
 fn build_inspect_indexes_sql(args: InspectIndexesArgs) -> (String, Vec<Value>) {
     let (schema, table) = split_optional_table(args.schema, args.table);
     let mut sql = String::from(
@@ -2975,6 +3418,7 @@ fn build_inspect_sql(action: InspectAction) -> (String, Vec<Value>) {
             (sql, params)
         }
         InspectAction::Indexes(args) => build_inspect_indexes_sql(args),
+        InspectAction::Connections(args) => build_inspect_connections_sql(args),
         InspectAction::Table(args) => {
             let (schema, name) = split_table_name("public".to_string(), args.name);
             if args.full {

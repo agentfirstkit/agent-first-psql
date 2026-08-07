@@ -26,6 +26,7 @@ A **shape** is one legal set of arguments that may appear together, under a stab
 ## Commands
 
 - [`afpsql`](#afpsql) — Run one SQL action per process, or open a long-lived pipe session.
+- [`afpsql inspect connections`](#afpsql-inspect-connections) — List server backends with state, wait event, age, and the max_connections limit.
 - [`afpsql inspect database`](#afpsql-inspect-database) — Summarize the connected database: schema/table/view/sequence counts and size.
 - [`afpsql inspect databases`](#afpsql-inspect-databases) — List databases on the connected server with size, encoding, and connection facts.
 - [`afpsql inspect indexes`](#afpsql-inspect-indexes) — List indexes with definitions, size, validity, and optional usage stats.
@@ -41,6 +42,11 @@ A **shape** is one legal set of arguments that may appear together, under a stab
 - [`afpsql skill install`](#afpsql-skill-install) — Install the Agent-First PSQL skill.
 - [`afpsql skill status`](#afpsql-skill-status) — Show whether the Agent-First PSQL skill is installed, valid, and up to date.
 - [`afpsql skill uninstall`](#afpsql-skill-uninstall) — Remove an afpsql-managed Agent-First PSQL skill.
+- [`afpsql ui connections`](#afpsql-ui-connections) — Open a live panel counting server connections against max_connections; reloads itself.
+- [`afpsql ui indexes`](#afpsql-ui-indexes) — Open a panel listing indexes with their definitions, size, and validity.
+- [`afpsql ui plan`](#afpsql-ui-plan) — Show one statement to a person and run it only if they approve; closing refuses.
+- [`afpsql ui schema`](#afpsql-ui-schema) — Open a panel showing every relation in one schema and its columns.
+- [`afpsql ui table`](#afpsql-ui-table) — Open a panel describing one table: columns, constraints, indexes, and triggers.
 
 ### `afpsql`
 
@@ -105,13 +111,13 @@ Arguments across every shape above:
 | `--dry-run` | Prepare the query and report its shape without running it |
 | `--explain` | Return the plan instead of the rows: `plan` wraps the SQL in EXPLAIN (FORMAT JSON); `analyze` runs it and buffers metrics |
 | `--mode` | Runtime mode: one SQL action, a long-lived JSONL session, or psql argument translation |
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -139,6 +145,51 @@ Arguments across every shape above:
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
 
+### `afpsql inspect connections`
+
+List server backends with state, wait event, age, and the max_connections limit.
+
+```
+afpsql inspect connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all]
+```
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--all` | Include PostgreSQL's own background backends, not just client connections |
+
 ### `afpsql inspect database`
 
 Summarize the connected database: schema/table/view/sequence counts and size.
@@ -149,13 +200,13 @@ afpsql inspect database [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -193,13 +244,13 @@ afpsql inspect databases [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] 
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -238,13 +289,13 @@ afpsql inspect indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -285,13 +336,13 @@ afpsql inspect schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -331,13 +382,13 @@ afpsql inspect schemas [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -375,13 +426,13 @@ afpsql inspect snapshot [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -423,13 +474,13 @@ afpsql inspect table <NAME> [--full] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--h
 |---|---|
 | `NAME` | Table name; `schema.table` overrides the default `public` schema |
 | `--full` | Also return constraints, indexes, triggers, and sequence/default metadata |
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -467,13 +518,13 @@ afpsql inspect tables [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -513,13 +564,13 @@ afpsql inspect views [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--p
 
 | Argument | Meaning |
 |---|---|
-| `--dsn` | PostgreSQL DSN source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
-| `--conninfo` | libpq conninfo source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--host` | PostgreSQL host |
 | `--port` | PostgreSQL port |
 | `--user` | PostgreSQL user name |
 | `--dbname` | PostgreSQL database name |
-| `--password` | PostgreSQL password source: literal value, env:NAME, file:PATH#DOT_PATH, or literal:VALUE for a literal starting with a source prefix |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
 | `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
 | `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
 | `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
@@ -658,6 +709,260 @@ Arguments across every shape above:
 | `--scope` | Skill scope |
 | `--skills-dir` | Directory that contains skill folders |
 | `--force` | Overwrite or remove an unmanaged Agent-First PSQL skill at the target path |
+
+### `afpsql ui connections`
+
+Open a live panel counting server connections against max_connections; reloads itself.
+
+```
+afpsql ui connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all] [--refresh <SECONDS>]
+```
+
+Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--all` | Include PostgreSQL's own background backends, not just client connections |
+| `--refresh` | Seconds between reloads; minimum 2 |
+
+### `afpsql ui indexes`
+
+Open a panel listing indexes with their definitions, size, and validity.
+
+```
+afpsql ui indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--table <TABLE>]
+```
+
+Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--schema` | Schema to filter on |
+| `--table` | Table to filter on; `schema.table` overrides --schema |
+
+### `afpsql ui plan`
+
+Show one statement to a person and run it only if they approve; closing refuses.
+
+#### `ui_plan` — Show inline --sql for approval
+
+```
+afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] --sql <SQL> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
+```
+
+#### `ui_plan_file` — Show the statement read from --sql-file for approval
+
+```
+afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] --sql-file <PATH> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
+```
+
+Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
+
+Arguments across every shape above:
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--sql` | Inline SQL to show and, once approved, run |
+| `--sql-file` | File to read the statement from; `-` reads it from stdin |
+| `--param` | Positional bind parameter in N=value form; repeat for more parameters. Bare null/true/false bind as JSON null/booleans; prefix with `text:` to bind any value as a literal string |
+| `--permission` | Query permission policy; defaults to read, ssh-read with --ssh, or container-read with a --container-<driver>-* flag |
+| `--statement-timeout-ms` | Per-query statement timeout in milliseconds |
+| `--lock-timeout-ms` | Per-query lock timeout in milliseconds |
+| `--inline-max-rows` | Maximum inline rows before returning a truncated result |
+| `--inline-max-bytes` | Maximum inline payload bytes before returning a truncated result |
+
+### `afpsql ui schema`
+
+Open a panel showing every relation in one schema and its columns.
+
+```
+afpsql ui schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] <SCHEMA>
+```
+
+Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `SCHEMA` | Schema to inspect, for example `public` |
+
+### `afpsql ui table`
+
+Open a panel describing one table: columns, constraints, indexes, and triggers.
+
+```
+afpsql ui table [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] <NAME>
+```
+
+Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
+
+| Argument | Meaning |
+|---|---|
+| `--dsn` | PostgreSQL DSN URI (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--conninfo` | libpq conninfo string (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--host` | PostgreSQL host |
+| `--port` | PostgreSQL port |
+| `--user` | PostgreSQL user name |
+| `--dbname` | PostgreSQL database name |
+| `--password` | PostgreSQL password (the value, or where to read it: env:NAME, file[+FORMAT]:PATH#DOT_PATH, literal:VALUE) |
+| `--ssh` | Open an SSH transport to USER@HOST before connecting to PostgreSQL |
+| `--ssh-via` | SSH hop to reach before the final --ssh destination; repeat for more hops |
+| `--ssh-option` | Additional OpenSSH -o option; repeat for more options |
+| `--ssh-remote-socket` | Explicit remote PostgreSQL Unix socket path for SSH forwarding |
+| `--ssh-sudo-user` | Remote OS user for the sudo -n Unix-socket bridge; needs an explicit socket |
+| `--container-docker-name` | Run a docker exec stdio bridge in this container before connecting |
+| `--container-docker-user` | Container OS user to run the docker exec bridge as |
+| `--container-docker-context` | Docker context to run the exec against |
+| `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
+| `--container-podman-user` | Container OS user to run the podman exec bridge as |
+| `--container-podman-runtime` | Podman runtime command; defaults to podman |
+| `--container-nerdctl-name` | Run a nerdctl exec stdio bridge in this container before connecting |
+| `--container-nerdctl-user` | Container OS user to run the nerdctl exec bridge as |
+| `--container-nerdctl-runtime` | Nerdctl runtime command; defaults to nerdctl |
+| `--container-compose-service` | Run a compose exec stdio bridge in this service before connecting |
+| `--container-compose-user` | Container OS user to run the compose exec bridge as |
+| `--container-compose-file` | Compose file passed before compose exec; repeat for more files |
+| `--container-compose-project` | Compose project name passed before compose exec |
+| `--container-compose-runtime` | Compose runtime command; defaults to docker, use docker-compose for v1 |
+| `--container-kubectl-pod` | Run a kubectl exec stdio bridge in this pod before connecting |
+| `--container-kubectl-container` | Container within a multi-container pod to exec into |
+| `--container-kubectl-namespace` | Kubernetes namespace to run the exec in |
+| `--container-kubectl-context` | Kubernetes context to run the exec against |
+| `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
+| `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `NAME` | Table name; `schema.table` overrides the default `public` schema |
 
 ## Exit codes
 

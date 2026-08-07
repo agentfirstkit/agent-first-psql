@@ -329,6 +329,37 @@ fn inspect_table_full_returns_snapshot_rows_for_one_table() {
 }
 
 #[test]
+fn inspect_connections_reports_activity_against_the_server_limit() {
+    let (sql, params) = build_inspect_sql(InspectAction::Connections(InspectConnectionsArgs {
+        all: false,
+    }));
+    assert!(params.is_empty());
+    for needle in [
+        "pg_catalog.pg_stat_activity",
+        "wait_event_type",
+        "backend_type",
+        // The limit the count is read against, and the clock that proves one
+        // snapshot is not the previous one.
+        "current_setting('max_connections')",
+        "snapshot_at",
+        "pg_catalog.pg_backend_pid()",
+        "query_seconds",
+    ] {
+        assert!(
+            sql.contains(needle),
+            "connections SQL missing {needle}: {sql}"
+        );
+    }
+    // max_connections governs client backends, so those are what the default
+    // counts; --all widens it to everything the server runs for itself.
+    assert!(sql.contains("where a.backend_type = 'client backend'"));
+    let (all_sql, _) = build_inspect_sql(InspectAction::Connections(InspectConnectionsArgs {
+        all: true,
+    }));
+    assert!(!all_sql.contains("where a.backend_type"), "SQL: {all_sql}");
+}
+
+#[test]
 fn registry_accepts_extended_inspect_subcommands() {
     for (args, shape) in [
         (
@@ -641,6 +672,155 @@ fn registry_accepts_permission_flag() {
     assert_eq!(permission_of(&invocation), Some(Permission::ContainerWrite));
 }
 
+#[cfg(feature = "ui")]
+#[test]
+fn registry_accepts_every_ui_panel() {
+    for (args, shape) in [
+        (vec!["afpsql", "ui", "schema", "public"], "ui_schema"),
+        (vec!["afpsql", "ui", "table", "public.users"], "ui_table"),
+        (
+            vec!["afpsql", "ui", "indexes", "--table", "users"],
+            "ui_indexes",
+        ),
+        (vec!["afpsql", "ui", "connections"], "ui_connections"),
+        (
+            vec!["afpsql", "ui", "connections", "--all", "--refresh", "30"],
+            "ui_connections",
+        ),
+        (vec!["afpsql", "ui", "plan", "--sql", "select 1"], "ui_plan"),
+        (
+            vec!["afpsql", "ui", "plan", "--sql-file", "-"],
+            "ui_plan_file",
+        ),
+    ] {
+        assert_eq!(shape_of(&args), shape);
+    }
+}
+
+/// A monitor is pointed at a server someone else depends on, so the interval
+/// has a floor — and asking for less is refused rather than quietly rounded up,
+/// because an agent that asked for 100ms should learn its number was not used.
+#[cfg(feature = "ui")]
+#[test]
+fn a_refresh_below_the_floor_is_refused_rather_than_clamped() {
+    let invocation = match resolve(&["afpsql", "ui", "connections", "--refresh", "0"]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("the shape must resolve: {}", error.message),
+    };
+    let error = match run_ui_connections(&invocation) {
+        Err(error) => error,
+        Ok(_) => panic!("--refresh 0 should have been refused"),
+    };
+    assert_eq!(error.code, "cli_invalid_argument_value");
+    assert!(error.message.contains("at least"));
+
+    // The default is what an invocation with no `--refresh` gets, and the floor
+    // itself is accepted.
+    for (args, expected) in [
+        (vec!["afpsql", "ui", "connections"], DEFAULT_REFRESH_SECONDS),
+        (
+            vec!["afpsql", "ui", "connections", "--refresh", "2"],
+            MIN_REFRESH_SECONDS,
+        ),
+    ] {
+        let invocation = match resolve(&args) {
+            Ok(invocation) => invocation,
+            Err(error) => panic!("{args:?} was rejected: {}", error.message),
+        };
+        match run_ui_connections(&invocation) {
+            Ok(Mode::Ui(UiRequest {
+                panel: UiPanel::View(view),
+                ..
+            })) => assert_eq!(view.refresh_seconds(), Some(expected.unsigned_abs())),
+            _ => panic!("{args:?} is not a connection monitor"),
+        }
+    }
+}
+
+/// The statement a person will be shown is resolved once, here: `ui plan`
+/// carries the SQL text, never a path it could read again after an approval.
+#[cfg(feature = "ui")]
+#[test]
+fn ui_plan_carries_the_resolved_statement_not_its_source() {
+    let dir = std::env::temp_dir().join(format!("afpsql-ui-plan-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("statement.sql");
+    std::fs::write(&path, "update orders set total = $1").expect("write statement");
+
+    let invocation = match resolve(&[
+        "afpsql",
+        "ui",
+        "plan",
+        "--sql-file",
+        &path.to_string_lossy(),
+        "--param",
+        "1=42",
+        "--permission",
+        "write",
+    ]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("ui plan was rejected: {}", error.message),
+    };
+    let plan = match run_ui_plan(&invocation) {
+        Ok(Mode::Ui(UiRequest {
+            panel: UiPanel::Plan(plan),
+            ..
+        })) => plan,
+        _ => panic!("ui plan did not resolve to a plan"),
+    };
+    assert_eq!(plan.sql, "update orders set total = $1");
+    // Bound exactly as a query binds it: numerics stay text so PostgreSQL, not
+    // afpsql, decides the type.
+    assert_eq!(plan.params, vec![Value::from("42")]);
+    assert_eq!(plan.options.permission, Some(Permission::Write));
+    // A confirmation window answers before any row arrives, so it has no
+    // streaming lifecycle to configure.
+    assert!(!plan.options.stream_rows);
+
+    // Changing the file afterwards cannot change what runs: the request already
+    // holds the text.
+    std::fs::write(&path, "drop table orders").expect("rewrite statement");
+    assert_eq!(plan.sql, "update orders set total = $1");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ui plan` runs one statement once and blocks on a person, so the lifecycle
+/// arguments of the other query shapes are not arguments it has.
+#[cfg(feature = "ui")]
+#[test]
+fn ui_plan_has_no_streaming_or_dry_run_shape() {
+    for args in [
+        vec!["afpsql", "ui", "plan", "--sql", "select 1", "--stream-rows"],
+        vec!["afpsql", "ui", "plan", "--sql", "select 1", "--dry-run"],
+        vec![
+            "afpsql",
+            "ui",
+            "plan",
+            "--sql",
+            "select 1",
+            "--explain",
+            "plan",
+        ],
+        // One source for one statement, exactly as a query has one.
+        vec![
+            "afpsql",
+            "ui",
+            "plan",
+            "--sql",
+            "select 1",
+            "--sql-file",
+            "/tmp/q.sql",
+        ],
+        // A statement is required; there is nothing to approve without one.
+        vec!["afpsql", "ui", "plan"],
+    ] {
+        assert!(
+            registry().resolve_from(args.clone()).is_err(),
+            "{args:?} should have been rejected"
+        );
+    }
+}
+
 #[test]
 fn short_flags_do_not_exist() {
     // The registry has no short syntax at all, so `-h` is not a rejected alias
@@ -926,42 +1106,61 @@ fn typed_secret_source_resolves_env_and_errors() {
     let path = std::env::var("PATH");
     assert!(path.is_ok());
     if let Ok(path) = path {
-        let source = TypedSecretSource::Env("PATH".to_string());
-        assert_eq!(source.resolve("--dsn"), Ok(path));
+        let source = ValueSource::Env("PATH".to_string());
+        assert_eq!(read_secret_source("--dsn", &source), Ok(path));
     }
 
     let missing_name = format!("AFPSQL_TEST_MISSING_{}", std::process::id());
-    let missing = TypedSecretSource::Env(missing_name).resolve("--dsn");
+    let missing = read_secret_source("--dsn", &ValueSource::Env(missing_name));
     assert!(missing.is_err());
 }
 
 #[test]
 fn a_config_source_is_one_file_and_one_dot_path() {
     for flag in ["--dsn", "--conninfo", "--password"] {
-        let source =
-            TypedSecretSource::parse(flag, Some("file:config.yaml#database.url".to_string()))
-                .expect("typed file source")
-                .expect("source");
-        let TypedSecretSource::File(reference) = source else {
+        let source = parse_secret_source(flag, Some("file:config.yaml#database.url".to_string()))
+            .expect("typed file source")
+            .expect("source");
+        let ValueSource::File {
+            path,
+            dot_path,
+            format,
+        } = source
+        else {
             panic!("expected file source")
         };
-        assert_eq!(reference.file, std::path::PathBuf::from("config.yaml"));
-        assert_eq!(reference.path, "database.url");
-        assert!(TypedSecretSource::parse(flag, Some("file:config.yaml".to_string())).is_err());
+        assert_eq!(path, std::path::PathBuf::from("config.yaml"));
+        assert_eq!(dot_path, "database.url");
+        // Unnamed: the file's own extension says what it is.
+        assert_eq!(format, None);
+        // A file whose name cannot say so names the format itself — this is
+        // what makes a credential in an extensionless `.conf` reachable.
+        assert!(matches!(
+            parse_secret_source(flag, Some("file+ini:/etc/app.conf#db.url".to_string())),
+            Ok(Some(ValueSource::File { format: Some(ref name), .. })) if name == "ini"
+        ));
+        assert!(parse_secret_source(flag, Some("file:config.yaml".to_string())).is_err());
     }
 }
 
 #[test]
 fn one_slot_is_one_typed_secret_source() {
     assert!(matches!(
-        TypedSecretSource::parse("--dsn", Some("env:DATABASE_URL".to_string())),
-        Ok(Some(TypedSecretSource::Env(name))) if name == "DATABASE_URL"
+        parse_secret_source("--dsn", Some("env:DATABASE_URL".to_string())),
+        Ok(Some(ValueSource::Env(name))) if name == "DATABASE_URL"
     ));
     assert!(matches!(
-        TypedSecretSource::parse("--dsn", Some("postgresql://db/app".to_string())),
-        Ok(Some(TypedSecretSource::Literal(value))) if value == "postgresql://db/app"
+        parse_secret_source("--dsn", Some("postgresql://db/app".to_string())),
+        Ok(Some(ValueSource::Literal(value))) if value == "postgresql://db/app"
     ));
-    assert!(TypedSecretSource::parse("--dsn", Some("env:".to_string())).is_err());
+    assert!(parse_secret_source("--dsn", Some("env:".to_string())).is_err());
+    // A stream source is not one this argument accepts, and the refusal says so.
+    for raw in ["stdin", "prompt", "fd:3"] {
+        assert!(
+            parse_secret_source("--dsn", Some(raw.to_string())).is_err(),
+            "{raw}"
+        );
+    }
 }
 
 #[test]

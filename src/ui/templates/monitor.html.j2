@@ -1,0 +1,36 @@
+{#-
+  `connection_monitor`: the same `inspect connections` snapshot, re-run on every
+  reload, read four ways before the raw table.
+
+  Everything here is already counted, sorted and formatted in the document, so
+  an override reorders, drops or regroups these sections without recomputing
+  anything — and without being able to disagree with what the agent read.
+-#}
+{% extends "layout.html.j2" %}
+{% block panel %}
+{% if document.error %}<p class="warn">This reload failed: {{ document.error }}. The page keeps trying.</p>
+{% endif %}
+<section class="capacity">
+{% if document.capacity.max %}<meter min="0" max="{{ document.capacity.max }}" value="{{ document.capacity.clients }}" low="{{ document.capacity.high }}" high="{{ document.capacity.high }}" optimum="0"></meter><p class="count">{{ document.capacity.clients }} <span class="of">of {{ document.capacity.max }}</span> <span class="unit">client connections</span></p>
+{% else %}<p class="count">{{ document.capacity.clients }} <span class="unit">client connections</span></p><p class="hint">The server did not report max_connections.</p>
+{% endif %}</section>
+{% if document.groups %}<div class="groups">
+{% for group in document.groups %}<section class="group"><h2>{{ group.heading }}</h2><dl>{% for entry in group.entries %}<div><dt>{{ entry.label }}</dt><dd>{{ entry.count }}</dd></div>{% endfor %}</dl></section>
+{% endfor %}</div>
+{% endif %}
+<section class="longest"><h2>Longest running</h2>
+{% if document.longest %}<div class="scroll">
+<table>
+<thead>
+<tr><th>pid</th><th>database</th><th>user</th><th>state</th><th>waiting on</th><th>query age</th><th>txn age</th><th>statement</th></tr>
+</thead>
+<tbody>
+{% for backend in document.longest %}<tr{% if backend.is_self %} class="self"{% endif %}><td>{{ backend.pid }}</td><td>{{ backend.database }}</td><td>{{ backend.user }}</td><td>{{ backend.state }}</td><td>{{ backend.waiting_on }}</td><td>{{ backend.query_age }}</td><td>{{ backend.transaction_age }}</td><td class="sql">{{ backend.statement }}</td></tr>
+{% endfor %}</tbody>
+</table>
+</div>{% else %}<p class="empty">No statement is running and no transaction is open.</p>{% endif %}</section>
+<section class="waits"><h2>Wait events</h2>{% if document.waits %}<dl>{% for wait in document.waits %}<div><dt>{{ wait.label }}</dt><dd>{{ wait.count }}</dd></div>{% endfor %}</dl>{% else %}<p class="empty">Nothing is waiting.</p>{% endif %}</section>
+{% if document.backend_count == 0 %}<p class="empty">The server reported no backends.</p>
+{% else %}<h2>Every backend</h2>
+{% include "table.html.j2" %}{% endif %}
+{% endblock %}

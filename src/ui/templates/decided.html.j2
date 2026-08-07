@@ -1,0 +1,12 @@
+{#-
+  What the plan panel says after a person answers it.
+
+  afpsql renders this, in afpsql's words, from what it actually recorded — not
+  from what the page that was pressed claimed to be. A person who was shown a
+  mislabelled control reads the truth here.
+-#}
+{% extends "layout.html.j2" %}
+{% block panel %}
+<p class="decided">{{ document.message }}</p>
+<p class="hint">You can close this window.</p>
+{% endblock %}

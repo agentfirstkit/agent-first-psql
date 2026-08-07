@@ -1,0 +1,330 @@
+:root {
+  color-scheme: light dark;
+  --page: #ffffff;
+  --ink: #14171a;
+  --muted: #5b6570;
+  --line: #dfe3e8;
+  --head: #f4f6f8;
+  --null: #98a2ad;
+  --warn: #8a4b00;
+  --warn-bg: #fff6e8;
+  --go: #0b5c2e;
+  --go-bg: #e8f5ec;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #16191c;
+    --ink: #e7eaee;
+    --muted: #9aa4af;
+    --line: #2b3036;
+    --head: #1e2226;
+    --null: #6d7681;
+    --warn: #f0b464;
+    --warn-bg: #2a2016;
+    --go: #7fd7a0;
+    --go-bg: #16241b;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  margin-bottom: 1.25rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.subject {
+  margin: 0.15rem 0 0;
+  font-size: 1.35rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* Schema output is wide. The table scrolls inside this box so the page itself
+   never scrolls sideways. */
+.scroll {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+/* Size columns to their content and let the container scroll. A percentage
+   width would squeeze short columns until identifiers wrapped mid-word. */
+table {
+  border-collapse: collapse;
+  width: max-content;
+  min-width: 100%;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--head);
+  border-bottom: 1px solid var(--line);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+th .name {
+  display: block;
+  font-weight: 600;
+}
+
+th .type {
+  display: block;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+tbody td {
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  white-space: pre-wrap;
+  /* Only genuinely long values wrap — an index definition or a jsonb payload.
+     Everything shorter keeps its own width. */
+  max-width: 60ch;
+  overflow-wrap: anywhere;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+td.null {
+  color: var(--null);
+  font-style: italic;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 2rem;
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+}
+
+footer {
+  margin-top: 1rem;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+h2 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Something the page needs a person to notice: a reload that failed, or a
+   statement PostgreSQL already refused. */
+.warn {
+  margin: 0 0 1rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── connection monitor ── */
+
+/* The number the panel exists for, at the size it deserves. */
+.capacity {
+  margin-bottom: 0.5rem;
+}
+
+.capacity meter {
+  display: block;
+  width: 100%;
+  height: 0.75rem;
+}
+
+.count {
+  margin: 0.4rem 0 0;
+  font-size: 2rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+.count .of,
+.count .unit {
+  font-size: 0.9rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* Three tallies of the same snapshot, side by side while there is room. */
+.groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+}
+
+.groups .group {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.groups dl,
+.waits dl {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.groups dl > div,
+.waits dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.groups dl > div:last-child,
+.waits dl > div:last-child {
+  border-bottom: none;
+}
+
+.groups dt,
+.waits dt {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.groups dd,
+.waits dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A statement is as long as somebody wrote it, and PostgreSQL reports it in
+   full. It scrolls inside its own cell rather than pushing every other row off
+   the screen; the table below still holds the whole text. */
+.longest td.sql {
+  display: block;
+  max-width: 60ch;
+  max-height: 4.5em;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* This panel's own connection is one of the rows it reports. */
+.longest tr.self td {
+  background: var(--head);
+}
+
+/* ── plan confirmation ── */
+
+.plan {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1rem;
+}
+
+/* A statement afpsql reads as a write does not look like every other page. */
+.plan.writes {
+  border-color: var(--warn);
+}
+
+.terms,
+.details {
+  margin: 0;
+}
+
+.terms > div,
+.details > div {
+  display: flex;
+  gap: 1rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.details > div:last-child {
+  border-bottom: none;
+}
+
+.terms dt,
+.details dt {
+  flex: 0 0 8rem;
+  color: var(--muted);
+}
+
+.terms dd,
+.details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+pre.sql {
+  margin: 1rem 0;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--head);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.decide {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.decide button {
+  font: inherit;
+  padding: 0.6rem 1.1rem;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--page);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.decide .approve {
+  border-color: var(--go);
+  background: var(--go-bg);
+  color: var(--go);
+  font-weight: 600;
+}
+
+.decide .refuse {
+  font-weight: 600;
+}

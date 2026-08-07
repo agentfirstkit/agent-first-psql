@@ -1,0 +1,27 @@
+{#-
+  The frame every afpsql panel sits in.
+
+  A frontend that only wants a different body overrides `page.html.j2` and
+  inherits this; one that wants a different frame overrides this file too. The
+  `<!-- afpsql:trusted-runtime -->` comment is not decoration: afpsql replaces
+  it with its own nonce-bound script, and a panel that returns a decision will
+  not open without it.
+-#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% if document.refresh_seconds %}<meta http-equiv="refresh" content="{{ document.refresh_seconds }}">
+{% endif %}<title>{{ document.title }} — {{ document.subject }}</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header><h1>{{ document.heading }}</h1><p class="subject">{{ document.subject }}</p></header>
+<main>
+{% block panel %}{% endblock %}
+</main>
+<footer>{{ document.footer }}</footer>
+<!-- afpsql:trusted-runtime -->
+</body>
+</html>

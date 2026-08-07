@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 default-run = "afpsql"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."
@@ -10,8 +10,11 @@ readme = "README.md"
 exclude = [".github/"]
 
 [features]
+default = ["ui"]
 # Enables integration tests that require a live PostgreSQL DSN.
 db-tests = []
+# `afpsql ui`: isolated windows over the same queries `afpsql inspect` runs.
+ui = ["agent-first-ui/session", "dep:axum", "dep:minijinja"]
 
 [[bin]]
 # Keep afpsql first: release tooling derives the primary artifact name from it.
@@ -23,8 +26,16 @@ name = "afpsql-readonly"
 path = "src/readonly_main.rs"
 
 [dependencies]
-agent-first-data = { version = "0.31.0", default-features = false, features = ["cli", "skill-admin", "stream-redirect", "yaml", "toml", "dotenv", "ini"] }
+agent-first-data = { version = "0.32.1", default-features = false, features = ["cli", "skill-admin", "stream-redirect", "yaml", "toml", "dotenv", "ini"] }
+# `session`: every panel is a window over a served AFUI session. The frontend
+# overlay and its script guard come with the tier below it.
+agent-first-ui = { version = "0.3.1", default-features = false, optional = true }
 async-trait = "0.1"
+axum = { version = "0.8", optional = true }
+# Panels are templates, not Rust that writes HTML, because a person has to be
+# able to replace one. Same engine as afmail's Review UI rather than a second
+# one: a frontend author who has written for either has written for both.
+minijinja = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
@@ -33,6 +44,12 @@ native-tls = "0.2"
 postgres-native-tls = "0.5"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+# The frontend suite recomputes AFUI's trust fingerprint itself, so a change to
+# that algorithm shows up as a failure to serve a trusted frontend rather than
+# as a quietly passing test.
+blake3 = "1"
 
 [lints.clippy]
 unwrap_used = "deny"

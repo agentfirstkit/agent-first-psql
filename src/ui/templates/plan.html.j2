@@ -1,0 +1,20 @@
+{#-
+  `plan_confirm`: one statement, and a person's answer about it.
+
+  This template may be replaced like any other — reordered, regrouped, reworded,
+  with sections dropped. What it cannot do is decide what a control means.
+  `data-afpsql-decision` *declares* a control; afpsql's own runtime, injected at
+  the layout's trusted-runtime marker under a nonce a frontend cannot forge, is
+  what binds that declaration to the route that runs or refuses the statement.
+  A page that declares neither control is a broken override and is reported as
+  one, because a question with no answer is worse than no window.
+-#}
+{% extends "layout.html.j2" %}
+{% block panel %}
+<section class="plan{% if document.writes %} writes{% endif %}"><dl class="terms"><div><dt>server</dt><dd>{{ document.target }}</dd></div><div><dt>transaction</dt><dd>{{ document.transaction }}</dd></div><div><dt>statement</dt><dd>{{ document.classification }}</dd></div></dl><pre class="sql">{{ document.sql }}</pre><dl class="details">{% if document.params %}{% for param in document.params %}<div><dt>${{ param.index }}{% if param.type_name %} {{ param.type_name }}{% endif %}</dt><dd>{{ param.value }}</dd></div>{% endfor %}{% else %}<div><dt>parameters</dt><dd>none</dd></div>{% endif %}{% if document.returns %}<div><dt>returns</dt><dd>{{ document.returns }}</dd></div>{% endif %}</dl>
+{% if document.rejected %}<p class="warn">PostgreSQL rejected this statement when afpsql prepared it: {{ document.rejected }}. Approving it still sends it, and it will fail the same way.</p>
+{% endif %}</section>
+<div class="decide">
+{% for decision in document.decisions %}<button type="button" class="{{ decision.id }}" data-afpsql-decision="{{ decision.id }}">{{ decision.label }}</button>
+{% endfor %}</div>
+{% endblock %}

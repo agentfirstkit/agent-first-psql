@@ -1,0 +1,9 @@
+{#-
+  `schema_inspect`, `table_inspect` and `index_inspect`: one result set, read
+  once, shown until the person closes the window.
+-#}
+{% extends "layout.html.j2" %}
+{% block panel %}
+{% if document.row_count == 0 %}<p class="empty">No matching objects.</p>
+{% else %}{% include "table.html.j2" %}{% endif %}
+{% endblock %}

@@ -135,6 +135,52 @@ Prefer `afpsql inspect` over hand-writing `information_schema` /
 - `afpsql inspect table NAME --full` — table-focused metadata export including
   relation, columns, constraints, indexes, triggers, and sequence/default
   relationships.
+- `afpsql inspect connections [--all]` — one row per server backend with state,
+  wait event, ages, and the `max_connections` the count is read against.
+  `--all` adds the backends PostgreSQL runs for itself, which that limit does
+  not govern.
+
+## Showing Something to a Person
+
+`afpsql ui schema`, `afpsql ui table`, `afpsql ui indexes`, and
+`afpsql ui connections` open the same data a person can read in a window
+instead of returning it. Reach for one only when a *person* asked to look, or
+when you have already read the data and they need to see its shape to answer
+you. Never use `ui` to read data yourself: the result carries no rows, only that
+the window closed.
+
+These are watch sessions, so the call blocks until the person closes the window.
+Treat that closure as "they are done looking", never as approval of anything.
+A window that cannot open is an environment problem — report it and fall back to
+the matching `inspect` command rather than retrying.
+
+`ui connections` is the one panel meant to outlive your attention: it reloads
+itself, so open it, report that it is open, and go back to work rather than
+waiting on it. Run it in the background when you have anything else to do, and
+leave the interval alone unless the person asked — it is a repeated query
+against a server other people are using.
+
+## Asking a Person to Approve a Statement
+
+`afpsql ui plan --sql '...' [--param N=V] [--permission write]` shows one
+statement to a person and runs it only if they approve. Use it when a write is
+consequential enough that a person should see it first, not as a substitute for
+knowing what your own statement does.
+
+- Only an approval runs anything. A closed window, a refusal, and an expired
+  credential are all the same answer, and the terminal event says
+  `result.code:"ui_plan_refused"` with `executed:false`. Never re-run the
+  statement yourself after a refusal, and never read "the window closed" as
+  consent.
+- On approval the statement runs through the ordinary execution path, so the
+  events that follow are the ordinary ones: a `kind:"result"` result, or a
+  `sql_error`. Branch on those exactly as you would for `afpsql --sql`.
+- The statement is fixed when you invoke the command. Changing a `--sql-file`
+  after the window opens changes nothing, and there is no way to amend what the
+  person is looking at — refuse and ask again with a new statement instead.
+- `afpsql-readonly` refuses a write here as it does everywhere; the window does
+  not open at all. Do not reach for `ui plan` to get around a readonly
+  capability.
 
 For query plans, add `--explain plan` (`EXPLAIN (FORMAT JSON)`) or
 `--explain analyze` (also runs the statement; writes still need write

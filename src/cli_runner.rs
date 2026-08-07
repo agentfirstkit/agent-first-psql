@@ -57,24 +57,14 @@ pub async fn run(
                 std::process::exit(2);
             }
         };
+        // A dry run never reaches `handler::execute_query`, so the readonly
+        // refusal it would have made has to be made here — by the same
+        // function, so the two cannot drift.
         if capability == crate::Capability::ReadOnly
-            && let Err(error) = crate::readonly_policy::validate_sql(&sql)
+            && let Some((error, hint)) =
+                crate::readonly_policy::readonly_refusal(&sql, resolved_opts.read_only)
         {
-            if crate::emit::emit_cli_error(&error, Some(crate::readonly_hint()), output_format)
-                .is_err()
-            {
-                std::process::exit(4);
-            }
-            std::process::exit(2);
-        }
-        if capability == crate::Capability::ReadOnly && !resolved_opts.read_only {
-            if crate::emit::emit_cli_error(
-                "write permission is unavailable in afpsql-readonly",
-                Some(crate::readonly_hint()),
-                output_format,
-            )
-            .is_err()
-            {
+            if crate::emit::emit_cli_error(&error, Some(hint), output_format).is_err() {
                 std::process::exit(4);
             }
             std::process::exit(2);

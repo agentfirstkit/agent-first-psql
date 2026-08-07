@@ -128,13 +128,21 @@ Each secret slot has three mutually exclusive explicit sources:
 | libpq conninfo | `--conninfo` | `--conninfo env:NAME` | `--conninfo file:FILE#DOT_PATH` |
 | password | `--password` | `--password env:NAME` | `--password file:FILE#DOT_PATH` |
 
-Config files may be JSON (`.json`), TOML (`.toml`), YAML (`.yaml`/`.yml`), or
-dotenv (`.env`, `.env.*`, `*.env`). A config source is one typed argument
-containing both the file and dot path; malformed sources are refused consistently
-by both the canonical registry and the psql-compatible translator. The path must resolve to a non-empty
+Config files may be JSON (`.json`), TOML (`.toml`), YAML (`.yaml`/`.yml`),
+dotenv (`.env`, `.env.*`, `*.env`), or INI (`.ini`). A config source is one
+typed argument containing both the file and dot path.
+
+The grammar is AFDATA's, declared on each of the three arguments, so the
+canonical registry refuses a malformed or unaccepted source while it resolves
+argv — `cli_invalid_argument_value` at exit 2, before any file is opened — and
+the psql-compatible translator, which parses its own argv, refuses the same set
+through the same parser. Stream sources (`stdin`, `fd:N`, `prompt`) are
+deliberately not accepted here: `afpsql` reads SQL on stdin, and blocking on a
+terminal is a hang for an agent. The path must resolve to a non-empty
 string; the value is returned verbatim — never trimmed, coerced from another
 type, or URL-decoded, so percent-encode reserved characters in a DSN (`%40` for
-`@`). Note that a double-quoted dotenv value or a TOML basic `"..."` string still
+`@`). A dot path resolving to a number or a boolean is refused rather than
+coerced: a credential is text. Note that a double-quoted dotenv value or a TOML basic `"..."` string still
 undergoes that format's own escape processing (`\t`→tab, `\\`→`\`); use an
 unquoted or single-quoted `'...'` value for raw bytes.
 
@@ -643,6 +651,64 @@ when psql-compat translation has dropped the write boundary.
 libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
 `PGPASSWORD`, `PGSSLMODE`) fill connection fields that were not provided via
 flags or secrets, listing which variables were used.
+
+## Replacing a panel (`afui frontend`)
+
+Every `afpsql ui` panel is a MiniJinja template rendered against a typed
+document, and any of them can be replaced. AFUI owns where an override lives and
+whether it is trusted; afpsql owns what the files mean.
+
+| `ui_kind` | Panel |
+| --- | --- |
+| `schema_inspect` | `afpsql ui schema` |
+| `table_inspect` | `afpsql ui table` |
+| `index_inspect` | `afpsql ui indexes` |
+| `connection_monitor` | `afpsql ui connections` |
+| `plan_confirm` | `afpsql ui plan` |
+
+Install one with `afui frontend init --provider-id afpsql --ui-kind <KIND>` and
+turn it on with `afui frontend enable`. `ui_api_version` is `1`.
+
+Files an override may supply, each independently — a file it does not supply
+comes from afpsql, so replacing one page keeps the rest:
+
+| Path | What it is |
+| --- | --- |
+| `templates/page.html.j2` | The panel body for this `ui_kind` |
+| `templates/layout.html.j2` | The frame every page extends |
+| `templates/table.html.j2` | The result table partial |
+| `templates/decided.html.j2` | What `plan_confirm` shows after an answer |
+| `templates/<anything>.j2` | Partials of your own, reachable with `{% include %}` |
+| `style.css` | The stylesheet |
+| `assets/**` | Stylesheets, images and fonts, served from the session origin |
+
+Templates render against `document`, which carries everything the panel worked
+out — already counted, sorted, classified and formatted. Reorder it, regroup it,
+drop what you do not want; you cannot arrive at a different answer than the one
+the agent read, because the panel and `afpsql inspect` run the same SQL.
+
+Three things an override cannot do, and they are enforced rather than requested:
+
+- **Ship JavaScript.** AFUI refuses a frontend file whose name says it is a
+  script, and refuses a `<script>`, an `onclick=`, or a `javascript:` URL inside
+  a template. The only script any panel loads is afpsql's own.
+- **Decide what a control means.** `plan_confirm` templates *declare* a control
+  with `data-afpsql-decision="approve"` or `"refuse"`; afpsql's runtime, spliced
+  in at the layout's `<!-- afpsql:trusted-runtime -->` marker under a
+  per-session nonce, is what binds that declaration to the route that runs or
+  refuses the statement. A declaration afpsql does not recognise binds to
+  nothing. A page that declares neither control does not open.
+- **Turn escaping off.** `|safe`, a `filter safe` block and `autoescape` are
+  refused, and every value a panel prints — including anything PostgreSQL
+  returned — is escaped.
+
+A frontend afpsql cannot load is an error naming safe mode
+(`ui_frontend_incompatible`, `ui_frontend_unreadable`, `ui_frontend_unsafe`,
+`ui_frontend_template`, `ui_frontend_incomplete`), never a quietly substituted
+built-in page: no window opens and nothing runs. `AFUI_SAFE_MODE=1` ignores
+every override. A workspace frontend that has not been enabled is skipped in
+silence by design — the `ui_ready` progress event carries `ui_frontend_id` only
+when an override is actually serving.
 
 ## Runtime Safety Limits
 

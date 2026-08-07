@@ -308,6 +308,32 @@ pub fn validate_session_with_trust(
     Ok(())
 }
 
+/// Everything afpsql-readonly refuses about one statement, decided before it
+/// runs, as the message and hint the refusal is reported with.
+///
+/// `handler::execute_query` makes this same judgement and is the authority: a
+/// route that skipped it would be a hole, not a shortcut. This exists for the
+/// callers that must refuse *earlier* than that — a dry run, which never
+/// reaches the executor, and `ui plan`, which would otherwise open a window and
+/// let a person approve a statement afpsql was always going to refuse.
+///
+/// Call it only when the capability is [`crate::Capability::ReadOnly`];
+/// `read_only_transaction` is the resolved permission's own answer, not a
+/// second reading of the arguments.
+#[must_use]
+pub fn readonly_refusal(sql: &str, read_only_transaction: bool) -> Option<(String, &'static str)> {
+    if let Err(error) = validate_sql(sql) {
+        return Some((error, crate::readonly_hint()));
+    }
+    if !read_only_transaction {
+        return Some((
+            "write permission is unavailable in afpsql-readonly".to_string(),
+            crate::readonly_hint(),
+        ));
+    }
+    None
+}
+
 pub fn validate_sql(sql: &str) -> Result<(), String> {
     let keywords = leading_keywords(sql, 4);
     let is_transaction_control = matches!(
@@ -330,6 +356,17 @@ pub fn validate_sql(sql: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// The first SQL keyword, lowercased, skipping leading comments.
+///
+/// Exposed so a caller that wants to *describe* a statement reads it the same
+/// way this module classifies one, rather than writing a second scanner that
+/// disagrees about `/* … */ update …`. Describing is all it is good for: the
+/// keyword says what the statement starts with, never what it is allowed to do.
+#[must_use]
+pub fn leading_keyword(sql: &str) -> Option<String> {
+    leading_keywords(sql, 1).into_iter().next()
 }
 
 fn leading_keywords(sql: &str, limit: usize) -> Vec<String> {

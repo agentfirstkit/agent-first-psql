@@ -22,10 +22,11 @@ pub mod protocol;
 pub mod psql_admin;
 pub mod readonly_policy;
 pub mod runtime_env;
-pub mod secret_config;
 pub mod skill_admin;
 pub mod ssh_transport;
 pub mod types;
+#[cfg(feature = "ui")]
+pub mod ui;
 pub mod writer;
 
 use agent_first_data::OutputFormat;
@@ -124,6 +125,26 @@ pub async fn run(capability: Capability, bin_name: &str) {
                 reject_readonly(&error, readonly_local_capability_hint());
             }
             pipe::run(init, capability, has_locked_profile).await
+        }
+        // An inspection panel only ever reads, so afpsql-readonly may open one;
+        // an administrator-locked profile may not, because opening a window
+        // spawns a browser and writes a profile directory, and locked profiles
+        // withhold host capabilities. `ui::run` enforces that itself.
+        #[cfg(feature = "ui")]
+        cli::Mode::Ui(mut request) => {
+            let has_locked_profile = locked_profile.is_some();
+            if let Some(profile) = locked_profile.clone() {
+                request.session = profile;
+            }
+            if capability == Capability::ReadOnly
+                && let Err(error) = readonly_policy::validate_session_with_trust(
+                    &request.session,
+                    has_locked_profile,
+                )
+            {
+                reject_readonly(&error, readonly_local_capability_hint());
+            }
+            ui::run(request, capability, has_locked_profile).await
         }
         cli::Mode::PsqlAdmin(_) if capability == Capability::ReadOnly => {
             reject_readonly(
