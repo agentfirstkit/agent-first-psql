@@ -322,6 +322,10 @@ fn connection_subject(session: &SessionConfig) -> String {
     };
     let mut subject = match config.get_hosts().first() {
         Some(tokio_postgres::config::Host::Tcp(host)) => host.clone(),
+        // `Host::Unix` is compiled out where Unix sockets do not exist, so the
+        // arm has to be absent on Windows rather than merely unreachable —
+        // every other match on this enum in the crate is gated the same way.
+        #[cfg(unix)]
         Some(tokio_postgres::config::Host::Unix(path)) => path.display().to_string(),
         None => String::new(),
     };

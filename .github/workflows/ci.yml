@@ -90,3 +90,32 @@ jobs:
 
       - name: PostgreSQL smoke
         run: cargo run -- --dsn "$AFPSQL_TEST_DSN_SECRET" --sql "select 1 as n"
+
+  # release.yml builds the platform binaries, and it runs *after* this gate
+  # passes — so until this job existed, a Windows-only compile error was first
+  # reported one step before `cargo publish`, with the tag already pushed. It
+  # has cost three releases. `cargo check` rather than a full build: what breaks
+  # here is `#[cfg(unix)]` items being used unconditionally, which fails to
+  # compile long before anything is linked.
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # `--all-targets` so a test that only compiles on Unix is caught here too,
+      # not by whoever next runs the suite on Windows.
+      - name: Check
+        run: cargo check --locked --all-targets

@@ -21,6 +21,7 @@
     "Render every panel from a MiniJinja template a person may replace through the frontend overlay, making the typed document each panel builds a contract: what a panel computes belongs to afpsql, what it looks like does not",
     "Add afpsql inspect connections with an --all flag, returning one row per server backend with its state, wait event and ages alongside the max_connections the count should be read against",
     "Adopt the shared value-source grammar for connection secrets in place of a private implementation of the same rules",
+    "Fix a Windows build failure from matching a Unix-only connection host variant unconditionally, and add a Windows compile check to CI so a platform-only break fails the gate instead of the publish step",
     "Move to agent-first-data 0.32.1 and agent-first-ui 0.3.1"
   ],
   "bonds": [
