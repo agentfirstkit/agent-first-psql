@@ -243,6 +243,22 @@ enum ContainerTarget {
     UnixSocket { path: String },
 }
 
+/// The `Ok` variant is the larger of the two here — a `tokio_postgres::Client`
+/// plus the bridge guard — so boxing the error would not shrink this `Result`.
+/// Asserted rather than assumed: if that stops being true, so does the
+/// `expect` below.
+const _: () = assert!(
+    std::mem::size_of::<(Client, ContainerBridgeGuard)>() >= std::mem::size_of::<ConnectError>(),
+    "ConnectError is now the larger variant; box it here as wait_bridge_handshake does"
+);
+
+// `allow`, not `expect`: a toolchain that does not emit this lint would make an
+// `expect` itself an error, and the assertion above is what carries the
+// reasoning either way.
+#[allow(
+    clippy::result_large_err,
+    reason = "the Ok variant is larger; see the size assertion above"
+)]
 pub async fn connect_stdio_bridge(
     cfg: &SessionConfig,
 ) -> Result<(Client, ContainerBridgeGuard), ConnectError> {
@@ -251,6 +267,14 @@ pub async fn connect_stdio_bridge(
     let nonce = generate_bridge_nonce();
     let (program, args) =
         build_bridge_process(&settings, &target, &nonce).map_err(ConnectError::new)?;
+    // Same reasoning as the SSH bridge: `docker`, `podman`, `nerdctl` and
+    // `kubectl` are all bare names taken from the caller's `PATH`, which a
+    // locked profile must not be reading.
+    let program = if cfg.profile_pinned {
+        crate::readonly_policy::trusted_program(&program).map_err(ConnectError::new)?
+    } else {
+        std::path::PathBuf::from(&program)
+    };
     let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .stdin(Stdio::piped())
@@ -277,14 +301,14 @@ pub async fn connect_stdio_bridge(
         // names instead of telling the agent to "check the target name".
         let stderr_text = captured_stderr(&stderr_capture);
         if stderr_indicates_missing_target(&stderr_text)
-            && let Some(list) = list_container_targets(&settings).await
+            && let Some(list) = list_container_targets(&settings, cfg.profile_pinned).await
         {
             err.hint = Some(match err.hint.take() {
                 Some(base) => format!("{base}; available containers: {list}"),
                 None => format!("available containers: {list}"),
             });
         }
-        return Err(err);
+        return Err(*err);
     }
     let stream = ContainerStdioStream { stdout, stdin };
     let pg_cfg = resolve_pg_config(cfg)
@@ -392,11 +416,14 @@ fn append_stderr_capture(capture: &Arc<Mutex<Vec<u8>>>, bytes: &[u8]) {
     }
 }
 
+// Boxed, like `ExecError::Connect` already stores it. `ConnectError` is five
+// owned strings and sizes every `Result` it appears in — which for a `()` Ok is
+// the whole return value. The caller was re-boxing it anyway.
 async fn wait_bridge_handshake(
     child: &mut tokio::process::Child,
     stderr_capture: &Arc<Mutex<Vec<u8>>>,
     handshake_rx: Option<oneshot::Receiver<bool>>,
-) -> Result<(), ConnectError> {
+) -> Result<(), Box<ConnectError>> {
     let Some(handshake_rx) = handshake_rx else {
         return Err(handshake_connect_error(
             child,
@@ -433,7 +460,7 @@ async fn handshake_connect_error(
     child: &mut tokio::process::Child,
     stderr_capture: &Arc<Mutex<Vec<u8>>>,
     message: &str,
-) -> ConnectError {
+) -> Box<ConnectError> {
     let status = child.try_wait().ok().flatten();
     let stderr_text = captured_stderr(stderr_capture);
     let mut err = ConnectError::new(message);
@@ -446,7 +473,7 @@ async fn handshake_connect_error(
             "the container bridge wrote diagnostics before {BRIDGE_READY_PREFIX}; container bridge stderr: {stderr_text}"
         )
     });
-    enrich_container_connect_error(err, status, &stderr_text)
+    Box::new(enrich_container_connect_error(err, status, &stderr_text))
 }
 
 fn captured_stderr(capture: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -532,12 +559,19 @@ const CONTAINER_LIST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// List the runtime's actual container names so a wrong-target error can name the
 /// real options. Best-effort; `None` on any failure or unsupported driver.
-async fn list_container_targets(settings: &ContainerSettings) -> Option<String> {
+async fn list_container_targets(
+    settings: &ContainerSettings,
+    profile_pinned: bool,
+) -> Option<String> {
     if settings.ssh_destination.is_some() {
         return None;
     }
     let mut args = Vec::new();
     match settings.driver {
+        ContainerDriver::Apple => {
+            args.push("list".to_string());
+            args.push("--quiet".to_string());
+        }
         ContainerDriver::Docker | ContainerDriver::Podman | ContainerDriver::Nerdctl => {
             if settings.driver == ContainerDriver::Docker
                 && let Some(context) = settings.context.as_ref()
@@ -554,9 +588,17 @@ async fn list_container_targets(settings: &ContainerSettings) -> Option<String> 
         // for now and fall back to the generic hint.
         ContainerDriver::Compose | ContainerDriver::Kubectl => return None,
     }
+    // The target listing is a hint-builder, but it still starts a process: a
+    // locked profile must not learn container names by running whatever the
+    // caller's `PATH` calls `docker`.
+    let runtime = if profile_pinned {
+        crate::readonly_policy::trusted_program(&settings.runtime).ok()?
+    } else {
+        std::path::PathBuf::from(&settings.runtime)
+    };
     let output = tokio::time::timeout(
         CONTAINER_LIST_TIMEOUT,
-        tokio::process::Command::new(&settings.runtime)
+        tokio::process::Command::new(&runtime)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -617,6 +659,18 @@ pub fn container_config_with_env(
             .docker_runtime
             .clone()
             .or_else(|| env("AFPSQL_CONTAINER_DOCKER_RUNTIME")),
+        apple_name: container
+            .apple_name
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_APPLE_NAME")),
+        apple_user: container
+            .apple_user
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_APPLE_USER")),
+        apple_runtime: container
+            .apple_runtime
+            .clone()
+            .or_else(|| env("AFPSQL_CONTAINER_APPLE_RUNTIME")),
         podman_name: container
             .podman_name
             .clone()
@@ -697,7 +751,7 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
 
     let Some(driver) = container.selected_driver()? else {
         return Err(
-            "container transport requires one of --container-docker-name, --container-podman-name, --container-nerdctl-name, --container-compose-service, or --container-kubectl-pod"
+            "container transport requires one of --container-docker-name, --container-apple-name, --container-podman-name, --container-nerdctl-name, --container-compose-service, or --container-kubectl-pod"
                 .to_string(),
         );
     };
@@ -710,6 +764,11 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
             container.docker_name.clone(),
             container.docker_user.clone(),
             container.docker_runtime.clone(),
+        ),
+        ContainerDriver::Apple => (
+            container.apple_name.clone(),
+            container.apple_user.clone(),
+            container.apple_runtime.clone(),
         ),
         ContainerDriver::Podman => (
             container.podman_name.clone(),
@@ -765,9 +824,12 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
         context: match driver {
             ContainerDriver::Docker => container.docker_context.clone(),
             ContainerDriver::Kubectl => container.kubectl_context.clone(),
-            // Podman, nerdctl, and Compose select no context, so no flag in
+            // Apple, Podman, nerdctl, and Compose select no context, so no flag in
             // those families can name one.
-            ContainerDriver::Podman | ContainerDriver::Nerdctl | ContainerDriver::Compose => None,
+            ContainerDriver::Apple
+            | ContainerDriver::Podman
+            | ContainerDriver::Nerdctl
+            | ContainerDriver::Compose => None,
         },
         compose_files: container.compose_files.clone(),
         compose_project: container.compose_project.clone(),
@@ -818,7 +880,10 @@ fn build_container_exec_args(
     let command = bridge_command_args(target, nonce);
     let mut args = Vec::new();
     match settings.driver {
-        ContainerDriver::Docker | ContainerDriver::Podman | ContainerDriver::Nerdctl => {
+        ContainerDriver::Docker
+        | ContainerDriver::Apple
+        | ContainerDriver::Podman
+        | ContainerDriver::Nerdctl => {
             if settings.driver == ContainerDriver::Docker
                 && let Some(context) = settings.context.as_ref()
             {
@@ -987,6 +1052,7 @@ mod tests {
     fn typed_drivers_select_fixed_default_runtimes() {
         for (driver, runtime) in [
             (ContainerDriver::Docker, "docker"),
+            (ContainerDriver::Apple, "container"),
             (ContainerDriver::Podman, "podman"),
             (ContainerDriver::Nerdctl, "nerdctl"),
             (ContainerDriver::Compose, "docker"),
@@ -1457,6 +1523,9 @@ mod tests {
             "AFPSQL_CONTAINER_DOCKER_USER",
             "AFPSQL_CONTAINER_DOCKER_CONTEXT",
             "AFPSQL_CONTAINER_DOCKER_RUNTIME",
+            "AFPSQL_CONTAINER_APPLE_NAME",
+            "AFPSQL_CONTAINER_APPLE_USER",
+            "AFPSQL_CONTAINER_APPLE_RUNTIME",
             "AFPSQL_CONTAINER_PODMAN_NAME",
             "AFPSQL_CONTAINER_PODMAN_USER",
             "AFPSQL_CONTAINER_PODMAN_RUNTIME",

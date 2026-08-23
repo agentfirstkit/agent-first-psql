@@ -84,6 +84,9 @@ impl RuntimeConfig {
                     &mut entry.container.docker_runtime,
                     container.docker_runtime,
                 );
+                apply_patch(&mut entry.container.apple_name, container.apple_name);
+                apply_patch(&mut entry.container.apple_user, container.apple_user);
+                apply_patch(&mut entry.container.apple_runtime, container.apple_runtime);
                 apply_patch(&mut entry.container.podman_name, container.podman_name);
                 apply_patch(&mut entry.container.podman_user, container.podman_user);
                 apply_patch(

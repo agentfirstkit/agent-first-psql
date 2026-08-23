@@ -30,6 +30,7 @@ jobs:
     env:
       AFPSQL_TEST_DSN_SECRET: postgresql://test:test@localhost:5432/test?sslmode=disable
       DATABASE_URL: postgresql://test:test@localhost:5432/test?sslmode=disable
+      AFPSQL_TEST_CONTAINER_RUNTIME: docker
       PGSSLMODE: disable
       # `all` is the release gate and includes the container e2e, which runs
       # only when this is set. The service container above covers the
@@ -51,6 +52,15 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # The runner images ship whatever ShellCheck their distribution packages
+      # — Ubuntu 24.04's is 0.9.0, two majors behind — and its rules differ from
+      # the pinned one's on real code. Provision the pin so this leg judges the
+      # tree by the same rules the local gate does.
+      - name: Setup ShellCheck
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/install-shellcheck.sh --install
 
       - name: Install afdata skill validator
         run: cargo install agent-first-data --locked --features skill

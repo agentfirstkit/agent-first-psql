@@ -103,6 +103,14 @@ impl CancelState {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Record that a cancel was asked for without sending anything.
+    ///
+    /// Used for a query the worker had not started: there is no backend to ask,
+    /// and the flag is what stops the executor from starting one.
+    pub fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
     /// Atomic claim for the terminal emission for this query id. Returns
     /// `true` exactly once across all concurrent callers (handler emitting
     /// result/sql_error, cancel dispatcher emitting cancelled error). The

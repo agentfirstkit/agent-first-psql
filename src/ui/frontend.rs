@@ -4,33 +4,40 @@
 //! lives in, whether it has been trusted, whether it declares afpsql's
 //! `ui_api_version`, which file the override supplies and which falls back to
 //! afpsql's own, and the rule that a frontend afpsql cannot load is an error
-//! naming safe mode rather than a quiet built-in page. None of that is restated
-//! here — [`PanelFrontend`] is a thin thing wrapped around
-//! `agent_first_ui::UiFrontend`, which is the one implementation of it.
+//! naming safe mode rather than a quiet built-in page. AFUI's
+//! [`agent_first_ui::UiPage`] also owns assembly: the MiniJinja environment
+//! policy, the render, the rendered-markup guard, the runtime-marker count,
+//! and the order that keeps a Provider's own trusted runtime from tripping
+//! the guard it splices past. None of that is restated here — [`PanelFrontend`]
+//! is a thin thing wrapped around both.
 //!
 //! afpsql owns what a frontend *is*: MiniJinja templates rendered against the
-//! typed panel document below, plus a stylesheet and static assets. That is the
-//! whole of what an override supplies. It supplies no behaviour: AFUI refuses a
-//! frontend file whose name says it is a script, and
-//! [`agent_first_ui::reject_frontend_script`] refuses one hiding inside a
-//! template. The only JavaScript any panel loads is afpsql's own decision
-//! runtime, injected under a per-session nonce at the layout's
-//! `<!-- afpsql:trusted-runtime -->` marker.
+//! typed panel document below, plus a stylesheet and static assets. It
+//! supplies no behaviour: `UiPage` refuses a frontend file whose name says it
+//! is a script, and refuses one hiding inside a template. The only JavaScript
+//! any panel loads is afpsql's own decision runtime, injected under a
+//! per-session nonce at the layout's `<!-- afpsql:trusted-runtime -->`
+//! marker. A static watch panel gets that marker replaced with nothing at all;
+//! the live monitor gets a separate runtime which carries snapshots and
+//! inspection requests over the session channel.
+//!
+//! What `UiPage` does *not* take is the one thing that makes a decide panel
+//! trustworthy: which declaration binds to which route. `data-afpsql-decision`
+//! is a template's to *declare*; afpsql's own runtime, spliced in under a
+//! nonce a frontend cannot forge, is what *binds* it. `UiPage` checks that a
+//! page is structurally complete; it has no idea a decide panel exists, so
+//! afpsql checks that itself, on the page `UiPage` already returned.
 //!
 //! What that buys is the point of the whole arrangement: a template can move,
 //! rename, regroup and drop anything, and still cannot make a control mean
 //! something other than what it declares — the declaration is the template's,
 //! the binding is afpsql's.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use agent_first_ui::{
-    Error as UiError, SAFE_MODE_HINT, UiCspNonce, UiFrontend, reject_frontend_script,
-    reject_rendered_script,
+    Error as UiError, UiAppIcon, UiCspNonce, UiDecisionRuntime, UiErrorKind, UiFrontend, UiPage,
 };
-use axum::Router;
-use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use serde::Serialize;
 
 pub(super) const PROVIDER_ID: &str = "afpsql";
@@ -39,11 +46,19 @@ pub(super) const PROVIDER_ID: &str = "afpsql";
 ///
 /// One number for all five panels, because from a frontend author's point of
 /// view they are one contract: the shape of the `document` a template renders
-/// against, the four template names afpsql resolves, the
+/// against, the five template names afpsql resolves, the
 /// `<!-- afpsql:trusted-runtime -->` marker, and the `data-afpsql-decision`
 /// declaration the runtime binds. A change to any of those is a change to all
 /// of them for the person who has to fix their frontend.
-pub(super) const UI_API_VERSION: &str = "1";
+///
+/// `2` is where the inspection panels stopped handing a template the snapshot
+/// query's own row shape and started handing it relations with their columns,
+/// constraints, indexes and triggers already attached — see [`super::inspect`].
+/// `3` replaces the connection monitor's page reload with a declared live
+/// snapshot/EXPLAIN surface bound by afpsql's trusted runtime. `4` separates
+/// monitor freshness from request feedback and preserves the request panel
+/// while live snapshots are replaced.
+pub(super) const UI_API_VERSION: &str = "4";
 
 /// Where afpsql splices its own behaviour into a page it did not necessarily
 /// write.
@@ -52,21 +67,37 @@ pub(super) const TRUSTED_RUNTIME_MARKER: &str = "<!-- afpsql:trusted-runtime -->
 /// How a template declares that a control answers the question.
 pub(super) const DECISION_ATTRIBUTE: &str = "data-afpsql-decision";
 
-/// The entry template every override supplies under `templates/`.
-///
-/// One name for every `ui_kind` rather than five, because an override
-/// directory is already keyed by `ui_kind`: the person editing
-/// `.afui/frontends/afpsql/plan_confirm/templates/page.html.j2` has already
-/// said which panel they mean by being in that directory.
-const ENTRY_TEMPLATE: &str = "page.html.j2";
+/// Where the decide page shows what is happening while an answer travels.
+const DECISION_STATUS_ATTRIBUTE: &str = "data-afpsql-decision-status";
 
-const LAYOUT_TEMPLATE: &str = "layout.html.j2";
-const TABLE_TEMPLATE: &str = "table.html.j2";
-const DECIDED_TEMPLATE: &str = "decided.html.j2";
+/// Every hook `monitor_runtime.js` looks for. A page that dropped one opens
+/// with a live region nothing ever writes into.
+const MONITOR_DECLARATIONS: [&str; 7] = [
+    "data-afpsql-monitor-snapshot",
+    "data-afpsql-explain-form",
+    "data-afpsql-explain-sql",
+    "data-afpsql-explain-result",
+    "data-afpsql-explain-panel",
+    "data-afpsql-explain-status",
+    "data-afpsql-live-status",
+];
+
+/// Every template name doubles as the on-disk path an override supplies it
+/// under, per `UiPage` — so a template's own `{% extends %}` / `{% include %}`
+/// has to spell the same `templates/…` path a person sees in their frontend
+/// directory, not a bare file name.
+const ENTRY_TEMPLATE: &str = "templates/page.html.j2";
+const LAYOUT_TEMPLATE: &str = "templates/layout.html.j2";
+const TABLE_TEMPLATE: &str = "templates/table.html.j2";
+const RELATION_TEMPLATE: &str = "templates/relation.html.j2";
+const DECIDED_TEMPLATE: &str = "templates/decided.html.j2";
 
 const BUILTIN_LAYOUT: &str = include_str!("templates/layout.html.j2");
 const BUILTIN_TABLE: &str = include_str!("templates/table.html.j2");
-const BUILTIN_INSPECT: &str = include_str!("templates/inspect.html.j2");
+const BUILTIN_RELATION: &str = include_str!("templates/relation.html.j2");
+const BUILTIN_TABLE_INSPECT: &str = include_str!("templates/table-inspect.html.j2");
+const BUILTIN_SCHEMA_INSPECT: &str = include_str!("templates/schema-inspect.html.j2");
+const BUILTIN_INDEX_INSPECT: &str = include_str!("templates/index-inspect.html.j2");
 const BUILTIN_MONITOR: &str = include_str!("templates/monitor.html.j2");
 const BUILTIN_PLAN: &str = include_str!("templates/plan.html.j2");
 const BUILTIN_DECIDED: &str = include_str!("templates/decided.html.j2");
@@ -75,9 +106,33 @@ const BUILTIN_DECIDED: &str = include_str!("templates/decided.html.j2");
 /// no style exemption in its policy, and so a frontend can replace presentation
 /// without touching structure — or structure without touching presentation.
 const BUILTIN_STYLE: &str = include_str!("style.css");
+const BUILTIN_APP_ICON: &str = include_str!("app-icon.svg");
 
-/// afpsql's own behaviour, and the only script any panel ever loads.
-const DECISION_RUNTIME: &str = include_str!("runtime.js");
+/// afpsql's own behaviour, and the only script a monitor panel ever loads.
+///
+/// Served with AFUI's page kernel ahead of it, inside one function scope: the
+/// session root, state synchronization, reconnect and call correlation are not
+/// facts about PostgreSQL, and this file is shorter for not restating them.
+const MONITOR_RUNTIME: &str = include_str!("monitor_runtime.js");
+
+/// The decide panel's runtime: which declaration means what, and afpsql's own
+/// words for what is happening while it travels.
+///
+/// The rules around it — exact declaration match, an unrecognised declaration
+/// bound to nothing, one answer per page, every control disabled the moment
+/// one is pressed, a form navigation rather than a fetch — are AFUI's, so they
+/// hold identically for every decide page in this kit rather than being
+/// re-derived here. What stays afpsql's is the vocabulary: `approve` and
+/// `refuse`, the routes they post to, and what a person reads while waiting.
+pub(super) fn decision_runtime() -> Result<UiDecisionRuntime, FrontendFailure> {
+    UiDecisionRuntime::new(DECISION_ATTRIBUTE)
+        .and_then(|runtime| runtime.with_status_attribute(DECISION_STATUS_ATTRIBUTE))
+        .and_then(|runtime| runtime.with_decision("approve", "approve"))
+        .and_then(|runtime| runtime.with_pending_text("approve", "Approving…"))
+        .and_then(|runtime| runtime.with_decision("refuse", "refuse"))
+        .and_then(|runtime| runtime.with_pending_text("refuse", "Refusing…"))
+        .map_err(FrontendFailure::from)
+}
 
 /// A panel that failed before it could be shown, in afpsql's error vocabulary.
 #[derive(Debug)]
@@ -87,36 +142,74 @@ pub(super) struct FrontendFailure {
     pub(super) hint: Option<&'static str>,
 }
 
-impl FrontendFailure {
-    fn new(code: &'static str, message: String) -> Self {
+/// Every AFUI failure, in afpsql's vocabulary.
+///
+/// AFUI classifies its own errors; afpsql prefixes that classification and
+/// takes the recovery action AFUI already knows about. What used to be here
+/// was a match over AFUI's variants that fell into `unreadable` for anything
+/// it had not thought about, plus a second conversion path whose whole job was
+/// to strip a hint AFUI had embedded in its own message.
+impl From<UiError> for FrontendFailure {
+    fn from(error: UiError) -> Self {
         Self {
-            code,
-            message,
-            hint: Some(SAFE_MODE_HINT),
+            code: ui_error_code(&error),
+            message: error.to_string(),
+            hint: error.hint(),
         }
     }
 }
 
-impl From<UiError> for FrontendFailure {
-    fn from(error: UiError) -> Self {
-        let code = match error {
-            UiError::FrontendIncompatible { .. } => "ui_frontend_incompatible",
-            UiError::FrontendScript { .. } | UiError::FrontendFileName { .. } => {
-                "ui_frontend_unsafe"
-            }
-            _ => "ui_frontend_unreadable",
-        };
-        Self::new(code, error.to_string())
+/// `ui_<afpsql's word for what AFUI classified>`, interned so the code stays
+/// `&'static str`.
+///
+/// A `String` here would ripple through every event this failure reaches.
+/// Exhaustive over AFUI's closed classification, with **no wildcard arm**:
+/// this used to default to `ui_frontend_unreadable`, which reported a closed
+/// session runtime, a machine with no browser and a bad `--mode` as a frontend
+/// that could not be read — and sent a person to look at a file that was fine.
+/// Now a classification AFUI adds stops this compiling until afpsql decides
+/// what it is called here.
+fn ui_error_code(error: &UiError) -> &'static str {
+    match error.kind() {
+        UiErrorKind::FrontendIncompatible => "ui_frontend_incompatible",
+        UiErrorKind::FrontendUnsafe => "ui_frontend_unsafe",
+        UiErrorKind::FrontendUnreadable => "ui_frontend_unreadable",
+        UiErrorKind::PageRender => "ui_frontend_template",
+        UiErrorKind::PageIncomplete => "ui_frontend_incomplete",
+        UiErrorKind::WindowUnavailable => "ui_window_unavailable",
+        UiErrorKind::WindowWaitFailed => "ui_window_wait_failed",
+        UiErrorKind::DeliveryModeInvalid | UiErrorKind::DeliveryModeNotOffered => {
+            "ui_delivery_unavailable"
+        }
+        UiErrorKind::LinkAddressUnavailable | UiErrorKind::UpstreamNotProxyable => {
+            "ui_delivery_unreachable"
+        }
+        UiErrorKind::RuntimeClosed => "ui_runtime_closed",
+        UiErrorKind::RuntimeBusy => "ui_runtime_busy",
+        UiErrorKind::RuntimeMisconfigured
+        | UiErrorKind::RuntimeMessageTooLarge
+        | UiErrorKind::RuntimeBlob
+        | UiErrorKind::RuntimePayload => "ui_runtime_failed",
+        UiErrorKind::ConfigUnreadable => "ui_config_unreadable",
+        UiErrorKind::InvalidArgument | UiErrorKind::Io => "ui_failed",
     }
 }
 
 /// Which built-in page a `ui_kind` starts from when no override supplies one.
+///
+/// The three inspection panels are separate shapes rather than one, because
+/// their documents are: a snapshot read as one relation, the same snapshot read
+/// as a whole schema, and a list of indexes are three things to look at, not one
+/// grid rendered three times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PanelShape {
-    /// One result set, read once: `schema_inspect`, `table_inspect`,
-    /// `index_inspect`.
-    Inspect,
-    /// The same query re-run on every reload: `connection_monitor`.
+    /// One relation and everything attached to it: `table_inspect`.
+    Table,
+    /// Every object in one schema: `schema_inspect`.
+    Schema,
+    /// Indexes under the tables they belong to: `index_inspect`.
+    Index,
+    /// The same query pushed on a live interval: `connection_monitor`.
     Monitor,
     /// One statement and a person's answer: `plan_confirm`.
     Decide,
@@ -125,7 +218,9 @@ pub(super) enum PanelShape {
 impl PanelShape {
     fn builtin_entry(self) -> &'static str {
         match self {
-            Self::Inspect => BUILTIN_INSPECT,
+            Self::Table => BUILTIN_TABLE_INSPECT,
+            Self::Schema => BUILTIN_SCHEMA_INSPECT,
+            Self::Index => BUILTIN_INDEX_INSPECT,
             Self::Monitor => BUILTIN_MONITOR,
             Self::Decide => BUILTIN_PLAN,
         }
@@ -136,13 +231,16 @@ impl PanelShape {
     fn needs_decision_controls(self) -> bool {
         matches!(self, Self::Decide)
     }
+
+    fn needs_monitor_contract(self) -> bool {
+        matches!(self, Self::Monitor)
+    }
 }
 
 /// One panel's file source: a person's frontend, or afpsql's own.
 pub(super) struct PanelFrontend {
     frontend: UiFrontend,
     shape: PanelShape,
-    ui_kind: &'static str,
 }
 
 impl PanelFrontend {
@@ -157,11 +255,7 @@ impl PanelFrontend {
     ) -> Result<Self, FrontendFailure> {
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let frontend = UiFrontend::resolve(&workspace_root, PROVIDER_ID, ui_kind, UI_API_VERSION)?;
-        Ok(Self {
-            frontend,
-            shape,
-            ui_kind,
-        })
+        Ok(Self { frontend, shape })
     }
 
     /// afpsql's own panel, for a caller that is not reading any frontend.
@@ -170,7 +264,6 @@ impl PanelFrontend {
         Self {
             frontend: UiFrontend::builtin(PROVIDER_ID, ui_kind, UI_API_VERSION),
             shape,
-            ui_kind,
         }
     }
 
@@ -192,257 +285,117 @@ impl PanelFrontend {
             .unwrap_or_else(|| BUILTIN_STYLE.as_bytes().to_vec()))
     }
 
-    /// The frontend's `assets/` tree. Every path 404s when there is no
-    /// frontend, so a panel mounts this without asking whether one exists.
-    pub(super) fn assets_router(&self) -> Router {
-        self.frontend.assets_router()
+    /// The application icon from this panel's resolved frontend overlay.
+    pub(super) fn app_icon(&self) -> Result<UiAppIcon, FrontendFailure> {
+        self.frontend
+            .app_icon(BUILTIN_APP_ICON)
+            .map_err(FrontendFailure::from)
+    }
+
+    /// The resolved overlay behind this panel, for AFUI's own page routes.
+    pub(super) fn frontend(&self) -> &UiFrontend {
+        &self.frontend
     }
 
     /// Render this panel's page from a typed document.
     ///
     /// `nonce` is the session's, and the only thing that can put a script on
-    /// the page. A panel with no decision to make passes `None` and the marker
-    /// resolves to nothing at all.
+    /// the page. A panel with no decision to make passes `None` — `UiPage`
+    /// still requires the marker to appear exactly once, and only replaces it
+    /// with nothing rather than skipping the check.
     pub(super) fn render_page<T: Serialize>(
         &self,
         document: &T,
         nonce: Option<&UiCspNonce>,
     ) -> Result<String, FrontendFailure> {
-        self.render(ENTRY_TEMPLATE, self.shape, document, nonce)
+        let decisions = self
+            .shape
+            .needs_decision_controls()
+            .then(decision_runtime)
+            .transpose()?;
+        let runtime = self.trusted_runtime(nonce, decisions.as_ref())?;
+        let mut builder = UiPage::builder(&self.frontend)
+            .entry(ENTRY_TEMPLATE)
+            .fallback(self.shape.builtin_entry())
+            .template(LAYOUT_TEMPLATE, BUILTIN_LAYOUT)
+            .template(TABLE_TEMPLATE, BUILTIN_TABLE)
+            .template(RELATION_TEMPLATE, BUILTIN_RELATION)
+            .template(DECIDED_TEMPLATE, BUILTIN_DECIDED)
+            .override_templates_under("templates", ".j2")?;
+        // Both contracts are now `UiPage`'s to check, on the parse tree it
+        // already built, before it returns a page at all — rather than two
+        // hand-written scans over the rendered string afterwards.
+        if let Some(decisions) = &decisions {
+            builder = builder.requires_decisions(decisions);
+        }
+        if self.shape.needs_monitor_contract() {
+            builder = builder.requires_attributes(MONITOR_DECLARATIONS.iter().copied());
+        }
+        builder
+            .runtime_marker(TRUSTED_RUNTIME_MARKER)
+            .runtime(runtime)
+            .render(document)
+            .map_err(FrontendFailure::from)
     }
 
     /// Render the page afpsql shows once an answer has been recorded.
     ///
-    /// Rendered through the same pipeline, so an override's layout and
-    /// stylesheet still apply — but never a decision control, because this page
-    /// has no question on it.
+    /// Rendered through the same pipeline, so an override's layout still
+    /// applies — but never a decision control, because this page has no
+    /// question on it and loads no runtime at all.
     pub(super) fn render_decided<T: Serialize>(
         &self,
         document: &T,
     ) -> Result<String, FrontendFailure> {
-        self.render(DECIDED_TEMPLATE, PanelShape::Inspect, document, None)
+        UiPage::builder(&self.frontend)
+            .entry(DECIDED_TEMPLATE)
+            .fallback(BUILTIN_DECIDED)
+            .template(LAYOUT_TEMPLATE, BUILTIN_LAYOUT)
+            .template(ENTRY_TEMPLATE, self.shape.builtin_entry())
+            .template(TABLE_TEMPLATE, BUILTIN_TABLE)
+            .template(RELATION_TEMPLATE, BUILTIN_RELATION)
+            .override_templates_under("templates", ".j2")?
+            .runtime_marker(TRUSTED_RUNTIME_MARKER)
+            .runtime(None)
+            .render(document)
+            .map_err(FrontendFailure::from)
     }
 
-    fn render<T: Serialize>(
+    /// Register every additional `.j2` file a frontend put under
+    /// `templates/`.  The five contract templates above keep their built-in
+    /// fallbacks; all other names are override-only partials discovered at
+    /// runtime and may be included by exactly their frontend-relative path.
+    /// The nonce-bound decision runtime for a shape with a question on it, or
+    /// `None` for one that has none. Either way `UiPage` still requires the
+    /// marker to appear — `None` is what tells it to replace the marker with
+    /// nothing rather than a script tag.
+    fn trusted_runtime(
         &self,
-        entry: &str,
-        shape: PanelShape,
-        document: &T,
         nonce: Option<&UiCspNonce>,
-    ) -> Result<String, FrontendFailure> {
-        let mut environment = Environment::new();
-        environment.set_undefined_behavior(UndefinedBehavior::SemiStrict);
-        // Every panel template is HTML and every value in a document is a
-        // domain value, so escaping is unconditional and `safe` is not a filter
-        // a frontend can reach for.
-        environment.set_auto_escape_callback(|_| AutoEscape::Html);
-        environment.remove_filter("safe");
-        for (name, text) in self.template_sources()? {
-            environment
-                .add_template_owned(name.clone(), text)
-                .map_err(|error| self.template_failure(&name, &error))?;
-        }
-        let template = environment
-            .get_template(entry)
-            .map_err(|error| self.template_failure(entry, &error))?;
-        let page = template
-            .render(minijinja::context! { document => minijinja::Value::from_serialize(document) })
-            .map_err(|error| self.template_failure(entry, &error))?;
-
-        // A value that arrived from PostgreSQL is checked after rendering as
-        // well as before: escaping is what stops a table name from becoming
-        // markup, and this is what notices when it did not.
-        reject_rendered_script("rendered page", &page).map_err(FrontendFailure::from)?;
-        self.finish(shape, page, nonce)
-    }
-
-    /// Splice afpsql's behaviour into the rendered page, and refuse a page that
-    /// left no room for it.
-    fn finish(
-        &self,
-        shape: PanelShape,
-        page: String,
-        nonce: Option<&UiCspNonce>,
-    ) -> Result<String, FrontendFailure> {
-        if !shape.needs_decision_controls() {
-            return Ok(page.replace(TRUSTED_RUNTIME_MARKER, ""));
-        }
-        let Some(nonce) = nonce else {
-            return Err(FrontendFailure {
-                code: "internal",
-                message: "a decision panel was rendered without a session nonce".to_owned(),
-                hint: None,
-            });
+        decisions: Option<&UiDecisionRuntime>,
+    ) -> Result<Option<String>, FrontendFailure> {
+        let (runtime, purpose) = match self.shape {
+            PanelShape::Monitor => (
+                format!(
+                    "(function(){{\n{}\n{MONITOR_RUNTIME}\n}})();",
+                    agent_first_ui::page_kernel_source()
+                ),
+                "live monitor",
+            ),
+            PanelShape::Decide => match decisions {
+                Some(decisions) => (decisions.source(), "decision"),
+                None => return Ok(None),
+            },
+            PanelShape::Table | PanelShape::Schema | PanelShape::Index => return Ok(None),
         };
-        if !page.contains(TRUSTED_RUNTIME_MARKER) {
-            return Err(self.broken_override(format!(
-                "the rendered page does not contain `{TRUSTED_RUNTIME_MARKER}`, so afpsql has \
-                 nowhere to bind the controls that answer it"
-            )));
-        }
-        for declared in ["approve", "refuse"] {
-            if !declares_decision(&page, declared) {
-                return Err(self.broken_override(format!(
-                    "the rendered page declares no `{DECISION_ATTRIBUTE}=\"{declared}\"` control, \
-                     so a person could not {declared} the statement"
-                )));
-            }
-        }
-        let runtime = format!(
-            "<script nonce=\"{}\">\n{DECISION_RUNTIME}</script>",
+        let nonce = nonce.ok_or_else(|| FrontendFailure {
+            code: "internal",
+            message: format!("a {purpose} panel was rendered without a session nonce"),
+            hint: None,
+        })?;
+        Ok(Some(format!(
+            "<script nonce=\"{}\">\n{runtime}</script>",
             nonce.as_str()
-        );
-        Ok(page.replace(TRUSTED_RUNTIME_MARKER, &runtime))
-    }
-
-    /// Every template the environment needs: the frontend's where it has one,
-    /// afpsql's where it does not.
-    ///
-    /// Per file, not per directory. Replacing `page.html.j2` alone keeps
-    /// afpsql's layout and table partial; replacing the layout alone keeps
-    /// afpsql's page. A frontend may also add templates of its own and
-    /// `{% include %}` them, which is what makes a real restructure possible
-    /// rather than a reskin.
-    fn template_sources(&self) -> Result<Vec<(String, String)>, FrontendFailure> {
-        let mut sources = Vec::new();
-        let mut supplied = BTreeSet::new();
-        for name in self.frontend_template_names() {
-            let Some(text) = self.frontend.text(&format!("templates/{name}"))? else {
-                continue;
-            };
-            // Both halves of "a frontend supplies no behaviour" — smuggled
-            // markup and the MiniJinja directives that switch escaping off —
-            // are one call, because they are one rule and every Provider needs
-            // the same one.
-            reject_frontend_script(&name, &text).map_err(FrontendFailure::from)?;
-            supplied.insert(name.clone());
-            sources.push((name, text));
-        }
-        for (name, builtin) in [
-            (ENTRY_TEMPLATE, self.shape.builtin_entry()),
-            (LAYOUT_TEMPLATE, BUILTIN_LAYOUT),
-            (TABLE_TEMPLATE, BUILTIN_TABLE),
-            (DECIDED_TEMPLATE, BUILTIN_DECIDED),
-        ] {
-            if !supplied.contains(name) {
-                sources.push((name.to_owned(), builtin.to_owned()));
-            }
-        }
-        Ok(sources)
-    }
-
-    /// The template file names the frontend actually ships.
-    ///
-    /// Read from the directory rather than from a fixed list, so a frontend can
-    /// break its page into partials afpsql has never heard of. Names go back
-    /// through `UiFrontend::text`, which is what validates them.
-    fn frontend_template_names(&self) -> Vec<String> {
-        let Some(location) = self.frontend.location() else {
-            return Vec::new();
-        };
-        let Ok(entries) = std::fs::read_dir(location.root.join("templates")) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| name.ends_with(".j2"))
-            .collect();
-        names.sort();
-        names
-    }
-
-    fn template_failure(&self, label: &str, error: &minijinja::Error) -> FrontendFailure {
-        let mut detail = error.to_string();
-        let mut source = std::error::Error::source(error);
-        while let Some(next) = source {
-            detail.push_str(": ");
-            detail.push_str(&next.to_string());
-            source = next.source();
-        }
-        FrontendFailure::new(
-            "ui_frontend_template",
-            match self.frontend.frontend_id() {
-                Some(frontend_id) => format!(
-                    "the {PROVIDER_ID} {} frontend `{frontend_id}` could not render `{label}`: \
-                     {detail}",
-                    self.ui_kind
-                ),
-                None => format!("{PROVIDER_ID} could not render its own `{label}`: {detail}"),
-            },
-        )
-    }
-
-    fn broken_override(&self, what: String) -> FrontendFailure {
-        FrontendFailure::new(
-            "ui_frontend_incomplete",
-            match self.frontend.frontend_id() {
-                Some(frontend_id) => format!(
-                    "the {PROVIDER_ID} {} frontend `{frontend_id}` is incomplete: {what}",
-                    self.ui_kind
-                ),
-                None => format!(
-                    "{PROVIDER_ID}'s own {} page is incomplete: {what}",
-                    self.ui_kind
-                ),
-            },
-        )
-    }
-}
-
-/// Whether the page declares a control for this answer.
-///
-/// Tolerant about quoting because a person writes this by hand, and strict
-/// about the value: an unrecognised declaration binds to nothing, so a page
-/// that only declares `approve` is reported rather than opened.
-fn declares_decision(page: &str, declared: &str) -> bool {
-    page.match_indices(DECISION_ATTRIBUTE).any(|(index, _)| {
-        let after = &page[index + DECISION_ATTRIBUTE.len()..];
-        let after = after.trim_start();
-        let Some(after) = after.strip_prefix('=') else {
-            return false;
-        };
-        let after = after.trim_start();
-        // The value has to be exactly the declaration, not merely start with
-        // it. A prefix match accepts `approve-all`, which the runtime maps to
-        // nothing — so the page would satisfy this check and then open with a
-        // control that silently does nothing. That is precisely the failure
-        // `ui_frontend_incomplete` exists to prevent, so matching loosely here
-        // would defeat the check it guards.
-        let value = match after.chars().next() {
-            Some(quote @ ('"' | '\'')) => after[quote.len_utf8()..].split(quote).next(),
-            _ => after
-                .split(|character: char| character.is_ascii_whitespace() || character == '>')
-                .next(),
-        };
-        value == Some(declared)
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_declaration_must_be_the_whole_value_not_a_prefix() {
-        let declared =
-            |value: &str| format!("<button {DECISION_ATTRIBUTE}=\"{value}\">go</button>");
-        assert!(declares_decision(&declared("approve"), "approve"));
-        assert!(declares_decision(&declared("refuse"), "refuse"));
-        assert!(declares_decision(
-            &format!("<button {DECISION_ATTRIBUTE}='approve'>go</button>"),
-            "approve"
-        ));
-
-        // Regression: this used to pass on a prefix match. The runtime maps
-        // only the exact values, so such a page satisfied the completeness
-        // check and then opened with a control that did nothing at all — the
-        // one outcome `ui_frontend_incomplete` exists to prevent.
-        assert!(!declares_decision(&declared("approve-all"), "approve"));
-        assert!(!declares_decision(&declared("refuse_everything"), "refuse"));
-        assert!(!declares_decision(&declared("approved"), "approve"));
-        assert!(!declares_decision(&declared(""), "approve"));
-        assert!(!declares_decision("<button>go</button>", "approve"));
+        )))
     }
 }

@@ -10,6 +10,9 @@ use agent_first_data::{
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, btree_map::Entry};
 
+#[cfg(feature = "ui")]
+use agent_first_ui::UiDeliveryMode;
+
 const STARTUP_ENV_KEYS: &[&str] = &[
     "AFPSQL_DSN_SECRET",
     "AFPSQL_CONNINFO_SECRET",
@@ -26,6 +29,9 @@ const STARTUP_ENV_KEYS: &[&str] = &[
     "AFPSQL_CONTAINER_DOCKER_USER",
     "AFPSQL_CONTAINER_DOCKER_CONTEXT",
     "AFPSQL_CONTAINER_DOCKER_RUNTIME",
+    "AFPSQL_CONTAINER_APPLE_NAME",
+    "AFPSQL_CONTAINER_APPLE_USER",
+    "AFPSQL_CONTAINER_APPLE_RUNTIME",
     "AFPSQL_CONTAINER_PODMAN_NAME",
     "AFPSQL_CONTAINER_PODMAN_USER",
     "AFPSQL_CONTAINER_PODMAN_RUNTIME",
@@ -74,6 +80,12 @@ pub struct UiRequest {
     pub startup_args: Value,
     pub startup_env: Value,
     pub startup_requested: bool,
+    /// `--mode`, parsed but not yet resolved against `AFUI_DELIVERY`: `None`
+    /// means the flag was not given, not "use the default". `ui::run` is
+    /// where `explicit > AFUI_DELIVERY > window` is actually decided, via
+    /// `agent_first_ui::UiDeliveryPlan::resolve` — giving this field a
+    /// default here would make that priority unreachable.
+    pub delivery: Option<UiDeliveryMode>,
 }
 
 /// Which of AFUI's two session shapes this invocation asked for.
@@ -101,7 +113,7 @@ pub enum UiView {
     },
     Connections {
         all: bool,
-        /// Seconds between the page's own reloads. Presentation, not part of
+        /// Seconds between live snapshots. Presentation, not part of
         /// the query — [`UiView::inspect_action`] ignores it.
         refresh_seconds: u64,
     },
@@ -324,7 +336,7 @@ const PERMISSIONS: [&str; 6] = [
 /// command that accepts it, which is what makes one `<command> --help` a
 /// complete answer instead of a pointer to a parent. This is that one list,
 /// applied to each command that can open a session.
-const CONNECTION_IDS: [&str; 33] = [
+const CONNECTION_IDS: [&str; 36] = [
     "dsn",
     "conninfo",
     "host",
@@ -341,6 +353,9 @@ const CONNECTION_IDS: [&str; 33] = [
     "container_docker_user",
     "container_docker_context",
     "container_docker_runtime",
+    "container_apple_name",
+    "container_apple_user",
+    "container_apple_runtime",
     "container_podman_name",
     "container_podman_user",
     "container_podman_runtime",
@@ -553,6 +568,19 @@ fn with_connection_args(command: CommandSpec) -> CommandSpec {
         .arg(
             ArgSpec::option("--container-docker-runtime", "COMMAND")
                 .about("Docker runtime command; defaults to docker"),
+        )
+        .arg(
+            ArgSpec::option("--container-apple-name", "NAME").about(
+                "Run an Apple container exec stdio bridge in this container before connecting",
+            ),
+        )
+        .arg(
+            ArgSpec::option("--container-apple-user", "USER")
+                .about("Container OS user to run the Apple container exec bridge as"),
+        )
+        .arg(
+            ArgSpec::option("--container-apple-runtime", "COMMAND")
+                .about("Apple container runtime command; defaults to container"),
         )
         .arg(
             ArgSpec::option("--container-podman-name", "NAME")
@@ -889,11 +917,45 @@ fn inspect_table_command() -> CommandSpec {
 /// person and returns only once they close the window. One verb cannot own both
 /// endings.
 fn ui_view_command(name: &'static str, about: &'static str) -> CommandSpec {
-    with_connection_args(CommandSpec::new(["ui", name]).about(about))
+    with_connection_args(CommandSpec::new(["ui", name]).about(about)).arg(ui_delivery_mode_arg())
+}
+
+/// `--mode` for a panel: which of AFUI's deliveries hands it to a person.
+///
+/// A different axis from the root `--mode cli|pipe|psql` — the two never
+/// appear on the same command line, since `ui` has no runtime mode of its
+/// own — and AFDATA scopes an argument id to the exact command path that
+/// declares it, so `ui table --mode window` and `afpsql --mode cli` are two
+/// unrelated declarations rather than a name collision. The same reuse
+/// already exists inside a single binary's own registry (an `api serve`
+/// network-exposure `--mode` beside a `ui` delivery `--mode`), which is where
+/// this was confirmed rather than assumed.
+///
+/// `link` is absent from the enum, from `--help`, and from the plan behind
+/// them — [`UI_DELIVERY`] is the one place that says so, and it builds both.
+/// An absent capability is a value this axis was never given, not a silently
+/// broken one. Why a database panel does not offer it is in `ui.rs`, where the
+/// offer is used.
+///
+/// The flag has no default, which AFUI now enforces rather than each Provider
+/// remembering: a default here would read the same as a person having typed
+/// `--mode window`, and the priority explicit > `AFUI_DELIVERY` > window would
+/// never reach the environment.
+/// Which deliveries every afpsql panel offers, declared once.
+///
+/// Used by the flag below and by `ui.rs` when it builds the plan, so the two
+/// cannot drift apart.
+#[cfg(feature = "ui")]
+pub(crate) const UI_DELIVERY: agent_first_ui::cli::UiDeliveryOffer =
+    agent_first_ui::cli::UiDeliveryOffer::Local;
+
+fn ui_delivery_mode_arg() -> ArgSpec {
+    UI_DELIVERY.arg("--mode")
 }
 
 fn ui_combination(id: &'static str, extra: &[&'static str]) -> Combination {
     let mut optional: Vec<&str> = extra.to_vec();
+    optional.push("mode");
     optional.extend_from_slice(&CONNECTION_IDS);
     Combination::new(id)
         .action(id)
@@ -939,9 +1001,9 @@ fn ui_indexes_command() -> CommandSpec {
     .combination(ui_combination("ui_indexes", &["schema", "table"]))
 }
 
-/// How often the connection monitor reloads itself, and the floor under it.
+/// How often the connection monitor pushes a snapshot, and the floor under it.
 ///
-/// The floor is not a guess about what is pretty: a page that reloads faster
+/// The floor is not a guess about what is pretty: a monitor that queries faster
 /// than a person can read it is a poll loop against someone's production server
 /// wearing a window as a disguise. Below it the invocation is refused rather
 /// than quietly clamped, because an agent that asked for 100ms should be told
@@ -955,7 +1017,7 @@ const MIN_REFRESH_SECONDS: i64 = 2;
 fn ui_connections_command() -> CommandSpec {
     ui_view_command(
         "connections",
-        "Open a live panel counting server connections against max_connections; reloads itself.",
+        "Open a live server-connection panel with plain EXPLAIN input.",
     )
     .arg(
         ArgSpec::flag("--all")
@@ -965,7 +1027,7 @@ fn ui_connections_command() -> CommandSpec {
         ArgSpec::option_i64("--refresh", "SECONDS")
             .default_i64(DEFAULT_REFRESH_SECONDS)
             .about(format!(
-                "Seconds between reloads; minimum {MIN_REFRESH_SECONDS}"
+                "Seconds between live snapshots; minimum {MIN_REFRESH_SECONDS}"
             )),
     )
     .combination(ui_combination("ui_connections", &["all", "refresh"]))
@@ -1527,6 +1589,9 @@ fn connection_from(invocation: &ResolvedInvocation) -> Result<Connection, ParseE
             docker_user: optional_string(invocation, "container_docker_user"),
             docker_context: optional_string(invocation, "container_docker_context"),
             docker_runtime: optional_string(invocation, "container_docker_runtime"),
+            apple_name: optional_string(invocation, "container_apple_name"),
+            apple_user: optional_string(invocation, "container_apple_user"),
+            apple_runtime: optional_string(invocation, "container_apple_runtime"),
             podman_name: optional_string(invocation, "container_podman_name"),
             podman_user: optional_string(invocation, "container_podman_user"),
             podman_runtime: optional_string(invocation, "container_podman_runtime"),
@@ -1796,7 +1861,20 @@ fn ui_request(
         startup_args,
         startup_env: startup_env_snapshot(),
         startup_requested: startup_requested(&entries),
+        delivery: delivery_mode_of(invocation)?,
     }))
+}
+
+/// `--mode`, read as the enum `ui::run` resolves against `AFUI_DELIVERY`.
+///
+/// `None` when the flag was not given — the registered enum only ever
+/// accepts `window` or `session`, so a parse failure here would be a defect
+/// in this program's own registration, not a value a caller passed; it is
+/// still propagated as a `ParseError` rather than assumed away.
+#[cfg(feature = "ui")]
+fn delivery_mode_of(invocation: &ResolvedInvocation) -> Result<Option<UiDeliveryMode>, ParseError> {
+    agent_first_ui::cli::delivery_of(invocation, "mode")
+        .map_err(|error| ParseError::invalid_value(error.to_string()))
 }
 
 #[cfg(feature = "ui")]
@@ -1841,7 +1919,7 @@ fn run_ui_connections(invocation: &ResolvedInvocation) -> ActionResult {
             "--refresh must be at least {MIN_REFRESH_SECONDS} seconds"
         ))
         .hint(
-            "a panel that reloads faster than a person reads is a poll loop against the server",
+            "a panel that updates faster than a person reads is a poll loop against the server",
         ));
     }
     run_ui(
@@ -2322,6 +2400,21 @@ fn parse_psql_long_arg(
         "--container-docker-runtime" => {
             state.container.docker_runtime =
                 Some(take_long_arg_value(raw, i, "--container-docker-runtime")?);
+            Ok(())
+        }
+        "--container-apple-name" => {
+            state.container.apple_name =
+                Some(take_long_arg_value(raw, i, "--container-apple-name")?);
+            Ok(())
+        }
+        "--container-apple-user" => {
+            state.container.apple_user =
+                Some(take_long_arg_value(raw, i, "--container-apple-user")?);
+            Ok(())
+        }
+        "--container-apple-runtime" => {
+            state.container.apple_runtime =
+                Some(take_long_arg_value(raw, i, "--container-apple-runtime")?);
             Ok(())
         }
         "--container-podman-name" => {
@@ -2960,13 +3053,23 @@ fn parse_param_value(v: &str) -> Value {
     Value::String(v.to_string())
 }
 
-fn wrap_explain_sql(user_sql: &str, analyze: bool) -> String {
+pub(crate) fn wrap_explain_sql(user_sql: &str, analyze: bool) -> String {
     let body = crate::db::trim_trailing_statement_terminators(user_sql);
     if analyze {
         format!("explain (analyze true, format json, buffers true) {body}")
     } else {
         format!("explain (format json) {body}")
     }
+}
+
+/// A text plan for the human monitor UI.
+///
+/// The structured CLI keeps JSON because agents consume it. The live panel is
+/// read by a person, so PostgreSQL's indented text plan is the useful shape and
+/// avoids making the browser reverse-engineer a protocol result into a tree.
+pub(crate) fn wrap_explain_text_sql(user_sql: &str) -> String {
+    let body = crate::db::trim_trailing_statement_terminators(user_sql);
+    format!("explain (format text) {body}")
 }
 
 fn optional_string_value(value: Option<String>) -> Value {

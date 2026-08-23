@@ -263,6 +263,23 @@ pub enum Output {
         columns: Vec<ColumnInfo>,
         trace: Trace,
     },
+    /// A cancel was requested for a running query. **Not** the query's
+    /// outcome.
+    ///
+    /// PostgreSQL's CancelRequest has no response and may arrive after the
+    /// backend already finished the statement, so nothing here knows yet
+    /// whether the SQL was stopped, committed, or failed for its own reasons.
+    /// The query's single terminal event — `result` / `sql_error` / `error` —
+    /// still follows under the same `id`, and that one is the answer.
+    #[serde(rename = "cancel_requested")]
+    CancelRequested {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// What was actually sent, and what to wait for.
+        hint: String,
+        trace: Trace,
+    },
     #[serde(rename = "config")]
     Config(RuntimeConfig),
     #[serde(rename = "pong")]
@@ -464,7 +481,7 @@ impl SshConfig {
     }
 }
 
-/// The five container exec drivers.
+/// The six container exec drivers.
 ///
 /// A driver is never named directly. It is inferred from which
 /// `--container-<driver>-*` flag family (or matching session field family) the
@@ -473,6 +490,7 @@ impl SshConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerDriver {
     Docker,
+    Apple,
     Podman,
     Nerdctl,
     Compose,
@@ -483,6 +501,7 @@ impl ContainerDriver {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Docker => "docker",
+            Self::Apple => "apple",
             Self::Podman => "podman",
             Self::Nerdctl => "nerdctl",
             Self::Compose => "compose",
@@ -494,6 +513,7 @@ impl ContainerDriver {
     pub fn default_runtime(self) -> &'static str {
         match self {
             Self::Docker | Self::Compose => "docker",
+            Self::Apple => "container",
             Self::Podman => "podman",
             Self::Nerdctl => "nerdctl",
             Self::Kubectl => "kubectl",
@@ -504,6 +524,7 @@ impl ContainerDriver {
     pub fn target_flag(self) -> &'static str {
         match self {
             Self::Docker => "--container-docker-name",
+            Self::Apple => "--container-apple-name",
             Self::Podman => "--container-podman-name",
             Self::Nerdctl => "--container-nerdctl-name",
             Self::Compose => "--container-compose-service",
@@ -515,6 +536,7 @@ impl ContainerDriver {
     pub fn flag_family(self) -> &'static str {
         match self {
             Self::Docker => "--container-docker-*",
+            Self::Apple => "--container-apple-*",
             Self::Podman => "--container-podman-*",
             Self::Nerdctl => "--container-nerdctl-*",
             Self::Compose => "--container-compose-*",
@@ -539,6 +561,12 @@ pub struct ContainerConfig {
     pub docker_context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apple_runtime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub podman_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -604,6 +632,7 @@ impl ContainerConfig {
     pub fn target_name(&self) -> Option<&str> {
         self.docker_name
             .as_deref()
+            .or(self.apple_name.as_deref())
             .or(self.podman_name.as_deref())
             .or(self.nerdctl_name.as_deref())
             .or(self.compose_service.as_deref())
@@ -614,6 +643,7 @@ impl ContainerConfig {
     pub fn runtime_override(&self) -> Option<&str> {
         self.docker_runtime
             .as_deref()
+            .or(self.apple_runtime.as_deref())
             .or(self.podman_runtime.as_deref())
             .or(self.nerdctl_runtime.as_deref())
             .or(self.compose_runtime.as_deref())
@@ -621,7 +651,7 @@ impl ContainerConfig {
     }
 
     /// For each driver, the first flag of its family the caller set.
-    fn family_flags(&self) -> [(ContainerDriver, Option<&'static str>); 5] {
+    fn family_flags(&self) -> [(ContainerDriver, Option<&'static str>); 6] {
         [
             (
                 ContainerDriver::Docker,
@@ -630,6 +660,14 @@ impl ContainerConfig {
                     ("--container-docker-user", self.docker_user.is_some()),
                     ("--container-docker-context", self.docker_context.is_some()),
                     ("--container-docker-runtime", self.docker_runtime.is_some()),
+                ]),
+            ),
+            (
+                ContainerDriver::Apple,
+                first_present(&[
+                    ("--container-apple-name", self.apple_name.is_some()),
+                    ("--container-apple-user", self.apple_user.is_some()),
+                    ("--container-apple-runtime", self.apple_runtime.is_some()),
                 ]),
             ),
             (
@@ -743,6 +781,12 @@ struct SessionConfigFlat {
     #[serde(default)]
     docker_runtime: Option<String>,
     #[serde(default)]
+    apple_name: Option<String>,
+    #[serde(default)]
+    apple_user: Option<String>,
+    #[serde(default)]
+    apple_runtime: Option<String>,
+    #[serde(default)]
     podman_name: Option<String>,
     #[serde(default)]
     podman_user: Option<String>,
@@ -801,6 +845,9 @@ impl From<SessionConfigFlat> for SessionConfig {
                 docker_user: flat.docker_user,
                 docker_context: flat.docker_context,
                 docker_runtime: flat.docker_runtime,
+                apple_name: flat.apple_name,
+                apple_user: flat.apple_user,
+                apple_runtime: flat.apple_runtime,
                 podman_name: flat.podman_name,
                 podman_user: flat.podman_user,
                 podman_runtime: flat.podman_runtime,
@@ -981,6 +1028,9 @@ pub struct ContainerConfigPatch {
     pub docker_user: PatchField<String>,
     pub docker_context: PatchField<String>,
     pub docker_runtime: PatchField<String>,
+    pub apple_name: PatchField<String>,
+    pub apple_user: PatchField<String>,
+    pub apple_runtime: PatchField<String>,
     pub podman_name: PatchField<String>,
     pub podman_user: PatchField<String>,
     pub podman_runtime: PatchField<String>,
@@ -1039,6 +1089,12 @@ struct SessionConfigPatchFlat {
     #[serde(default)]
     docker_runtime: PatchField<String>,
     #[serde(default)]
+    apple_name: PatchField<String>,
+    #[serde(default)]
+    apple_user: PatchField<String>,
+    #[serde(default)]
+    apple_runtime: PatchField<String>,
+    #[serde(default)]
     podman_name: PatchField<String>,
     #[serde(default)]
     podman_user: PatchField<String>,
@@ -1096,6 +1152,9 @@ impl From<SessionConfigPatchFlat> for SessionConfigPatch {
                 docker_user: flat.docker_user,
                 docker_context: flat.docker_context,
                 docker_runtime: flat.docker_runtime,
+                apple_name: flat.apple_name,
+                apple_user: flat.apple_user,
+                apple_runtime: flat.apple_runtime,
                 podman_name: flat.podman_name,
                 podman_user: flat.podman_user,
                 podman_runtime: flat.podman_runtime,

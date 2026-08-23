@@ -191,10 +191,19 @@ afpsql --ssh user@db-server \
   --sql "select now()"
 ```
 
-If the working manual command is `docker exec CONTAINER psql ...` or an
-equivalent Podman, nerdctl, Compose, or Kubernetes exec, use container transport
-instead of container-local `psql`. The container does not need afpsql or psql;
-afpsql uses a no-TTY exec bridge through the selected driver:
+If the working manual command is `container exec CONTAINER psql ...`,
+`docker exec CONTAINER psql ...`, or an equivalent Podman, nerdctl, Compose, or
+Kubernetes exec, use container transport instead of container-local `psql`. The
+container does not need afpsql or psql; afpsql uses a no-TTY exec bridge through
+the selected driver:
+
+```bash
+afpsql --container-apple-name pg-container \
+  --dsn 'postgresql://app:pw@127.0.0.1:5432/appdb' \
+  --sql "select now()"
+```
+
+The Docker family remains available when Docker is the selected runtime:
 
 ```bash
 afpsql --container-docker-name pg-container \
@@ -228,7 +237,7 @@ afpsql --ssh root@server --container-docker-name app-container \
 ```
 
 The driver is the flag family, not a separate selector: use
-`--container-podman-name`, `--container-nerdctl-name`,
+`--container-apple-name`, `--container-podman-name`, `--container-nerdctl-name`,
 `--container-compose-service`, or `--container-kubectl-pod` when the target uses
 another exec driver. Each family carries only the options its driver has, so
 `--container-kubectl-namespace` exists and `--container-podman-context` does not,

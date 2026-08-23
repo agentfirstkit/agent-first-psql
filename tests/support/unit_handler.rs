@@ -421,12 +421,10 @@ async fn execute_query_maps_executor_outcomes() {
 #[tokio::test]
 async fn execute_query_marks_transient_sqlstates_retryable() {
     let cfg = RuntimeConfig::default();
-    for (sqlstate, expected) in [
-        ("40001", true),
-        ("40P01", true),
-        ("57014", true),
-        ("23505", false),
-    ] {
+    // `57014` is not here: a statement the server stopped is answered as a
+    // terminal `cancelled`, not as a retryable SQL error. See
+    // `a_server_side_cancel_is_one_settled_outcome` below.
+    for (sqlstate, expected) in [("40001", true), ("40P01", true), ("23505", false)] {
         let (app, mut rx) = test_app_with_executor(
             cfg.clone(),
             Err(ExecError::Sql {
@@ -457,6 +455,112 @@ async fn execute_query_marks_transient_sqlstates_retryable() {
         };
         assert_eq!(emitted, sqlstate);
         assert_eq!(retryable, expected, "{sqlstate}");
+    }
+}
+
+#[tokio::test]
+async fn sqlstate_57014_is_read_with_what_this_side_knows() {
+    // PostgreSQL sends `57014` both for a cancel this program requested and for
+    // a `statement_timeout` expiring, and the wire does not distinguish them —
+    // only the message text does, which is exactly what callers are told not to
+    // branch on. So the answer comes from whether a cancel was asked for.
+    let sql_error = || ExecError::Sql {
+        sqlstate: "57014".to_string(),
+        message: "canceling statement".to_string(),
+        detail: None,
+        hint: None,
+        position: None,
+    };
+
+    // Nobody asked: a timeout, reported as the SQL error it is.
+    let (app, mut rx) = test_app_with_executor(RuntimeConfig::default(), Err(sql_error()));
+    execute_query(
+        &app,
+        Some("t".to_string()),
+        Some("default".to_string()),
+        "select pg_sleep(30)".to_string(),
+        vec![],
+        QueryOptions::default(),
+        None,
+    )
+    .await;
+    let Some(Output::SqlError { sqlstate, .. }) = rx.recv().await else {
+        unreachable!("a timeout must stay a sql_error")
+    };
+    assert_eq!(sqlstate, "57014");
+
+    // Asked for: the same SQLSTATE now settles the cancel.
+    let (app, mut rx) = test_app_with_executor(RuntimeConfig::default(), Err(sql_error()));
+    let cancel_slot = crate::db::new_cancel_slot();
+    cancel_slot.request_cancel();
+    execute_query(
+        &app,
+        Some("c".to_string()),
+        Some("default".to_string()),
+        "select pg_sleep(30)".to_string(),
+        vec![],
+        QueryOptions::default(),
+        Some(Queued {
+            cancel_slot,
+            accepted_config: RuntimeConfig::default(),
+        }),
+    )
+    .await;
+    let Some(Output::Error {
+        error_code,
+        retryable,
+        ..
+    }) = rx.recv().await
+    else {
+        unreachable!("a requested cancel must be a terminal error event")
+    };
+    assert_eq!(error_code, "cancelled");
+    assert!(!retryable);
+}
+
+#[tokio::test]
+async fn a_lost_commit_is_never_reported_as_retryable() {
+    // The two ways a commit can go wrong that an agent must not confuse. One
+    // is settled and safe to redo; the other is unknown and must not be
+    // repeated at all. Neither may carry `retryable: true`, which is what the
+    // transaction path used to send for both.
+    for (error, expected_code) in [
+        (
+            ExecError::TransactionLostRolledBack,
+            "transaction_lost_rolled_back",
+        ),
+        (
+            ExecError::CommitOutcomeUnknown("no answer to COMMIT".to_string()),
+            "commit_outcome_unknown",
+        ),
+    ] {
+        let (app, mut rx) = test_app_with_executor(RuntimeConfig::default(), Err(error));
+        execute_query(
+            &app,
+            Some("w".to_string()),
+            Some("default".to_string()),
+            "insert into t values (1)".to_string(),
+            vec![],
+            QueryOptions::default(),
+            None,
+        )
+        .await;
+
+        let Some(Output::Error {
+            error_code,
+            retryable,
+            hint,
+            ..
+        }) = rx.recv().await
+        else {
+            unreachable!("expected a terminal error event")
+        };
+        assert_eq!(error_code, expected_code);
+        assert!(
+            !retryable,
+            "{expected_code} must never invite a blind retry"
+        );
+        assert!(hint.is_some(), "{expected_code} must say what to do next");
     }
 }
 

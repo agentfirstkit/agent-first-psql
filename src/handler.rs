@@ -54,6 +54,22 @@ impl QueryState {
         self.phase.store(value, Ordering::SeqCst);
     }
 
+    /// Take a query that has not started yet, atomically.
+    ///
+    /// This is the one case where cancelling *is* the outcome: nothing was
+    /// sent to the database, so "cancelled" is a fact rather than a guess. It
+    /// races `try_start` on the session worker and exactly one of them wins.
+    pub fn try_cancel_queued(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                QUERY_QUEUED,
+                QUERY_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
     pub fn try_start(&self) -> bool {
         self.phase
             .compare_exchange(
@@ -112,6 +128,26 @@ impl App {
     }
 }
 
+/// What a query carries because it waited.
+///
+/// A query submitted over the pipe is accepted at one moment and run at
+/// another, and both of these exist because of that gap. A caller that runs one
+/// query and exits has neither.
+pub struct Queued {
+    /// Lets a later `cancel` reach this query, and lets exactly one side emit
+    /// its terminal event.
+    pub cancel_slot: crate::db::CancelSlot,
+    /// The configuration in force when the query was accepted.
+    ///
+    /// Read instead of whatever is current at execution time: a `config` line
+    /// arriving in between used to be able to repoint the session, and the
+    /// query would then run — and commit — against a different database than
+    /// the one it was submitted for, with which one depending on task
+    /// scheduling rather than on the order the caller wrote.
+    pub accepted_config: RuntimeConfig,
+}
+
+/// Run one query and emit exactly one terminal event for it.
 pub async fn execute_query(
     app: &Arc<App>,
     id: Option<String>,
@@ -119,10 +155,17 @@ pub async fn execute_query(
     sql: String,
     params: Vec<Value>,
     options: QueryOptions,
-    cancel_slot: Option<crate::db::CancelSlot>,
+    queued: Option<Queued>,
 ) {
     let start = Instant::now();
-    let cfg = app.config.read().await.clone();
+    let (cancel_slot, accepted_config) = match queued {
+        Some(queued) => (Some(queued.cancel_slot), Some(queued.accepted_config)),
+        None => (None, None),
+    };
+    let cfg = match accepted_config {
+        Some(cfg) => cfg,
+        None => app.config.read().await.clone(),
+    };
     let resolved_session = resolve_session_name(&cfg, session.as_deref());
 
     let Some(session_cfg) = cfg.sessions.get(&resolved_session).cloned() else {
@@ -282,12 +325,15 @@ pub async fn execute_query(
                 &mut sink,
             )
             .await;
-        if cancel_requested(&cancel_slot_for_suppression) {
-            return;
-        }
+        // No `is_cancelled` check: a cancel request is not an outcome, and
+        // suppressing the real one here is how a committed write came back as
+        // "cancelled". The claim still runs, because a query cancelled while
+        // it was queued was answered by the dispatcher and must not be
+        // answered twice.
         if !try_claim_terminal_emit(&cancel_slot_for_suppression) {
             return;
         }
+        let result = settle_cancel(result, &cancel_slot_for_suppression);
         handle_streaming_result(app, id, resolved_session, result, sink, start).await;
         return;
     }
@@ -309,13 +355,11 @@ pub async fn execute_query(
         })
         .await;
 
-    if cancel_requested(&cancel_slot) {
-        return;
-    }
     if !try_claim_terminal_emit(&cancel_slot) {
         return;
     }
 
+    let result = settle_cancel(result, &cancel_slot);
     match result {
         Ok(ExecOutcome::Rows {
             columns,
@@ -387,6 +431,33 @@ fn permission_error_hint(options: &QueryOptions, session: &SessionConfig) -> Str
     }
 }
 
+/// Turn a server-side stop into `cancelled` only when this process asked for it.
+///
+/// PostgreSQL reports `57014` for a statement it stopped, and it does not say
+/// why: a cancel this program sent and a `statement_timeout` expiring look
+/// identical on the wire, and the only thing that separates them is the wording
+/// of a message no caller should be branching on. What settles it is knowledge
+/// this side already has — whether a cancel was requested for this query at
+/// all. Without that check, every timeout would be reported as a cancellation
+/// nobody asked for.
+fn settle_cancel<T>(
+    result: Result<T, ExecError>,
+    cancel_slot: &Option<crate::db::CancelSlot>,
+) -> Result<T, ExecError> {
+    let requested = cancel_slot
+        .as_ref()
+        .map(|slot| slot.is_cancelled())
+        .unwrap_or(false);
+    match result {
+        Err(ExecError::Sql { ref sqlstate, .. })
+            if requested && sqlstate == crate::protocol::sqlstate::QUERY_CANCELED =>
+        {
+            Err(ExecError::Cancelled)
+        }
+        other => other,
+    }
+}
+
 /// Returns true if the caller wins the right to emit the terminal event
 /// (`result`/`sql_error`/`error`) for this query id. CLI mode (no
 /// cancel_slot) always wins. Pipe mode wins when the cancel dispatcher
@@ -396,13 +467,6 @@ fn try_claim_terminal_emit(cancel_slot: &Option<crate::db::CancelSlot>) -> bool 
         .as_ref()
         .map(|slot| slot.claim_terminal_emit())
         .unwrap_or(true)
-}
-
-fn cancel_requested(cancel_slot: &Option<crate::db::CancelSlot>) -> bool {
-    cancel_slot
-        .as_ref()
-        .map(|slot| slot.is_cancelled())
-        .unwrap_or(false)
 }
 
 pub async fn handle_session_info(app: &Arc<App>, id: Option<String>, session: Option<String>) {
@@ -823,6 +887,71 @@ pub(crate) async fn emit_exec_error(
                 id.as_deref(),
                 Some(resolved_session),
                 Some(&sqlstate),
+                None,
+                &trace,
+            )
+            .await;
+        }
+        ExecError::TransactionLostRolledBack => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::TRANSACTION_LOST_ROLLED_BACK.to_string(),
+                    error: "the connection was lost before COMMIT was sent".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
+                    hint: Some(
+                        "the transaction was rolled back and nothing in it took effect; \
+                         open a new transaction and redo the work"
+                            .to_string(),
+                    ),
+                    // Safe to redo, but not by repeating this operation: the
+                    // transaction it belonged to no longer exists.
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(resolved_session),
+                Some(error_code::TRANSACTION_LOST_ROLLED_BACK),
+                None,
+                &trace,
+            )
+            .await;
+        }
+        ExecError::CommitOutcomeUnknown(message) => {
+            let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: id.clone(),
+                    error_code: error_code::COMMIT_OUTCOME_UNKNOWN.to_string(),
+                    error: message,
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
+                    hint: Some(
+                        "COMMIT was sent and no answer came back; the write may or may not have \
+                         landed. Do not repeat it — read the data back, or check a unique key or \
+                         operation marker, before deciding"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                    trace: trace.clone(),
+                })
+                .await;
+            emit_log(
+                app,
+                log_event::QUERY_ERROR,
+                id.as_deref(),
+                Some(resolved_session),
+                Some(error_code::COMMIT_OUTCOME_UNKNOWN),
                 None,
                 &trace,
             )

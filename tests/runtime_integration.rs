@@ -1442,18 +1442,35 @@ fn pipe_config_and_cancel_existing_query() {
     );
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"code\":\"config\""));
-    // Exactly one outcome event for q1, either the SELECT result (handler
-    // won) or the cancelled error (cancel dispatcher won). Never both.
-    let outcomes_for_q1 = text
+    // Exactly one outcome event for q1: the SELECT result, or a terminal
+    // `cancelled`, or the SQL error — never two of them.
+    //
+    // `cancel_requested` is not one of them. It arrives as a `result` envelope
+    // under the same id and says only that the request went out; the query
+    // still reports what happened to it afterwards. Counting it made this test
+    // pass or fail on whether the cancel happened to land while the query was
+    // still queued, which is exactly the timing an outcome must not depend on.
+    let events_for_q1 = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|v| v["result"]["id"] == "q1" || v["error"]["id"] == "q1")
+        .collect::<Vec<_>>();
+    let outcomes_for_q1 = events_for_q1
+        .iter()
         .filter(|v| {
-            v["kind"] == "result"
+            (v["kind"] == "result" && v["result"]["code"] != "cancel_requested")
                 || (v["kind"] == "error"
                     && matches!(v["error"]["code"].as_str(), Some("sql_error" | "cancelled")))
         })
         .count();
+    assert!(
+        events_for_q1
+            .iter()
+            .filter(|v| v["result"]["code"] == "cancel_requested")
+            .count()
+            <= 1,
+        "a cancel is acknowledged at most once: {text}"
+    );
     assert_eq!(
         outcomes_for_q1, 1,
         "expected one outcome for q1, got {outcomes_for_q1}; output: {text}"
@@ -2012,10 +2029,21 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     reader.read_to_string(&mut all).expect("read output");
     let status = child.wait().expect("wait status");
     assert!(status.success());
-    assert!(all.contains("\"code\":\"cancelled\""), "output: {all}");
+    // The acknowledgement says the request went out; it is not the outcome.
     assert!(
-        all.contains("server-side cancel requested"),
+        all.contains("\"code\":\"cancel_requested\""),
+        "cancel acknowledgement missing: {all}"
+    );
+    assert!(
+        all.contains("cancel sent to the server"),
         "server-side cancel hint missing: {all}"
+    );
+    // And the query still reports what actually happened to it, under the same
+    // id. A cancel that beat the statement gets `cancelled`; one that lost the
+    // race gets the real result — either way exactly one terminal event.
+    assert!(
+        all.contains("\"code\":\"cancelled\"") || all.contains("\"kind\":\"result\""),
+        "no terminal event for the cancelled query: {all}"
     );
 
     let out = Command::new(bin())

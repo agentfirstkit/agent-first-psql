@@ -20,26 +20,34 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar
-          - os: ubuntu-22.04-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: zip
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify release source
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: ./scripts/release-assets.sh "$TAG"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
@@ -64,10 +72,6 @@ jobs:
           ARCHIVE_KIND: ${{ matrix.archive }}
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "invalid release tag: $TAG" >&2
-            exit 1
-          fi
           BIN_DIR="target/${TARGET}/release"
           if [ "$ARCHIVE_KIND" = "zip" ]; then
             ARCHIVE="afpsql-${TAG}-${TARGET}.zip"
@@ -78,17 +82,26 @@ jobs:
             tar -czf "$ARCHIVE" -C "$BIN_DIR" afpsql afpsql-readonly
             tar -tzf "$ARCHIVE" | grep -qx 'afpsql-readonly'
           fi
-          "$BIN_DIR/afpsql" --version
+          "$BIN_DIR/afpsql" --version | grep -q "\"version\":\"${TAG#v}\""
           ./scripts/release-smoke.sh "$BIN_DIR"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          # Take the digest and write the line, rather than letting each
+          # platform's tool spell it. Git Bash's sha256sum treats an archive as
+          # binary and writes `<digest> *<name>`, where GNU coreutils on Linux
+          # and shasum on macOS write `<digest>  <name>`. This file is published
+          # for people and read by the package channels, so one spelling on
+          # every platform is the point — and it is the spelling
+          # release-assets.sh verifies the upload against.
+          if command -v sha256sum >/dev/null 2>&1; then
+            DIGEST="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+          else
+            DIGEST="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          fi
+          printf '%s  %s\n' "$DIGEST" "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
-      - name: Upload to release
+      - name: Upload immutable release assets
         shell: bash
-        run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG"
-          gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+        run: ./scripts/release-assets.sh "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

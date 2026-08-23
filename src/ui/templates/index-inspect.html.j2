@@ -1,0 +1,23 @@
+{#-
+  `index_inspect`: indexes under the table they belong to.
+
+  The definition is the only place an index's columns appear, so it is on the
+  page rather than behind anything — the size and the access method say what an
+  index costs, the definition says what it is for.
+-#}
+{% extends "templates/layout.html.j2" %}
+{% block panel %}
+{% if document.empty %}<p class="empty">{{ document.empty }}</p>
+{% else %}{% for group in document.groups %}<section class="relation">
+<h2>{{ group.table }}</h2>
+<ul class="objects">
+{% for index in group.indexes %}<li><p class="line"><span class="ident">{{ index.name }}</span> <span class="kind">{{ index.method }}</span>{% if index.size %} <span class="kind">{{ index.size }}</span>{% endif %}{% for tag in index.tags %} <span class="tag">{{ tag }}</span>{% endfor %}</p>
+{% if index.definition %}<p class="sql">{{ index.definition }}</p>{% endif %}</li>
+{% endfor %}</ul>
+</section>
+{% endfor %}
+<details class="raw"><summary>Every row afpsql read ({{ document.row_count }})</summary>
+{% include "templates/table.html.j2" %}
+</details>
+{% endif %}
+{% endblock %}

@@ -49,6 +49,14 @@ matches exactly one registered shape.
   stdout, so read one stream and branch on `kind`. `--output-to` overrides the
   destination, but the streaming shapes have no `split` to select: it is not in
   their output contract.
+- **Query results are never redacted, and that is deliberate.** AFDATA's
+  secret-name redaction applies to connection, config and control metadata.
+  Rows, column values, SQL text and the parameters shown to a human approver
+  are the data the caller asked for, and altering them would make this tool
+  lie about the database. A column named `api_key_secret` comes back with its
+  value in it. So: project only the columns you need, do not copy result rows
+  into logs or files, and do not put them in front of a person who should not
+  see them.
 - When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
   It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
   transaction-control SQL, and psql translation. It still permits SQL/config
@@ -147,18 +155,37 @@ Prefer `afpsql inspect` over hand-writing `information_schema` /
 instead of returning it. Reach for one only when a *person* asked to look, or
 when you have already read the data and they need to see its shape to answer
 you. Never use `ui` to read data yourself: the result carries no rows, only that
-the window closed.
+the panel closed.
 
-These are watch sessions, so the call blocks until the person closes the window.
-Treat that closure as "they are done looking", never as approval of anything.
-A window that cannot open is an environment problem — report it and fall back to
-the matching `inspect` command rather than retrying.
+These are watch sessions, so the call blocks until the panel closes. Treat
+that closure as "they are done looking", never as approval of anything.
+Delivery defaults to a window on this machine; when there is no browser here,
+or the person is not at this machine, pass `--mode session` instead — afpsql
+only registers the panel, and the person reaches it through
+`afui session serve`. A window that cannot open on this machine is that
+environment problem; report it and retry with `--mode session` rather than
+retrying `window` unchanged, or fall back to the matching `inspect` command if
+nobody needs the window itself. An administrator-locked readonly profile is a
+different case: it refuses every panel outright, under either delivery,
+before anything connects — not an environment problem to retry past, so read
+the same data with `inspect` instead.
 
-`ui connections` is the one panel meant to outlive your attention: it reloads
-itself, so open it, report that it is open, and go back to work rather than
-waiting on it. Run it in the background when you have anything else to do, and
-leave the interval alone unless the person asked — it is a repeated query
-against a server other people are using.
+`ui connections` is the one panel meant to outlive a single snapshot: while at
+least one visible page is checking in, it pushes fresh retained snapshots over
+its typed AFUI runtime. A registered session with no page open keeps the last
+snapshot and stops querying PostgreSQL within 30 seconds. Open it, report that
+it is open, and go back to work rather than waiting on it. Run it as a
+long-lived process when you have anything else to do, and leave the interval
+alone unless the person asked — while observed, it is a repeated query against
+a server other people are using.
+
+That same panel lets the person enter SQL for plain `EXPLAIN (FORMAT JSON)`.
+The request travels back over the live channel and the plan appears in the
+panel; it does not reload the page, run `ANALYZE`, or return plan rows on the
+agent's stdout. The ordinary read permission and PostgreSQL read-only
+transaction still apply. Use the CLI `--explain analyze` path only when the
+user explicitly asks to execute and measure the statement, with the normal
+write permission when applicable.
 
 ## Asking a Person to Approve a Statement
 
@@ -167,20 +194,22 @@ statement to a person and runs it only if they approve. Use it when a write is
 consequential enough that a person should see it first, not as a substitute for
 knowing what your own statement does.
 
-- Only an approval runs anything. A closed window, a refusal, and an expired
-  credential are all the same answer, and the terminal event says
-  `result.code:"ui_plan_refused"` with `executed:false`. Never re-run the
-  statement yourself after a refusal, and never read "the window closed" as
-  consent.
+- Only an approval runs anything. A closed window, a session ended or refused
+  remotely, and an expired credential are all the same answer, and the
+  terminal event says `result.code:"ui_plan_refused"` with `executed:false`.
+  Never re-run the statement yourself after a refusal, and never read "the
+  panel closed" as consent — absence is not agreement under either delivery.
 - On approval the statement runs through the ordinary execution path, so the
   events that follow are the ordinary ones: a `kind:"result"` result, or a
   `sql_error`. Branch on those exactly as you would for `afpsql --sql`.
 - The statement is fixed when you invoke the command. Changing a `--sql-file`
-  after the window opens changes nothing, and there is no way to amend what the
+  after the panel opens changes nothing, and there is no way to amend what the
   person is looking at — refuse and ask again with a new statement instead.
-- `afpsql-readonly` refuses a write here as it does everywhere; the window does
-  not open at all. Do not reach for `ui plan` to get around a readonly
-  capability.
+- `afpsql-readonly` refuses a write here as it does everywhere; the panel
+  never opens, under either `--mode`. Do not reach for `ui plan` to get around
+  a readonly capability.
+- Same as the watch panels above: no browser here, or the person is not at
+  this machine, is a `--mode session` case, not a reason to skip approval.
 
 For query plans, add `--explain plan` (`EXPLAIN (FORMAT JSON)`) or
 `--explain analyze` (also runs the statement; writes still need write
@@ -204,16 +233,36 @@ actually run.
   SQLSTATE is present.
 - Other `kind:"error"` events are non-SQL failures (connect, cancel, invalid request,
   config). Branch on `error.code` first: `connect_failed`, `cancelled`,
-  `invalid_request`, `invalid_params`, `internal_error`. Connect failures may
+  `invalid_request`, `invalid_params`, `internal_error`,
+  `transaction_lost_rolled_back`, `commit_outcome_unknown`. Connect failures may
   also carry `sqlstate`/`message`/`detail` populated from the server-side
-  rejection. `internal_error` is afpsql's own fault rather than the request's:
-  retry once, restart the session if it repeats, and report it rather than
-  working around it.
+  rejection.
 - Honor `retryable: true/false`. Only retry when `true`, and only after
   correcting whatever the hint pointed at. `retryable:false` means the
   same input will fail the same way.
-- After a successful `cancel`, never resubmit the cancelled `id` — pick a
-  fresh id. Cancellation is final.
+- **Before resending a write, decide which of three things happened.** Reads are
+  free to retry; writes are not, and the error code says which case you are in:
+  - *It definitely did not happen* — `sql_error`, `cancelled`,
+    `transaction_lost_rolled_back`, or any failure before the statement ran.
+    The work is safe to redo.
+  - *It definitely happened* — you got a `result` or `result_end`.
+  - *Nobody knows* — `commit_outcome_unknown`. `COMMIT` was sent and no answer
+    came back. **Never resend it.** Read the data back, or check a unique key or
+    an operation marker you wrote inside the same transaction, and only then
+    decide.
+
+  There is no fourth case where repeating a write is a reasonable guess.
+- **A `cancel` is a request, not an outcome.** `result.code:"cancel_requested"`
+  acknowledges that the request was sent — it is not that query's result, even
+  though it arrives as a `result` envelope under the same `id`. PostgreSQL gives
+  cancellation no reply and may receive it after the statement has already
+  finished, so keep waiting for that `id`'s own terminal event — a `result` with
+  rows or a command tag, a `sql_error`, or an `error` — and treat *that* as what
+  happened. It can arrive before or after the acknowledgement. Only a terminal
+  `error.code:"cancelled"` means the statement was stopped; never report a
+  cancelled write as "nothing happened" until you have seen one.
+- Once an `id` has had its terminal event, do not resubmit that `id` — pick a
+  fresh one.
 
 ## Row Encoding Fidelity
 
@@ -293,7 +342,8 @@ work, open an explicit transaction:
   separately, and two families cannot be combined. Each family carries only the
   options its driver actually has, so an unavailable option has no flag rather
   than a runtime rejection: `kubectl exec` cannot exec as a user, and no kubectl
-  flag asks it to.
+  flag asks it to. Apple `container` uses the `--container-apple-name`,
+  `--container-apple-user`, and `--container-apple-runtime` family.
 - Connecting to a containerized PostgreSQL without a known password: prefer peer
   auth over the container's Unix socket with the family's user flag plus
   `--host /var/run/postgresql`. That exec user must match the database role

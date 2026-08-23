@@ -88,6 +88,9 @@ fn is_connection_or_transport_flag(flag: &str) -> bool {
             | "--container-docker-user"
             | "--container-docker-context"
             | "--container-docker-runtime"
+            | "--container-apple-name"
+            | "--container-apple-user"
+            | "--container-apple-runtime"
             | "--container-podman-name"
             | "--container-podman-user"
             | "--container-podman-runtime"
@@ -105,6 +108,89 @@ fn is_connection_or_transport_flag(flag: &str) -> bool {
             | "--container-kubectl-context"
             | "--container-kubectl-runtime"
     )
+}
+
+/// Where a locked profile is willing to find a transport program.
+///
+/// Not `PATH`. Under a locked profile the caller is the party being
+/// constrained, and `PATH` is theirs: the profile can pin the endpoint, the
+/// transport and the permissions and still hand the first `ssh` or `docker` on
+/// the caller's `PATH` a process on this machine. Whether the PostgreSQL
+/// handshake then succeeds is beside the point — the program already ran.
+const TRUSTED_PROGRAM_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+/// Resolve a transport program for a locked profile, or refuse to start one.
+///
+/// An absolute path is taken as given and checked; a bare name is looked up in
+/// [`TRUSTED_PROGRAM_DIRS`] only. Either way the file, and every directory
+/// above it, must be root-owned and not writable by group or others — the same
+/// trust rule the profile file itself is held to, because a program a caller
+/// can replace is a profile a caller can escape.
+pub fn trusted_program(program: &str) -> Result<PathBuf, String> {
+    let candidates: Vec<PathBuf> = if Path::new(program).is_absolute() {
+        vec![PathBuf::from(program)]
+    } else if program.contains('/') {
+        return Err(format!(
+            "an administrator-locked profile will not run `{program}`: a relative path is resolved against the caller's working directory"
+        ));
+    } else {
+        TRUSTED_PROGRAM_DIRS
+            .iter()
+            .map(|dir| Path::new(dir).join(program))
+            .collect()
+    };
+
+    let mut refusal = None;
+    for candidate in candidates {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        // Canonicalized before it is judged, so a link into a writable
+        // directory is checked where it lands rather than where it points from.
+        let resolved = candidate
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve `{}`: {error}", candidate.display()))?;
+        match trusted_program_path(&resolved) {
+            Ok(()) => return Ok(resolved),
+            Err(error) => refusal = Some(error),
+        }
+    }
+    Err(refusal.unwrap_or_else(|| {
+        format!(
+            "an administrator-locked profile found no trusted `{program}` in {}",
+            TRUSTED_PROGRAM_DIRS.join(", ")
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn trusted_program_path(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut current = Some(path);
+    while let Some(entry) = current {
+        let metadata = std::fs::metadata(entry)
+            .map_err(|error| format!("cannot inspect `{}`: {error}", entry.display()))?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(format!(
+                "an administrator-locked profile will not run `{}`: it, or a directory above it, is not owned by root or is writable by group or others",
+                path.display()
+            ));
+        }
+        current = entry
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn trusted_program_path(path: &Path) -> Result<(), String> {
+    Err(format!(
+        "administrator-locked profiles require Unix ownership checks; unsupported for {}",
+        path.display()
+    ))
 }
 
 pub fn locked_profile_name(executable: &str) -> Result<Option<String>, String> {
@@ -202,6 +288,8 @@ fn is_opaque_value_flag(flag: &str) -> bool {
             | "--container-docker-name"
             | "--container-docker-user"
             | "--container-docker-context"
+            | "--container-apple-name"
+            | "--container-apple-user"
             | "--container-podman-name"
             | "--container-podman-user"
             | "--container-nerdctl-name"
@@ -249,6 +337,7 @@ fn is_container_runtime_flag(flag: &str) -> bool {
     matches!(
         flag,
         "--container-docker-runtime"
+            | "--container-apple-runtime"
             | "--container-podman-runtime"
             | "--container-nerdctl-runtime"
             | "--container-compose-runtime"
@@ -416,6 +505,55 @@ fn leading_keywords(sql: &str, limit: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::types::{ContainerConfig, SshConfig};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_profile_will_not_take_a_transport_program_from_the_caller() {
+        // The whole point of a locked profile is that the caller cannot choose
+        // what runs. A bare name goes through the caller's `PATH`, so an
+        // `ssh` planted anywhere on it would run before any of the profile's
+        // endpoint or permission rules were consulted.
+        let planted = std::env::temp_dir().join(format!(
+            "afpsql_evil_path_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&planted).is_ok());
+        let evil = planted.join("ssh");
+        assert!(std::fs::write(&evil, "#!/bin/sh\nexit 0\n").is_ok());
+
+        // Not on the trusted list, so it is never found by name...
+        let by_name = trusted_program("ssh");
+        assert!(
+            by_name.as_deref() != Ok(evil.as_path()),
+            "a locked profile resolved `ssh` to a file the caller planted"
+        );
+        // ...and it is refused even when named outright, because a caller can
+        // write to it.
+        let error = trusted_program(&evil.to_string_lossy())
+            .expect_err("a caller-writable program must be refused");
+        assert!(error.contains("not owned by root"), "{error}");
+
+        // A relative path never resolves at all: it would be taken against
+        // whatever working directory the caller happened to start in.
+        assert!(trusted_program("./ssh").is_err());
+
+        let _ = std::fs::remove_dir_all(&planted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_profile_still_finds_the_systems_own_program() {
+        // The check has to be one a real machine passes, or it is a check
+        // nobody can turn on. `/bin/sh` is root-owned everywhere this runs.
+        match trusted_program("sh") {
+            Ok(path) => assert!(path.is_absolute(), "{}", path.display()),
+            Err(error) => panic!("a trusted `sh` must resolve: {error}"),
+        }
+    }
 
     #[test]
     fn ordinary_raw_policy_allows_host_capabilities() {

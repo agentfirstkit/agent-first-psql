@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,21 +13,23 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Add afpsql ui with five panels: schema, table, indexes and connections open a window onto data a person reads and end when they close it, while plan shows one statement and returns their answer",
-    "Run in every view panel the exact SQL its inspect sibling runs, and execute an approved statement through the ordinary path with the same connection, transport, permission resolution and readonly policy, so the window and the agent cannot disagree",
-    "Execute a planned statement only on an explicit approval: closing the window, refusing, and letting the credential lapse are the same answer, reported as ui_plan_refused with executed:false, so absence of an answer is never consent",
-    "Refuse before a window opens rather than after a person approves, both for a statement afpsql-readonly was always going to reject and for an administrator-locked profile, which withholds the host capabilities that opening a browser requires",
-    "Ship no JavaScript from a watch panel by leaving script-src absent so default-src none governs, including the connections panel, which refreshes itself without any",
-    "Render every panel from a MiniJinja template a person may replace through the frontend overlay, making the typed document each panel builds a contract: what a panel computes belongs to afpsql, what it looks like does not",
-    "Add afpsql inspect connections with an --all flag, returning one row per server backend with its state, wait event and ages alongside the max_connections the count should be read against",
-    "Adopt the shared value-source grammar for connection secrets in place of a private implementation of the same rules",
-    "Fix a Windows build failure from matching a Unix-only connection host variant unconditionally, and add a Windows compile check to CI so a platform-only break fails the gate instead of the publish step",
-    "Move to agent-first-data 0.32.1 and agent-first-ui 0.3.1"
+    "Treat a cancel as a request rather than an outcome: a running query gets a cancel_requested acknowledgement, keeps its id, and its own terminal event still arrives, while only a query still queued — which never reached the database — is claimed atomically and reported cancelled",
+    "Stop reporting a committed write as cancelled, and decide the outcome from whether a cancel was requested for that query rather than from SQLSTATE 57014, which PostgreSQL also sends when statement_timeout expires",
+    "Stop reconnecting inside tx_commit and tx_rollback, so a dead backend no longer receives a COMMIT on a brand-new connection that PostgreSQL answers with a success tag while the original transaction is already gone",
+    "Rebuild the table, schema and indexes panels around objects instead of the schema snapshot's row shape, moving grouping, the constraint rows that only restate a column's not null, and reading estimated_rows -1 as never analyzed into a document builder; the untouched result set stays on the page behind a details block and ui_api_version is 2",
+    "Add templates/relation.html.j2 to the frontend contract, shared by the table and schema pages and includable by an override that ships no copy of it",
+    "Add --mode window|session to the five ui panels, resolved through AFUI's own delivery plan with explicit --mode over AFUI_DELIVERY over window, so a machine with no display can still open one",
+    "Refuse link before a panel does any work or its readiness event goes out, and ground the locked-profile refusal in where the data behind a panel can leave the process rather than in host capability, so both hold for every delivery a panel could gain",
+    "Stop drawing a second head inside a framed session: the monitor hides its header and sends up the live line, while a panel waiting for a decision keeps its own head because a person is being asked to answer for what that page says",
+    "Add the Apple container transport (--container-apple-name, --container-apple-user, --container-apple-runtime) and run the local container gates on it",
+    "Name the config directory when a test trusts a frontend instead of pointing a process-wide variable at it, so two tests trusting at once no longer write into each other's store and serve the built-in page under an assertion that points nowhere near the cause",
+    "Stop counting a cancel acknowledgement as an outcome in the pipe test, and assert it is acknowledged at most once",
+    "Upgrade Agent-First Data to 0.34.0 and Agent-First UI to 0.5.0"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.XWoP3CQVfssQGj63azRQnNKkSBEDVmaK5gdNHHAxffc",
+      "uri": "cmn://agentfirstkit.com/b3.BmXjdNCjzm7ChFXVQ6FeKzfhuSjt3HvfGRbfCepefMUR",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

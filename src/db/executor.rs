@@ -328,7 +328,10 @@ impl DbExecutor for PostgresExecutor {
     async fn tx_commit(
         &self,
         session_name: &str,
-        session_cfg: &SessionConfig,
+        // Unused on purpose: a transaction belongs to the connection it was
+        // opened on, so there is no configuration under which this may open
+        // another one.
+        _session_cfg: &SessionConfig,
     ) -> Result<(), ExecError> {
         let session = get_session(&self.sessions, session_name).await;
         if !session.explicit_tx_active() {
@@ -337,29 +340,39 @@ impl DbExecutor for PostgresExecutor {
             ));
         }
         let mut client_guard = session.client.lock().await;
-        ensure_connected(&mut client_guard, session_cfg).await?;
-        let Some(client) = client_guard.as_mut() else {
-            return Err(ExecError::Connect(Box::new(ConnectError::new(
-                "connection unavailable",
-            ))));
+        // Deliberately not `ensure_connected`. A transaction lives on one
+        // backend, and reconnecting would send `COMMIT` down a connection that
+        // never saw the `BEGIN` — where PostgreSQL answers with a warning and a
+        // successful command tag, and the caller is told a transaction
+        // committed that was in fact rolled back when its backend went away.
+        let Some(pg_client) = live_client(&mut client_guard) else {
+            *client_guard = None;
+            session.set_explicit_tx(None);
+            return Err(ExecError::TransactionLostRolledBack);
         };
-        let Some(pg_client) = client.client.as_mut() else {
-            return Err(ExecError::Connect(Box::new(ConnectError::new(
-                "connection unavailable",
-            ))));
-        };
-        let result = pg_client
-            .batch_execute("COMMIT")
-            .await
-            .map_err(map_pg_error);
+        let result = pg_client.batch_execute("COMMIT").await;
         session.set_explicit_tx(None);
-        result
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // A SQL error is an answer: the server saw the COMMIT and
+                // refused it, so the transaction is settled as not committed.
+                // Anything else means no answer came back at all.
+                if error.code().is_some() {
+                    return Err(map_pg_error(error));
+                }
+                *client_guard = None;
+                Err(ExecError::CommitOutcomeUnknown(format!(
+                    "COMMIT was sent and the connection failed before an answer arrived: {error}"
+                )))
+            }
+        }
     }
 
     async fn tx_rollback(
         &self,
         session_name: &str,
-        session_cfg: &SessionConfig,
+        _session_cfg: &SessionConfig,
     ) -> Result<(), ExecError> {
         let session = get_session(&self.sessions, session_name).await;
         if !session.explicit_tx_active() {
@@ -368,16 +381,14 @@ impl DbExecutor for PostgresExecutor {
             ));
         }
         let mut client_guard = session.client.lock().await;
-        ensure_connected(&mut client_guard, session_cfg).await?;
-        let Some(client) = client_guard.as_mut() else {
-            return Err(ExecError::Connect(Box::new(ConnectError::new(
-                "connection unavailable",
-            ))));
-        };
-        let Some(pg_client) = client.client.as_mut() else {
-            return Err(ExecError::Connect(Box::new(ConnectError::new(
-                "connection unavailable",
-            ))));
+        // Same reasoning as `tx_commit`, with a kinder ending: a lost backend
+        // has already rolled this transaction back, which is what the caller
+        // asked for, so there is nothing left to do and nothing to report as a
+        // failure.
+        let Some(pg_client) = live_client(&mut client_guard) else {
+            *client_guard = None;
+            session.set_explicit_tx(None);
+            return Ok(());
         };
         let result = pg_client
             .batch_execute("ROLLBACK")
@@ -416,6 +427,20 @@ impl DbExecutor for PostgresExecutor {
     async fn shutdown(&self) {
         shutdown_all_sessions(&self.sessions).await;
     }
+}
+
+/// The session's open connection, if it still has one that is usable.
+///
+/// Never opens a new one: the callers that use this are the ones for which a
+/// different connection is a different transaction.
+fn live_client(
+    client: &mut Option<super::session::SessionClient>,
+) -> Option<&mut tokio_postgres::Client> {
+    let entry = client.as_mut()?;
+    if entry.is_closed() {
+        return None;
+    }
+    entry.client.as_mut()
 }
 
 async fn ensure_connected(
@@ -917,12 +942,22 @@ async fn finish_transaction<T>(
     result: Result<T, ExecError>,
 ) -> Result<T, ExecError> {
     match result {
-        Ok(outcome) => {
-            tx.commit().await.map_err(map_pg_error)?;
-            Ok(outcome)
-        }
+        Ok(outcome) => match tx.commit().await {
+            Ok(()) => Ok(outcome),
+            // The server answering with a SQLSTATE means it saw the COMMIT and
+            // refused it: the work is settled as not applied. No answer at all
+            // means the write may have landed, and reporting that as a
+            // retryable internal error — which is what this used to do — is how
+            // the same INSERT runs twice.
+            Err(error) if error.code().is_some() => Err(map_pg_error(error)),
+            Err(error) => Err(ExecError::CommitOutcomeUnknown(format!(
+                "COMMIT was sent and the connection failed before an answer arrived: {error}"
+            ))),
+        },
         Err(err) => {
-            tx.rollback().await.map_err(map_pg_error)?;
+            // The original failure is the answer; a rollback that cannot be
+            // sent means the backend is gone, which rolls back anyway.
+            let _ = tx.rollback().await;
             Err(err)
         }
     }

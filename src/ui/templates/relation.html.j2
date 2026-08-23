@@ -1,0 +1,45 @@
+{#-
+  One relation, read the way `\d` reads one: what the object is, then its
+  columns, then the things attached to it.
+
+  Renders whatever `relation` is in scope, so `ui table` includes it once and
+  `ui schema` includes it per relation without either page knowing the other
+  exists. Every value here is already unpacked, translated and counted in the
+  document — this file decides shape, never meaning.
+-#}
+{% if relation.facts or relation.comment %}<dl class="facts">
+{% for fact in relation.facts %}<div><dt>{{ fact.label }}</dt><dd>{{ fact.value }}</dd></div>
+{% endfor %}{% if relation.comment %}<div><dt>comment</dt><dd>{{ relation.comment }}</dd></div>
+{% endif %}</dl>
+{% endif %}
+{% if relation.definition %}<h3>Definition</h3>
+<pre class="sql">{{ relation.definition }}</pre>
+{% endif %}
+{% if relation.columns %}<h3>Columns</h3>
+<div class="scroll">
+<table class="detail">
+<thead><tr><th>#</th><th>column</th><th>type</th><th>null</th><th>default</th><th>notes</th></tr></thead>
+<tbody>
+{% for column in relation.columns %}<tr><td class="ordinal">{{ column.position }}</td><td class="ident">{{ column.name }}</td><td>{{ column.type_name }}</td><td>{% if column.nullable %}<span class="null">null</span>{% else %}not null{% endif %}</td><td>{% if column.default %}{{ column.default }}{% else %}<span class="null">—</span>{% endif %}</td><td>{% for tag in column.tags %}<span class="tag">{{ tag }}</span> {% endfor %}{% if column.comment %}<span class="note">{{ column.comment }}</span>{% endif %}</td></tr>
+{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+{% if relation.constraints %}<h3>Constraints</h3>
+<ul class="objects">
+{% for constraint in relation.constraints %}<li><p class="line"><span class="ident">{{ constraint.name }}</span> <span class="kind">{{ constraint.kind }}</span>{% for tag in constraint.tags %} <span class="tag warn-tag">{{ tag }}</span>{% endfor %}</p>
+{% if constraint.definition %}<p class="sql">{{ constraint.definition }}</p>{% endif %}</li>
+{% endfor %}</ul>
+{% endif %}
+{% if relation.indexes %}<h3>Indexes</h3>
+<ul class="objects">
+{% for index in relation.indexes %}<li><p class="line"><span class="ident">{{ index.name }}</span> <span class="kind">{{ index.method }}</span>{% if index.size %} <span class="kind">{{ index.size }}</span>{% endif %}{% for tag in index.tags %} <span class="tag">{{ tag }}</span>{% endfor %}</p>
+{% if index.definition %}<p class="sql">{{ index.definition }}</p>{% endif %}</li>
+{% endfor %}</ul>
+{% endif %}
+{% if relation.triggers %}<h3>Triggers</h3>
+<ul class="objects">
+{% for trigger in relation.triggers %}<li><p class="line"><span class="ident">{{ trigger.name }}</span>{% if trigger.function %} <span class="kind">{{ trigger.function }}</span>{% endif %}{% for tag in trigger.tags %} <span class="tag warn-tag">{{ tag }}</span>{% endfor %}</p>
+{% if trigger.definition %}<p class="sql">{{ trigger.definition }}</p>{% endif %}</li>
+{% endfor %}</ul>
+{% endif %}

@@ -126,10 +126,11 @@ pub async fn run(capability: Capability, bin_name: &str) {
             }
             pipe::run(init, capability, has_locked_profile).await
         }
-        // An inspection panel only ever reads, so afpsql-readonly may open one;
-        // an administrator-locked profile may not, because opening a window
-        // spawns a browser and writes a profile directory, and locked profiles
-        // withhold host capabilities. `ui::run` enforces that itself.
+        // An inspection panel only ever reads, so afpsql-readonly may open one.
+        // An administrator-locked profile may not — not because opening a
+        // window is a host capability, but because every panel is an exit for
+        // what the database holds, and a locked profile already refuses the
+        // narrower exit `--stdout-file` opens. `ui::run` enforces that itself.
         #[cfg(feature = "ui")]
         cli::Mode::Ui(mut request) => {
             let has_locked_profile = locked_profile.is_some();

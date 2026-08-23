@@ -159,7 +159,10 @@ struct SessionWorker {
 /// the agent's input order is the order PostgreSQL sees, even though
 /// queries normally run on a separate task.
 enum SessionOp {
-    Query(QueuedQuery),
+    // Boxed: a queued query now carries the whole configuration it was
+    // accepted under, which is much larger than a `begin` or a `commit`, and
+    // every message in the channel would otherwise be sized for it.
+    Query(Box<QueuedQuery>),
     Begin {
         id: Option<String>,
         session: String,
@@ -185,6 +188,8 @@ enum SessionOp {
 struct QueuedQuery {
     id: String,
     session: String,
+    /// The configuration this query was accepted under, frozen at enqueue.
+    accepted_config: crate::types::RuntimeConfig,
     sql: String,
     params: Vec<serde_json::Value>,
     options: QueryOptions,
@@ -470,6 +475,15 @@ async fn enqueue_tx_finish(
     }
 }
 
+/// Transaction control errors go through the query path's mapper.
+///
+/// They used to have their own, and the two disagreed about the same
+/// `ExecError`: a failed connect was `connect_failed` for a query and
+/// `invalid_request` for a `begin`, and an internal error was `retryable:
+/// false` for a query and `retryable: true` for a `commit` — which is exactly
+/// the bit an agent reads before deciding whether to send a write again. One
+/// mapper is the point: an agent branches on what happened, not on which verb
+/// it used.
 async fn emit_tx_error(
     app: &Arc<App>,
     id: Option<String>,
@@ -477,94 +491,7 @@ async fn emit_tx_error(
     err: crate::db::ExecError,
     start: Instant,
 ) {
-    use crate::db::ExecError;
-    let trace = Trace::only_duration(start.elapsed().as_millis() as u64);
-    let output = match err {
-        ExecError::Sql {
-            sqlstate,
-            message,
-            detail,
-            hint,
-            position,
-        } => {
-            let retryable = crate::protocol::sqlstate_retryable(&sqlstate);
-            Output::SqlError {
-                id,
-                session: Some(resolved_session.to_string()),
-                sqlstate,
-                message,
-                detail,
-                hint,
-                position,
-                retryable,
-                trace,
-            }
-        }
-        ExecError::Connect(connect) => {
-            let c = *connect;
-            Output::Error {
-                id,
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: c.error,
-                sqlstate: c.sqlstate,
-                message: c.message,
-                detail: c.detail,
-                hint: c.hint,
-                retryable: c.retryable,
-                trace,
-            }
-        }
-        ExecError::InvalidParams(message) => Output::Error {
-            id,
-            error_code: error_code::INVALID_REQUEST.to_string(),
-            error: message,
-            sqlstate: None,
-            message: None,
-            detail: None,
-            hint: None,
-            retryable: false,
-            trace,
-        },
-        ExecError::Config { message, hint } | ExecError::InvalidRequest { message, hint } => {
-            Output::Error {
-                id,
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: message,
-                sqlstate: None,
-                message: None,
-                detail: None,
-                hint,
-                retryable: false,
-                trace,
-            }
-        }
-        ExecError::Cancelled => Output::Error {
-            id,
-            error_code: error_code::CANCELLED.to_string(),
-            error: "transaction operation cancelled".to_string(),
-            sqlstate: None,
-            message: None,
-            detail: None,
-            hint: Some("retry the typed transaction operation".to_string()),
-            retryable: true,
-            trace,
-        },
-        ExecError::Internal(message) => Output::Error {
-            id,
-            error_code: error_code::INTERNAL_ERROR.to_string(),
-            error: message,
-            sqlstate: None,
-            message: None,
-            detail: None,
-            hint: Some(
-                "afpsql hit an internal error; retry, then restart the session if it persists"
-                    .to_string(),
-            ),
-            retryable: true,
-            trace,
-        },
-    };
-    let _ = app.writer.send(output).await;
+    handler::emit_exec_error(app, id, resolved_session, err, start).await;
 }
 
 async fn dispatch_query(
@@ -642,22 +569,23 @@ async fn dispatch_query(
         return;
     }
 
-    let resolved_session = {
-        let cfg = app.config.read().await;
-        resolve_session_name(&cfg, session.as_deref())
-    };
+    // One read, and the query carries it. Resolving the name now and the
+    // endpoint later is what let a `config` line overtake a queued query.
+    let accepted_config = app.config.read().await.clone();
+    let resolved_session = resolve_session_name(&accepted_config, session.as_deref());
     let tx = get_session_worker(runtime, &resolved_session).await;
     app.requests_total.fetch_add(1, Ordering::Relaxed);
     let queued = QueuedQuery {
         id: key.clone(),
         session: resolved_session,
+        accepted_config,
         sql,
         params,
         options,
         cancel_slot,
         state,
     };
-    if tx.send(SessionOp::Query(queued)).await.is_err() {
+    if tx.send(SessionOp::Query(Box::new(queued))).await.is_err() {
         let _ = app.in_flight.lock().await.remove(&key);
         let _ = app
             .writer
@@ -676,62 +604,29 @@ async fn dispatch_query(
     }
 }
 
+/// Ask the database to stop a query. Not a claim about how it ended.
+///
+/// This used to take the query's terminal event slot before the CancelRequest
+/// was even sent, emit `cancelled`, and drop the worker's real outcome on the
+/// floor. PostgreSQL's protocol says the opposite is true: a CancelRequest gets
+/// no response, may arrive after the backend has finished the statement, and
+/// the client has to keep waiting on the original query to learn whether it
+/// succeeded or ended with `57014`. A committed write reported as "cancelled"
+/// is the worst answer this program can give — the agent then does the work
+/// again, or reports to a person that nothing happened.
+///
+/// So there are two shapes now. A query still queued has not reached the
+/// database at all, and cancelling it *is* its outcome: that one is claimed
+/// atomically and gets a terminal `cancelled`. A running query gets an
+/// acknowledgement, and its own terminal event still arrives when the worker
+/// learns what actually happened.
 async fn dispatch_cancel(app: &Arc<App>, id: String) {
     let query = {
         let in_flight = app.in_flight.lock().await;
         in_flight.get(&id).cloned()
     };
 
-    if let Some(query) = query {
-        // Try to claim the terminal emit slot. If the handler already won
-        // (result/sql_error has been sent), report `already finished` and
-        // do not emit a second terminal event.
-        let won_emit = query.cancel_slot.claim_terminal_emit();
-        if !won_emit || query.state.phase() == QueryPhase::Finished {
-            let _ = app.in_flight.lock().await.remove(&id);
-            let _ = app
-                .writer
-                .send(Output::Error {
-                    id: Some(id),
-                    error_code: error_code::INVALID_REQUEST.to_string(),
-                    error: "query already finished".to_string(),
-                    sqlstate: None,
-                    message: None,
-                    detail: None,
-                    hint: Some(
-                        "cancel raced completion; the prior result/error event holds the outcome"
-                            .to_string(),
-                    ),
-                    retryable: false,
-                    trace: Trace::only_duration(0),
-                })
-                .await;
-        } else {
-            query.state.set_phase(QueryPhase::Cancelled);
-            let hint = match query.cancel_server_query().await {
-                Ok(true) => Some("server-side cancel requested".to_string()),
-                Ok(false) => {
-                    Some("query cancelled before execution reached the database".to_string())
-                }
-                Err(e) => Some(e),
-            };
-            let _ = app.in_flight.lock().await.remove(&id);
-            let _ = app
-                .writer
-                .send(Output::Error {
-                    id: Some(id),
-                    error_code: error_code::CANCELLED.to_string(),
-                    error: "query cancelled".to_string(),
-                    sqlstate: None,
-                    message: None,
-                    detail: None,
-                    hint,
-                    retryable: false,
-                    trace: Trace::only_duration(0),
-                })
-                .await;
-        }
-    } else {
+    let Some(query) = query else {
         let _ = app
             .writer
             .send(Output::Error {
@@ -749,7 +644,80 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
                 trace: Trace::only_duration(0),
             })
             .await;
+        return;
+    };
+
+    // Never started: the cancel is the whole story, and this is the only path
+    // that may speak for the query's outcome.
+    if query.state.try_cancel_queued() {
+        query.cancel_slot.request_cancel();
+        let terminal = query.cancel_slot.claim_terminal_emit();
+        let _ = app.in_flight.lock().await.remove(&id);
+        if terminal {
+            let _ = app
+                .writer
+                .send(Output::Error {
+                    id: Some(id),
+                    error_code: error_code::CANCELLED.to_string(),
+                    error: "query cancelled".to_string(),
+                    sqlstate: None,
+                    message: None,
+                    detail: None,
+                    hint: Some(
+                        "cancelled before execution reached the database; nothing was sent"
+                            .to_string(),
+                    ),
+                    retryable: false,
+                    trace: Trace::only_duration(0),
+                })
+                .await;
+        }
+        return;
     }
+
+    if query.state.is_finished() {
+        let _ = app.in_flight.lock().await.remove(&id);
+        let _ = app
+            .writer
+            .send(Output::Error {
+                id: Some(id),
+                error_code: error_code::INVALID_REQUEST.to_string(),
+                error: "query already finished".to_string(),
+                sqlstate: None,
+                message: None,
+                detail: None,
+                hint: Some(
+                    "cancel raced completion; the prior result/error event holds the outcome"
+                        .to_string(),
+                ),
+                retryable: false,
+                trace: Trace::only_duration(0),
+            })
+            .await;
+        return;
+    }
+
+    // Running. Ask, then say only that it was asked. The entry stays in flight
+    // and the id stays taken until the worker emits the real outcome.
+    let sent = query.cancel_server_query().await;
+    let hint = match sent {
+        Ok(true) => "cancel sent to the server; wait for this id's result, sql_error \
+                     (`57014` means it was stopped), or error"
+            .to_string(),
+        Ok(false) => {
+            "no server-side cancel could be sent; wait for this id's terminal event".to_string()
+        }
+        Err(reason) => format!("{reason}; wait for this id's terminal event"),
+    };
+    let _ = app
+        .writer
+        .send(Output::CancelRequested {
+            id,
+            session: None,
+            hint,
+            trace: Trace::only_duration(0),
+        })
+        .await;
 }
 
 async fn get_session_worker(runtime: &Arc<PipeRuntime>, session: &str) -> mpsc::Sender<SessionOp> {
@@ -780,8 +748,13 @@ async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<SessionOp>) {
     while let Some(op) = rx.recv().await {
         match op {
             SessionOp::Query(query) => {
-                if query.cancel_slot.is_cancelled() || !query.state.try_start() {
-                    query.state.set_phase(QueryPhase::Cancelled);
+                // The CAS is the whole handover: if the cancel dispatcher took
+                // this query while it was queued, it owns the outcome and
+                // already emitted it. Checking `is_cancelled` here as well —
+                // which this used to do — would also skip a query the
+                // dispatcher decided to let run, leaving an id with no
+                // terminal event at all.
+                if !query.state.try_start() {
                     continue;
                 }
 
@@ -792,16 +765,21 @@ async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<SessionOp>) {
                     query.sql,
                     query.params,
                     query.options,
-                    Some(query.cancel_slot.clone()),
+                    Some(handler::Queued {
+                        cancel_slot: query.cancel_slot.clone(),
+                        accepted_config: query.accepted_config,
+                    }),
                 )
                 .await;
 
-                if query.cancel_slot.is_cancelled() || query.state.phase() == QueryPhase::Cancelled
-                {
-                    query.state.set_phase(QueryPhase::Cancelled);
-                } else {
-                    query.state.set_phase(QueryPhase::Finished);
-                }
+                // Finished means the terminal event went out, whatever it said.
+                // A cancel that landed mid-flight does not change that: what
+                // the database did is what `execute_query` just reported.
+                // Left in the map, finished. `cleanup_finished_queries` reaps
+                // it later; until then a cancel that lost the race is told the
+                // query already finished rather than that it never existed, and
+                // the id stays taken.
+                query.state.set_phase(QueryPhase::Finished);
             }
             SessionOp::Begin {
                 id,

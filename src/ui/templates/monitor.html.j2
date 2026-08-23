@@ -1,14 +1,17 @@
 {#-
-  `connection_monitor`: the same `inspect connections` snapshot, re-run on every
-  reload, read four ways before the raw table.
+  `connection_monitor`: the same `inspect connections` snapshot, pushed again
+  on its live interval while at least one visible page is observing it, and
+  read four ways before the raw table.
 
   Everything here is already counted, sorted and formatted in the document, so
   an override reorders, drops or regroups these sections without recomputing
   anything — and without being able to disagree with what the agent read.
 -#}
-{% extends "layout.html.j2" %}
+{% extends "templates/layout.html.j2" %}
 {% block panel %}
-{% if document.error %}<p class="warn">This reload failed: {{ document.error }}. The page keeps trying.</p>
+<p class="monitor-live" data-afpsql-live-status role="status" aria-live="polite">Connecting…</p>
+<div data-afpsql-monitor-snapshot>
+{% if document.error %}<p class="warn">This update failed: {{ document.error }}. The monitor keeps trying.</p>
 {% endif %}
 <section class="capacity">
 {% if document.capacity.max %}<meter min="0" max="{{ document.capacity.max }}" value="{{ document.capacity.clients }}" low="{{ document.capacity.high }}" high="{{ document.capacity.high }}" optimum="0"></meter><p class="count">{{ document.capacity.clients }} <span class="of">of {{ document.capacity.max }}</span> <span class="unit">client connections</span></p>
@@ -18,6 +21,16 @@
 {% for group in document.groups %}<section class="group"><h2>{{ group.heading }}</h2><dl>{% for entry in group.entries %}<div><dt>{{ entry.label }}</dt><dd>{{ entry.count }}</dd></div>{% endfor %}</dl></section>
 {% endfor %}</div>
 {% endif %}
+<section class="explain-panel" aria-labelledby="explain-heading" data-afpsql-explain-panel>
+<h2 id="explain-heading">Explain a statement</h2>
+<p class="hint">See PostgreSQL's plan without running the statement.</p>
+<form data-afpsql-explain-form>
+<label for="afpsql-explain-sql">SQL</label>
+<textarea id="afpsql-explain-sql" data-afpsql-explain-sql spellcheck="false" required></textarea>
+<div class="explain-actions"><span class="hint" data-afpsql-explain-status role="status" aria-live="polite"></span><button type="submit" aria-keyshortcuts="Meta+Enter Control+Enter" disabled>Explain</button></div>
+</form>
+<pre class="sql explain-result" data-afpsql-explain-result hidden tabindex="0"></pre>
+</section>
 <section class="longest"><h2>Longest running</h2>
 {% if document.longest %}<div class="scroll">
 <table>
@@ -31,6 +44,7 @@
 </div>{% else %}<p class="empty">No statement is running and no transaction is open.</p>{% endif %}</section>
 <section class="waits"><h2>Wait events</h2>{% if document.waits %}<dl>{% for wait in document.waits %}<div><dt>{{ wait.label }}</dt><dd>{{ wait.count }}</dd></div>{% endfor %}</dl>{% else %}<p class="empty">Nothing is waiting.</p>{% endif %}</section>
 {% if document.backend_count == 0 %}<p class="empty">The server reported no backends.</p>
-{% else %}<h2>Every backend</h2>
-{% include "table.html.j2" %}{% endif %}
+{% else %}<details class="raw"><summary>All backends ({{ document.backend_count }})</summary>
+{% include "templates/table.html.j2" %}</details>{% endif %}
+</div>
 {% endblock %}

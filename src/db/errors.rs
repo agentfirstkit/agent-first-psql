@@ -18,6 +18,24 @@ pub enum ExecError {
         hint: Option<String>,
         position: Option<String>,
     },
+    /// The connection carrying an explicit transaction was gone before
+    /// `COMMIT` could be sent.
+    ///
+    /// A settled answer, not an unknown one: PostgreSQL rolls a transaction
+    /// back when its backend goes away, and nothing was sent, so the work is
+    /// definitely not committed. Saying so lets a caller redo it; saying
+    /// "internal error, retryable" — which is what this used to be — invites
+    /// the caller to send `COMMIT` again, on a new connection, where it
+    /// succeeds trivially and reports a commit that never happened.
+    TransactionLostRolledBack,
+    /// `COMMIT` was sent and no answer came back.
+    ///
+    /// The one outcome this program cannot resolve on its own. The database may
+    /// have committed and lost the reply, or may have failed before committing.
+    /// It is never retryable — repeating the write is how the same row is
+    /// written twice — and the only way out is for the caller to look at the
+    /// data.
+    CommitOutcomeUnknown(String),
     Internal(String),
 }
 
@@ -30,6 +48,10 @@ impl std::fmt::Display for ExecError {
         match self {
             Self::Cancelled => f.write_str("cancelled"),
             Self::Connect(error) => f.write_str(&error.error),
+            Self::TransactionLostRolledBack => f.write_str(
+                "the connection was lost before COMMIT was sent; the transaction was rolled back",
+            ),
+            Self::CommitOutcomeUnknown(message) => f.write_str(message),
             Self::Config { message, .. }
             | Self::InvalidRequest { message, .. }
             | Self::InvalidParams(message)

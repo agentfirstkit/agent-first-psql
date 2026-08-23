@@ -1,5 +1,9 @@
 pub mod error_code {
     pub const CANCELLED: &str = "cancelled";
+    /// The write is settled: it did not happen, and it is safe to redo.
+    pub const TRANSACTION_LOST_ROLLED_BACK: &str = "transaction_lost_rolled_back";
+    /// The write is unsettled: look at the data before doing anything.
+    pub const COMMIT_OUTCOME_UNKNOWN: &str = "commit_outcome_unknown";
     pub const CONNECT_FAILED: &str = "connect_failed";
     pub const INTERNAL_ERROR: &str = "internal_error";
     pub const INVALID_PARAMS: &str = "invalid_params";
@@ -31,6 +35,11 @@ pub mod command_tag {
     pub fn rows(row_count: usize) -> String {
         format!("ROWS {row_count}")
     }
+}
+
+pub mod sqlstate {
+    /// `query_canceled`: the server stopped the statement and rolled it back.
+    pub const QUERY_CANCELED: &str = "57014";
 }
 
 pub fn sqlstate_retryable(sqlstate: &str) -> bool {

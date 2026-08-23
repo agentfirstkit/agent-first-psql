@@ -3,9 +3,9 @@
 //! `ui schema`, `ui table`, `ui indexes` and `ui connections` are *watch*
 //! sessions: afpsql opens a window onto something a person reads, nothing on
 //! the page submits, and the session ends when they close it. Their value type
-//! is `()` and `Outcome::Completed` never occurs. `ui connections` differs from
-//! the other three in one way only — it reloads itself, because it is a view of
-//! something that moves.
+//! is `()` and `Outcome::Completed` never occurs. `ui connections` is live: it
+//! receives fresh server snapshots while the page can send an `EXPLAIN`
+//! inspection back over the same AFUI session runtime.
 //!
 //! `ui plan` is a *decide* session. It shows one statement and returns the
 //! person's answer as a typed value, and only one answer runs it: closing the
@@ -27,21 +27,27 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use agent_first_data::OutputFormat;
-use agent_first_ui::{Outcome, UiCspNonce, UiSecurityPolicy, UiSession, UiWindowConfig};
+use agent_first_ui::{
+    Outcome, UiCall, UiCallError, UiCspNonce, UiDeliveryFacts, UiDeliveryPlan, UiPagePolicy,
+    UiPageScript, UiSession, UiSessionRuntime,
+};
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderValue, header};
-use axum::response::{Html, IntoResponse};
+use axum::response::Html;
 use axum::routing::{get, post};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::task::JoinSet;
 
 mod frontend;
+mod inspect;
 
 use frontend::{FrontendFailure, PanelFrontend, PanelShape};
+use inspect::inspect_document;
 
 use crate::cli::{
     InspectAction, InspectConnectionsArgs, InspectIndexesArgs, InspectSchemaArgs, InspectTableArgs,
@@ -61,27 +67,36 @@ use crate::types::{
 /// these pages have no behaviour, and neither afpsql nor a frontend can give
 /// them any.
 ///
-/// `img-src` and `font-src` name `'self'` rather than `'none'` because a
-/// frontend may ship assets, and they are served from this session's own origin
-/// by `UiFrontend::assets_router`. Same origin, same credential, no network.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; \
-     connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'";
+/// Images and fonts come from this session's own origin because a frontend may
+/// ship assets, and AFUI serves them from that same origin under this same
+/// credential. Same origin, same credential, no network.
+fn watch_page_policy() -> UiPagePolicy {
+    UiPagePolicy::new(UiPageScript::None)
+        .allow_images()
+        .allow_fonts()
+}
 
-/// The decide panel differs in exactly two directives, and both are what make
-/// its answer trustworthy rather than what weaken it.
+/// The live monitor loads one nonce-bound Provider runtime and connects only
+/// to the channel under its own credential. Static inspection panels keep the
+/// script-free policy above.
+fn monitor_page_policy(nonce: &UiCspNonce) -> UiPagePolicy {
+    watch_page_policy()
+        .with_script(UiPageScript::Nonce(nonce.clone()))
+        .allow_runtime()
+}
+
+/// The decide panel differs from a watch panel in exactly two switches, and
+/// both are what make its answer trustworthy rather than what weaken it.
 ///
-/// `script-src 'nonce-…'` admits precisely one script — afpsql's decision
-/// runtime, spliced in at the layout marker with this session's nonce. A
-/// frontend cannot supply a script file (AFUI refuses one by name) or hide one
-/// in a template (refused by content), and could not run it if it did: it does
-/// not know the nonce. `form-action 'self'` is where the answer goes.
-fn plan_content_security_policy(nonce: &UiCspNonce) -> String {
-    format!(
-        "default-src 'none'; style-src 'self'; img-src 'self'; font-src 'self'; \
-         script-src 'nonce-{}'; connect-src 'none'; form-action 'self'; base-uri 'none'; \
-         frame-ancestors 'none'",
-        nonce.as_str()
-    )
+/// The nonce admits precisely one script — afpsql's decision runtime, spliced
+/// in at the layout marker with this session's nonce. A frontend cannot supply
+/// a script file (AFUI refuses one by name) or hide one in a template (refused
+/// by content), and could not run it if it did: it does not know the nonce.
+/// Form submission is where the answer goes.
+fn plan_page_policy(nonce: &UiCspNonce) -> UiPagePolicy {
+    watch_page_policy()
+        .with_script(UiPageScript::Nonce(nonce.clone()))
+        .allow_form_submission()
 }
 
 const PLAN_UI_KIND: &str = "plan_confirm";
@@ -91,6 +106,10 @@ const PLAN_UI_KIND: &str = "plan_confirm";
 /// A monitor is read at a glance; the full activity table below it holds every
 /// row, so nothing is hidden by this cut.
 const LONGEST_ROWS: usize = 10;
+
+/// A live inspection request is still an interactive control, not a bulk SQL
+/// transport. Larger statements use the ordinary CLI or pipe protocol.
+const MAX_MONITOR_EXPLAIN_SQL_BYTES: usize = 64 * 1024;
 
 /// The leading keywords afpsql calls a write when it describes a statement.
 ///
@@ -117,20 +136,49 @@ pub async fn run(
         startup_args,
         startup_env,
         startup_requested,
+        delivery,
     } = request;
 
-    // Opening a window spawns a browser and writes a profile directory. That is
-    // a host capability, and an administrator-locked profile restricts those
-    // for the same reason it refuses `--stdout-file`. It holds for every panel,
-    // including the one that would otherwise only ever read.
-    if locked_readonly_profile {
-        fail(
-            error_code::INVALID_REQUEST,
-            "panels are unavailable through an administrator-locked profile",
-            Some(crate::readonly_local_capability_hint()),
-            output,
-        );
+    // Not "opening a window is a host capability" — that reasoning only ever
+    // covered the window it was written for, and it would have waved a
+    // published session through instead of catching it: a published session
+    // spawns no browser and writes no profile directory. What a locked
+    // profile has to withhold is where the data behind a panel can end up.
+    // A window puts it on the screen of whoever is running afpsql; a
+    // published session puts it in front of anyone holding the
+    // `afui session serve` URL — a wider exit for the same rows than
+    // `--stdout-file`, which a locked profile already refuses. Judged that
+    // way, every delivery a panel could ever gain is refused for the same
+    // reason, so this check does not grow a case per delivery; it holds for
+    // every panel, including the one that would otherwise only ever read.
+    if let Some((message, hint)) = locked_profile_panel_refusal(locked_readonly_profile) {
+        fail(error_code::INVALID_REQUEST, message, Some(hint), output);
     }
+
+    // Resolved once, before any panel or query work, for the same reason the
+    // refusal above runs first: a bad `AFUI_DELIVERY` value or a resolved
+    // `link` should end the process before a connection is even opened, not
+    // after a person was already told a panel is on its way.
+    //
+    // `UI_DELIVERY` is `Local`, which is where afpsql declines `link` for a
+    // database panel — and it is the same value the `--mode` flag is built
+    // from, so the enum a person reads and the plan they get cannot disagree.
+    // The reason belongs here: a `link` panel binds every interface and
+    // advertises the result on the network with no tunnel — a wider,
+    // unencrypted exit for the same rows `--stdout-file` already loses under a
+    // locked profile (see `locked_profile_panel_refusal`). `window` never
+    // leaves this screen; `session` stays on loopback and is reached only
+    // through afui's own registry. AFUI refuses the resolved mode here and
+    // names the two that are on offer.
+    let plan = match crate::cli::UI_DELIVERY.resolve(delivery) {
+        Ok(plan) => plan,
+        Err(error) => fail(
+            error_code::INVALID_REQUEST,
+            &error.to_string(),
+            Some(DELIVERY_MODE_HINT),
+            output,
+        ),
+    };
 
     let config = RuntimeConfig::default();
     let (tx, rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
@@ -153,10 +201,49 @@ pub async fn run(
     }
 
     match panel {
-        UiPanel::View(view) => view_panel(app, rx, view, &session, output).await,
-        UiPanel::Plan(plan) => plan_panel(app, rx, plan, session, output).await,
+        UiPanel::View(view) => view_panel(app, rx, view, &session, output, plan).await,
+        UiPanel::Plan(statement) => plan_panel(app, rx, statement, session, output, plan).await,
     }
 }
+
+/// One readiness event: what afpsql knows about this panel, spliced together
+/// with what AFUI knows about the delivery reaching a person.
+///
+/// The delivery facts are taken rather than restated, so `mode`, `session_id`
+/// and the attention intervals mean the same thing here as in any other tool
+/// AFUI delivers for, under the same names.
+fn ready_event(facts: &UiDeliveryFacts, event: Value) -> Value {
+    // No link URL to reveal: `UI_DELIVERY` is `Local`, so a panel here never
+    // has one, and the plain merge is the whole job.
+    agent_first_ui::cli::ready_event(facts, event)
+}
+
+/// A panel a person only reads: no submission, no answer, and therefore no
+/// outcome but "they are done looking".
+///
+/// The nine composition steps this used to spell out — session, subject, icon,
+/// policy, stylesheet route, assets nest, page route, delivery, facts — are
+/// `UiSurface`'s now. What is left is which of them afpsql has an opinion
+/// about.
+fn watch_surface(
+    ui_kind: &'static str,
+    subject: &str,
+    app_icon: agent_first_ui::UiAppIcon,
+) -> agent_first_ui::UiSurface<()> {
+    // `UiSession::new` validates the two identifiers, and both are compile-time
+    // constants here, so this cannot fail in a way a person could cause.
+    #[allow(clippy::expect_used)]
+    agent_first_ui::UiSurface::<()>::new("afpsql", ui_kind)
+        .expect("afpsql's own provider and ui_kind identifiers are valid")
+        .with_subject(subject)
+        .with_app_icon(app_icon)
+        .with_page_policy(watch_page_policy())
+}
+
+/// What a `--mode` refusal tells a person to do instead. Both deliveries
+/// afpsql offers are named, because AFUI's own refusal names the modes but
+/// not the flag they belong to.
+const DELIVERY_MODE_HINT: &str = "use `--mode window` or `--mode session`";
 
 // ═══════════════════════════════════════════
 // Shared plumbing
@@ -241,21 +328,43 @@ async fn run_query_once(
     run
 }
 
-fn security_policy(policy: &str) -> UiSecurityPolicy {
-    match HeaderValue::from_str(policy) {
-        Ok(value) => UiSecurityPolicy::isolated().with_content_security_policy(value),
-        Err(_) => UiSecurityPolicy::isolated(),
+/// Whether an administrator-locked readonly profile refuses this panel, and
+/// what to say about it.
+///
+/// Deliberately blind to which panel was asked for and to how it would be
+/// delivered: the judgement is about where data can leave this process, not
+/// about what a particular delivery costs to open, so nothing about *this*
+/// panel or *this* delivery belongs in the condition. A future delivery
+/// option therefore inherits the refusal by construction rather than needing
+/// a new arm here.
+fn locked_profile_panel_refusal(
+    locked_readonly_profile: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !locked_readonly_profile {
+        return None;
     }
+    Some((
+        "a locked readonly profile has no exit for what the database holds, so ui panels are unavailable",
+        "read the same data with the matching `afpsql inspect` command",
+    ))
 }
 
-fn window_hint(error: &agent_first_ui::Error) -> Option<&'static str> {
-    match error {
-        agent_first_ui::Error::WindowBinaryNotFound => Some(
+/// A hint for a delivery failure, named for the axis rather than for
+/// `window` alone: [`UiDeliveryPlan::resolve`] and [`UiDeliveryPlan::deliver`]
+/// can both fail for either delivery this spore offers, and every call site
+/// passes their error here regardless of which one it was.
+fn delivery_hint(error: &agent_first_ui::Error) -> Option<&'static str> {
+    // Keyed on AFUI's classification rather than on one variant, so a window
+    // that could not launch gets the same way out as one that was never found.
+    // afpsql's own alternative replaces AFUI's: the useful thing to say here
+    // is not only "install a browser" but "you do not need one for this".
+    if error.kind() == agent_first_ui::UiErrorKind::WindowUnavailable {
+        return Some(
             "install a Chromium-family browser, or read the same data with the matching \
              `afpsql inspect` command",
-        ),
-        _ => None,
+        );
     }
+    error.hint()
 }
 
 fn fail(code: &str, message: &str, hint: Option<&str>, output: OutputFormat) -> ! {
@@ -269,35 +378,6 @@ fn emit_event_or_exit(event: agent_first_data::Event, output: OutputFormat) {
     if crate::emit::emit_event(event, output).is_err() {
         std::process::exit(4);
     }
-}
-
-/// The routes every panel serves besides its own page.
-///
-/// The stylesheet is read once, when the panel starts, rather than per request:
-/// a frontend's bytes are fixed for the life of a window — editing it revokes
-/// its trust anyway — and reading it here is what turns an unreadable
-/// stylesheet into a failure before a window opens rather than into a page with
-/// no styling.
-fn shared_panel_routes(frontend: &PanelFrontend, stylesheet: Vec<u8>) -> Router {
-    let stylesheet = Arc::new(stylesheet);
-    Router::new()
-        .route(
-            "/style.css",
-            get(move || {
-                let stylesheet = Arc::clone(&stylesheet);
-                async move {
-                    (
-                        [(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/css; charset=utf-8"),
-                        )],
-                        stylesheet.to_vec(),
-                    )
-                        .into_response()
-                }
-            }),
-        )
-        .nest("/assets", frontend.assets_router())
 }
 
 /// A frontend that will not load ends the command. It is never a quietly
@@ -350,12 +430,27 @@ fn connection_subject(session: &SessionConfig) -> String {
 // View panels
 // ═══════════════════════════════════════════
 
+/// The built-in page a view panel starts from.
+///
+/// One shape per `ui_kind` rather than one per *behaviour*: `ui table` and
+/// `ui schema` read the same query and neither reloads, yet they are two things
+/// to look at, so they are two pages a person can replace independently.
+fn panel_shape(view: &UiView) -> PanelShape {
+    match view {
+        UiView::Table { .. } => PanelShape::Table,
+        UiView::Schema { .. } => PanelShape::Schema,
+        UiView::Indexes { .. } => PanelShape::Index,
+        UiView::Connections { .. } => PanelShape::Monitor,
+    }
+}
+
 async fn view_panel(
     app: Arc<App>,
     rx: mpsc::Receiver<Output>,
     view: UiView,
     session: &SessionConfig,
     output: OutputFormat,
+    plan: UiDeliveryPlan,
 ) -> ! {
     let (sql, params) = crate::cli::inspect_sql_for(view.inspect_action());
     // The subject is what tells two panels of the same kind apart in
@@ -366,22 +461,18 @@ async fn view_panel(
     };
     // Before the first query, so a frontend afpsql cannot load costs a person
     // an error rather than a connection, a window, and then an error.
-    let shape = match view.refresh_seconds() {
-        Some(_) => PanelShape::Monitor,
-        None => PanelShape::Inspect,
-    };
-    let frontend = match PanelFrontend::resolve(view.ui_kind(), shape) {
+    let frontend = match PanelFrontend::resolve(view.ui_kind(), panel_shape(&view)) {
         Ok(frontend) => Arc::new(frontend),
         Err(failure) => fail_frontend(failure, output),
     };
     match view.refresh_seconds() {
         Some(seconds) => {
             live_panel(
-                app, rx, view, sql, params, subject, seconds, frontend, output,
+                app, rx, view, sql, params, subject, seconds, frontend, output, plan,
             )
             .await
         }
-        None => static_panel(app, rx, view, sql, params, subject, frontend, output).await,
+        None => static_panel(app, rx, view, sql, params, subject, frontend, output, plan).await,
     }
 }
 
@@ -399,7 +490,13 @@ async fn static_panel(
     subject: String,
     frontend: Arc<PanelFrontend>,
     output: OutputFormat,
+    plan: UiDeliveryPlan,
 ) -> ! {
+    let mode = plan.mode();
+    let app_icon = match frontend.app_icon() {
+        Ok(app_icon) => app_icon,
+        Err(failure) => fail_frontend(failure, output),
+    };
     let mut run = run_query_once(&app, &sql, &params, &mut rx).await;
     app.executor.shutdown().await;
     drop(app);
@@ -429,37 +526,44 @@ async fn static_panel(
         Ok(page) => page,
         Err(failure) => fail_frontend(failure, output),
     };
-    let router = Router::new()
-        .route("/", get(move || async move { Html(page) }))
-        .merge(shared_panel_routes(&frontend, stylesheet));
 
-    let session = match UiSession::<()>::new("afpsql", view.ui_kind()) {
-        Ok(session) => session
-            .with_subject(subject.clone())
-            .with_security_policy(security_policy(CONTENT_SECURITY_POLICY)),
-        Err(error) => fail("ui_session_invalid", &error.to_string(), None, output),
+    // Reachable first, then announced: `start` returns at exactly the point
+    // where every delivery fact is known and nobody is waiting on the person
+    // yet, so the readiness event describes a panel that is already there.
+    let active = match watch_surface(view.ui_kind(), &subject, app_icon)
+        .start(plan, page, stylesheet, frontend.frontend())
+        .await
+    {
+        Ok(active) => active,
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
     };
-
-    // The window is about to appear, and `window()` does not return until the
-    // person closes it, so the readiness event goes out first.
     emit_event_or_exit(
-        agent_first_data::json_progress(serde_json::json!({
-            "phase": "ui_ready",
-            "message": "The inspection panel is open. It ends when you close the window.",
-            "ui_kind": view.ui_kind(),
-            "subject": subject,
-            "row_count": rows.len(),
-            // Absent when afpsql's own page is serving. A workspace frontend
-            // that has not been trusted is deliberately skipped in silence, so
-            // this is how an agent tells "my override is running" from "my
-            // override is inert" without opening a window to look.
-            "ui_frontend_id": frontend.frontend_id(),
-        }))
+        agent_first_data::json_progress(ready_event(
+            &active.facts(),
+            serde_json::json!({
+                "phase": "ui_ready",
+                "message": format!("The inspection panel is ready: {}.", mode.description()),
+                "ui_kind": view.ui_kind(),
+                "subject": subject,
+                "row_count": rows.len(),
+                // Absent when afpsql's own page is serving. A workspace
+                // frontend that has not been trusted is deliberately skipped
+                // in silence, so this is how an agent tells "my override is
+                // running" from "my override is inert" without opening a
+                // window to look.
+                "ui_frontend_id": frontend.frontend_id(),
+            }),
+        ))
         .build(),
         output,
     );
 
-    match session.window(router, &UiWindowConfig::default()).await {
+    match active.wait().await {
         // A watch panel has no submit control, so `Completed` is unreachable;
         // both real endings mean the person is done looking.
         Ok(Outcome::Closed | Outcome::Completed(())) => {
@@ -475,67 +579,271 @@ async fn static_panel(
             );
             std::process::exit(0);
         }
-        // `UiExpiry::Never` is what window delivery issues, so this cannot fire.
+        // Both deliveries this panel supports issue `UiExpiry::Never`, so
+        // this cannot fire.
         Ok(Outcome::Expired) => fail(
             "ui_expired",
             "the inspection panel credential expired",
             None,
             output,
         ),
-        Err(error) => fail("ui_failed", &error.to_string(), window_hint(&error), output),
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
     }
 }
 
-/// A panel over something that moves, and the state one reload needs.
+/// One domain action the live surface asks its controller to perform.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum LivePanelAction {
+    Observe,
+    Explain { sql: String },
+}
+
+/// One non-terminal or terminal value belonging to an `EXPLAIN` call.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LivePanelReply {
+    Observed,
+    ExplainStarted,
+    ExplainResult {
+        plan_lines: Vec<String>,
+        row_count: usize,
+    },
+}
+
+/// The complete replaceable state of the monitor surface.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LivePanelState {
+    Snapshot { row_count: usize, page_html: String },
+    Error { message: String },
+}
+
+type LiveRuntime = UiSessionRuntime<LivePanelAction, LivePanelReply, LivePanelState>;
+
+/// A visible page checks in every ten seconds. Three missed check-ins stop
+/// database refreshes, bounding the work after a browser disappears without a
+/// clean close while leaving generous room for ordinary timer jitter.
+const LIVE_OBSERVATION_LEASE: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct LiveObservation {
+    active_until: Option<tokio::time::Instant>,
+}
+
+impl LiveObservation {
+    fn observe(&mut self, now: tokio::time::Instant) {
+        self.active_until = Some(now + LIVE_OBSERVATION_LEASE);
+    }
+
+    fn active(&self, now: tokio::time::Instant) -> bool {
+        self.active_until.is_some_and(|deadline| now <= deadline)
+    }
+}
+
+/// A panel over something that moves, and the state its controller updates.
 ///
-/// The whole point of this session is that it outlives the agent's attention:
-/// the agent opens it, goes back to work, and a person watches until they stop
-/// caring. So the page cannot be a snapshot taken at open — it re-runs the same
-/// query on every request, holding the connection for the life of the window.
+/// The page route serves the most recent complete render. While it is open, the
+/// controller re-runs the same inspection query and replaces AFUI's retained
+/// state; an independent call can travel back over the runtime without turning
+/// either direction into a page reload.
 struct LivePanel {
     app: Arc<App>,
-    /// One reload at a time. The query and its drain are one unit — a second
-    /// reload arriving mid-drain would take the first one's events.
+    /// One query at a time. A refresh and its drain are one unit — an EXPLAIN
+    /// arriving mid-drain must not take the refresh's events.
     rx: Mutex<mpsc::Receiver<Output>>,
+    /// EXPLAIN has its own database executor and output stream. A slow plan
+    /// must not stop the monitor query whose changing result the person is
+    /// looking at while they ask for it.
+    explain_app: Arc<App>,
+    explain_rx: Mutex<mpsc::Receiver<Output>>,
     sql: String,
     params: Vec<Value>,
     subject: String,
     refresh_seconds: u64,
     title: &'static str,
     frontend: Arc<PanelFrontend>,
-    reloads: AtomicU64,
+    nonce: UiCspNonce,
+    page: RwLock<String>,
+    updates: AtomicU64,
     last_row_count: AtomicUsize,
 }
 
 impl LivePanel {
-    async fn page(&self) -> (axum::http::StatusCode, Html<String>) {
+    async fn page(&self) -> Html<String> {
+        Html(self.page.read().await.clone())
+    }
+
+    async fn push_snapshot(&self, runtime: &LiveRuntime) -> bool {
         let run = {
             let mut rx = self.rx.lock().await;
             run_query_once(&self.app, &self.sql, &self.params, &mut rx).await
         };
-        self.reloads.fetch_add(1, Ordering::Relaxed);
-        // Whatever else this reload emitted stays in the window. A monitor left
-        // open all afternoon would otherwise put one transport log line per
-        // reload into a stream the agent stopped reading hours ago.
+        self.updates.fetch_add(1, Ordering::Relaxed);
+        // Whatever else this refresh emitted stays in the window. A monitor
+        // left open all afternoon would otherwise put one transport log line
+        // per refresh into a stream its caller stopped reading hours ago.
         let (columns, rows) = run.table.unwrap_or_default();
         self.last_row_count.store(rows.len(), Ordering::Relaxed);
         let document = monitor_document(self, &columns, &rows, run.error.as_deref());
-        // The first render happened before the window opened, so a frontend
-        // that cannot render at all was already an error and no window exists.
-        // A reload that fails after that says so in the window rather than
-        // blanking, for the same reason a failed query does.
-        match self.frontend.render_page(&document, None) {
-            Ok(page) => (axum::http::StatusCode::OK, Html(page)),
-            Err(failure) => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!(
-                    "<!doctype html><html lang=\"en\"><head><meta http-equiv=\"refresh\" \
-                     content=\"{}\"></head><body><h1>This reload could not be drawn</h1>\
-                     <p>{}</p></body></html>",
-                    self.refresh_seconds,
-                    escape(&failure.message)
-                )),
-            ),
+        let page = match self.frontend.render_page(&document, Some(&self.nonce)) {
+            Ok(page) => page,
+            Err(failure) => {
+                return runtime
+                    .publish_state(&LivePanelState::Error {
+                        message: failure.message,
+                    })
+                    .is_ok();
+            }
+        };
+        *self.page.write().await = page.clone();
+        publish_live_state(
+            runtime,
+            LivePanelState::Snapshot {
+                row_count: rows.len(),
+                page_html: page,
+            },
+        )
+    }
+
+    async fn explain(&self, call: UiCall<LivePanelAction, LivePanelReply>, sql: String) -> bool {
+        if sql.trim().is_empty() || sql.len() > MAX_MONITOR_EXPLAIN_SQL_BYTES {
+            let message = if sql.trim().is_empty() {
+                "SQL must not be empty".to_string()
+            } else {
+                format!(
+                    "SQL is {} bytes, exceeding the {}-byte live inspection limit",
+                    sql.len(),
+                    MAX_MONITOR_EXPLAIN_SQL_BYTES
+                )
+            };
+            return call
+                .fail(UiCallError::new("explain_request_invalid", message))
+                .await
+                .is_ok();
+        }
+        if call
+            .progress(&LivePanelReply::ExplainStarted)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let explain_sql = crate::cli::wrap_explain_text_sql(&sql);
+        let run = {
+            let mut rx = self.explain_rx.lock().await;
+            run_query_once(&self.explain_app, &explain_sql, &[], &mut rx).await
+        };
+        if let Some(message) = run.error {
+            return call
+                .fail(UiCallError::new("explain_failed", message))
+                .await
+                .is_ok();
+        }
+        let Some((columns, rows)) = run.table else {
+            return call
+                .fail(UiCallError::new(
+                    "explain_failed",
+                    "PostgreSQL returned no EXPLAIN result set",
+                ))
+                .await
+                .is_ok();
+        };
+        let Some(plan_column) = columns.first() else {
+            return call
+                .fail(UiCallError::new(
+                    "explain_failed",
+                    "PostgreSQL returned an empty EXPLAIN result",
+                ))
+                .await
+                .is_ok();
+        };
+        let plan_lines = rows
+            .iter()
+            .map(|row| row.get(&plan_column.name).map(scalar).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let row_count = plan_lines.len();
+        call.finish(&LivePanelReply::ExplainResult {
+            plan_lines,
+            row_count,
+        })
+        .await
+        .is_ok()
+    }
+}
+
+fn publish_live_state(runtime: &LiveRuntime, state: LivePanelState) -> bool {
+    match runtime.publish_state(&state) {
+        Ok(_) => true,
+        Err(agent_first_ui::Error::SessionRuntimeMessageTooLarge { .. }) => runtime
+            .publish_state(&LivePanelState::Error {
+                message: "The live update is too large for this session; narrow the inspection and try again."
+                    .to_string(),
+            })
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+async fn run_live_runtime(panel: Arc<LivePanel>, runtime: LiveRuntime) {
+    let runtime = Arc::new(runtime);
+    let mut explain_tasks = JoinSet::new();
+    let mut observation = LiveObservation::default();
+    let mut refresh = tokio::time::interval(Duration::from_secs(panel.refresh_seconds.max(1)));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The opening page is already the first snapshot; consume the immediate
+    // tick so the next query happens after the requested interval.
+    refresh.tick().await;
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {
+                if observation.active(tokio::time::Instant::now())
+                    && !panel.push_snapshot(runtime.as_ref()).await
+                {
+                    return;
+                }
+            }
+            call = runtime.recv() => {
+                match call {
+                    Ok(Some(call)) => {
+                        match call.action() {
+                            LivePanelAction::Observe => {
+                                observation.observe(tokio::time::Instant::now());
+                                if call.finish(&LivePanelReply::Observed).await.is_err() {
+                                    return;
+                                }
+                            }
+                            LivePanelAction::Explain { sql } => {
+                                observation.observe(tokio::time::Instant::now());
+                                let sql = sql.clone();
+                                if explain_tasks.is_empty() {
+                                    let panel = Arc::clone(&panel);
+                                    explain_tasks.spawn(async move {
+                                        let _sent = panel.explain(call, sql).await;
+                                    });
+                                } else if call
+                                    .fail(UiCallError::new(
+                                        "explain_busy",
+                                        "Wait for the current plan before asking for another.",
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(_) => return,
+                }
+            }
+            Some(_finished) = explain_tasks.join_next(), if !explain_tasks.is_empty() => {}
         }
     }
 }
@@ -551,14 +859,15 @@ async fn live_panel(
     refresh_seconds: u64,
     frontend: Arc<PanelFrontend>,
     output: OutputFormat,
+    plan: UiDeliveryPlan,
 ) -> ! {
     // One run before anything is drawn, for the same reason a static panel
     // drains first: a server that refuses the connection must reach the agent
     // as an error event rather than as a window that says so to nobody. The
-    // page the browser then loads is its own, fresher run.
+    // page the browser then loads starts from exactly this successful run.
     let opening = run_query_once(&app, &sql, &params, &mut rx).await;
     opening.report_to_agent(output);
-    let Some((_, rows)) = opening.table else {
+    let Some((columns, rows)) = opening.table else {
         fail(
             error_code::INVALID_REQUEST,
             "the activity query returned no result set",
@@ -571,68 +880,139 @@ async fn live_panel(
         Ok(bytes) => bytes,
         Err(failure) => fail_frontend(failure, output),
     };
+    let app_icon = match frontend.app_icon() {
+        Ok(app_icon) => app_icon,
+        Err(failure) => fail_frontend(failure, output),
+    };
+    let nonce = match UiCspNonce::generate() {
+        Ok(nonce) => nonce,
+        Err(error) => fail("ui_session_invalid", &error.to_string(), None, output),
+    };
+    let explain_config = app.config.read().await.clone();
+    let (explain_tx, explain_rx) = mpsc::channel::<Output>(OUTPUT_CHANNEL_CAPACITY);
+    let explain_app = Arc::new(App::new(explain_config, explain_tx, app.capability));
+    explain_app.locked_readonly_profile.store(
+        app.locked_readonly_profile.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
     let panel = Arc::new(LivePanel {
         app,
         rx: Mutex::new(rx),
+        explain_app,
+        explain_rx: Mutex::new(explain_rx),
         sql,
         params,
         subject: subject.clone(),
         refresh_seconds,
         title: view.title(),
         frontend: Arc::clone(&frontend),
-        reloads: AtomicU64::new(0),
+        nonce: nonce.clone(),
+        page: RwLock::new(String::new()),
+        updates: AtomicU64::new(0),
         last_row_count: AtomicUsize::new(rows.len()),
     });
     // Draw the opening snapshot before the window exists, purely so a frontend
     // that will not render is an error rather than a window full of it.
-    let opening_document = monitor_document(&panel, &Vec::new(), &rows, None);
-    if let Err(failure) = frontend.render_page(&opening_document, None) {
-        fail_frontend(failure, output);
-    }
+    let opening_document = monitor_document(&panel, &columns, &rows, None);
+    let opening_page = match frontend.render_page(&opening_document, Some(&nonce)) {
+        Ok(page) => page,
+        Err(failure) => fail_frontend(failure, output),
+    };
+    *panel.page.write().await = opening_page.clone();
     let router = Router::new()
         .route(
             "/",
             get(|State(panel): State<Arc<LivePanel>>| async move { panel.page().await }),
         )
         .with_state(Arc::clone(&panel))
-        .merge(shared_panel_routes(&frontend, stylesheet));
+        .merge(agent_first_ui::page_asset_routes(
+            stylesheet,
+            frontend.frontend(),
+        ));
 
     let session = match UiSession::<()>::new("afpsql", view.ui_kind()) {
         Ok(session) => session
             .with_subject(subject.clone())
-            .with_security_policy(security_policy(CONTENT_SECURITY_POLICY)),
+            .with_app_icon(app_icon)
+            .with_security_policy(monitor_page_policy(&nonce).into_security_policy()),
         Err(error) => fail("ui_session_invalid", &error.to_string(), None, output),
+    };
+    let (session, runtime) =
+        match session.with_runtime::<LivePanelAction, LivePanelReply, LivePanelState>() {
+            Ok(runtime) => runtime,
+            Err(error) => fail("ui_session_invalid", &error.to_string(), None, output),
+        };
+    if !publish_live_state(
+        &runtime,
+        LivePanelState::Snapshot {
+            row_count: rows.len(),
+            page_html: opening_page,
+        },
+    ) {
+        fail(
+            "ui_runtime_failed",
+            "could not publish the connection monitor's opening state",
+            None,
+            output,
+        );
+    }
+
+    let mode = plan.mode();
+    let active = match plan.start(session, router).await {
+        Ok(active) => active,
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
     };
 
     emit_event_or_exit(
-        agent_first_data::json_progress(serde_json::json!({
-            "phase": "ui_ready",
-            "message": "The connection monitor is open and reloads itself. \
-                        It ends when the person closes the window.",
-            "ui_kind": view.ui_kind(),
-            "subject": subject,
-            "refresh_seconds": refresh_seconds,
-            "row_count": rows.len(),
-            "ui_frontend_id": frontend.frontend_id(),
-        }))
+        agent_first_data::json_progress(ready_event(
+            &active.facts(),
+            serde_json::json!({
+                "phase": "ui_ready",
+                "message": format!(
+                    "The connection monitor is ready and updates live: {}.",
+                    mode.description()
+                ),
+                "ui_kind": view.ui_kind(),
+                "subject": subject,
+                "refresh_seconds": refresh_seconds,
+                "row_count": rows.len(),
+                "ui_frontend_id": frontend.frontend_id(),
+            }),
+        ))
         .build(),
         output,
     );
 
-    match session.window(router, &UiWindowConfig::default()).await {
+    let runtime_task = tokio::spawn(run_live_runtime(Arc::clone(&panel), runtime));
+    let outcome = active.wait().await;
+    runtime_task.abort();
+    let _ignored = runtime_task.await;
+    match outcome {
         Ok(Outcome::Closed | Outcome::Completed(())) => {
             // This panel held a connection open for as long as the window was,
             // so it closes it rather than letting the exit tear it down. A view
             // of somebody's connection count should not leave one behind.
             panel.app.executor.shutdown().await;
+            panel.explain_app.executor.shutdown().await;
+            let update_count = panel.updates.load(Ordering::Relaxed);
             emit_event_or_exit(
                 agent_first_data::json_result(serde_json::json!({
                     "ui_kind": view.ui_kind(),
                     "subject": subject,
                     "refresh_seconds": refresh_seconds,
-                    // What the person actually watched: how many times the page
-                    // reloaded, and what the last one showed.
-                    "reload_count": panel.reloads.load(Ordering::Relaxed),
+                    // What the person actually watched: how many snapshots the
+                    // controller pushed, and what the last one showed.
+                    "update_count": update_count,
+                    // Compatibility for callers of the former meta-refresh
+                    // monitor. New callers should read `update_count`; keeping
+                    // this alias avoids turning a presentation transport change
+                    // into an unrelated AFDATA field removal.
+                    "reload_count": update_count,
                     "row_count": panel.last_row_count.load(Ordering::Relaxed),
                     "closed": true,
                 }))
@@ -641,13 +1021,20 @@ async fn live_panel(
             );
             std::process::exit(0);
         }
+        // Both deliveries this panel supports issue `UiExpiry::Never`, so
+        // this cannot fire.
         Ok(Outcome::Expired) => fail(
             "ui_expired",
             "the connection monitor credential expired",
             None,
             output,
         ),
-        Err(error) => fail("ui_failed", &error.to_string(), window_hint(&error), output),
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
     }
 }
 
@@ -678,12 +1065,16 @@ fn approved(outcome: &Outcome<PlanDecision>) -> bool {
 }
 
 /// How the window ended, in the agent's terms.
+///
+/// Only the decided endings are afpsql's to name. Every other way a UI stops
+/// — a person closing it, a credential lapsing — means the same thing in
+/// every tool, so those words come from AFUI rather than being respelled per
+/// delivery here.
 fn ending_of(outcome: &Outcome<PlanDecision>) -> &'static str {
     match outcome {
         Outcome::Completed(PlanDecision::Approve) => "approved",
         Outcome::Completed(PlanDecision::Refuse) => "refused",
-        Outcome::Closed => "window_closed",
-        Outcome::Expired => "credential_expired",
+        ended => ended.ending(),
     }
 }
 
@@ -734,15 +1125,17 @@ impl PlanFacts {
 async fn plan_panel(
     app: Arc<App>,
     mut rx: mpsc::Receiver<Output>,
-    plan: UiPlan,
+    statement: UiPlan,
     session: SessionConfig,
     output: OutputFormat,
+    plan: UiDeliveryPlan,
 ) -> ! {
+    let mode = plan.mode();
     let UiPlan {
         sql,
         params,
         options,
-    } = plan;
+    } = statement;
 
     // Resolve the permission policy once, from the same options and session the
     // execution will resolve from, so what the window claims about the
@@ -772,6 +1165,10 @@ async fn plan_panel(
     // cannot load never costs a round trip and never opens a window.
     let frontend = match PanelFrontend::resolve(PLAN_UI_KIND, PanelShape::Decide) {
         Ok(frontend) => Arc::new(frontend),
+        Err(failure) => fail_frontend(failure, output),
+    };
+    let app_icon = match frontend.app_icon() {
+        Ok(app_icon) => app_icon,
         Err(failure) => fail_frontend(failure, output),
     };
 
@@ -806,7 +1203,8 @@ async fn plan_panel(
     let ui_session = match UiSession::<PlanDecision>::new("afpsql", PLAN_UI_KIND) {
         Ok(ui_session) => ui_session
             .with_subject(subject.clone())
-            .with_security_policy(security_policy(&plan_content_security_policy(&nonce))),
+            .with_app_icon(app_icon)
+            .with_security_policy(plan_page_policy(&nonce).into_security_policy()),
         Err(error) => fail("ui_session_invalid", &error.to_string(), None, output),
     };
     let approve = ui_session.completion();
@@ -833,29 +1231,52 @@ async fn plan_panel(
                 decided_page(&refuse_frontend, PlanDecision::Refuse, recorded)
             }),
         )
-        .merge(shared_panel_routes(&frontend, stylesheet));
+        .merge(agent_first_ui::page_asset_routes(
+            stylesheet,
+            frontend.frontend(),
+        ));
 
+    let active = match plan.start(ui_session, router).await {
+        Ok(active) => active,
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
+    };
     emit_event_or_exit(
-        agent_first_data::json_progress(serde_json::json!({
-            "phase": "ui_ready",
-            "message": "A statement is waiting for a person to approve it. \
-                        Closing the window refuses it.",
-            "ui_kind": PLAN_UI_KIND,
-            "subject": subject,
-            "target": facts.target,
-            "read_only_transaction": facts.read_only,
-            "writes": facts.writes(),
-            "param_count": facts.params.len(),
-            "prepared": facts.prepared.summary(),
-            "ui_frontend_id": frontend.frontend_id(),
-        }))
+        agent_first_data::json_progress(ready_event(
+            &active.facts(),
+            serde_json::json!({
+                "phase": "ui_ready",
+                "message": format!(
+                    "A statement is waiting for a person to approve it — {}. Closing it refuses \
+                     the statement.",
+                    mode.description()
+                ),
+                "ui_kind": PLAN_UI_KIND,
+                "subject": subject,
+                "target": facts.target,
+                "read_only_transaction": facts.read_only,
+                "writes": facts.writes(),
+                "param_count": facts.params.len(),
+                "prepared": facts.prepared.summary(),
+                "ui_frontend_id": frontend.frontend_id(),
+            }),
+        ))
         .build(),
         output,
     );
 
-    let outcome = match ui_session.window(router, &UiWindowConfig::default()).await {
+    let outcome = match active.wait().await {
         Ok(outcome) => outcome,
-        Err(error) => fail("ui_failed", &error.to_string(), window_hint(&error), output),
+        Err(error) => fail(
+            "ui_failed",
+            &error.to_string(),
+            delivery_hint(&error),
+            output,
+        ),
     };
     if !approved(&outcome) {
         emit_event_or_exit(
@@ -1030,7 +1451,7 @@ fn decided_document(decision: PlanDecision, recorded: bool) -> DecidedDocument {
         heading,
         subject: message.to_owned(),
         refresh_seconds: None,
-        footer: "afpsql",
+        footer: "",
         message: message.to_owned(),
     }
 }
@@ -1133,42 +1554,6 @@ fn table_document(columns: &[ColumnInfo], rows: &[Value]) -> TableDocument {
     }
 }
 
-/// `schema_inspect`, `table_inspect`, `index_inspect`.
-#[derive(Serialize)]
-struct InspectDocument {
-    ui_kind: &'static str,
-    title: &'static str,
-    heading: &'static str,
-    subject: String,
-    /// Always `null` here: a schema does not change while a person reads it.
-    /// The key is present so one layout serves every panel.
-    refresh_seconds: Option<u64>,
-    footer: String,
-    row_count: usize,
-    table: TableDocument,
-}
-
-fn inspect_document(
-    view: &UiView,
-    subject: &str,
-    columns: &[ColumnInfo],
-    rows: &[Value],
-) -> InspectDocument {
-    InspectDocument {
-        ui_kind: view.ui_kind(),
-        title: view.title(),
-        heading: view.title(),
-        subject: subject.to_owned(),
-        refresh_seconds: None,
-        footer: format!(
-            "{} row(s). Close this window when you are done.",
-            rows.len()
-        ),
-        row_count: rows.len(),
-        table: table_document(columns, rows),
-    }
-}
-
 // ═══════════════════════════════════════════
 // `ui connections` document
 // ═══════════════════════════════════════════
@@ -1222,8 +1607,8 @@ struct MonitorDocument {
     subject: String,
     refresh_seconds: Option<u64>,
     footer: String,
-    /// The failure of *this* reload, if it failed. A monitor that blanks itself
-    /// the first time a server hiccups is worse than one that says which reload
+    /// The failure of *this* update, if it failed. A monitor that blanks itself
+    /// the first time a server hiccups is worse than one that says which update
     /// failed and keeps trying.
     error: Option<String>,
     snapshot_at: String,
@@ -1256,16 +1641,18 @@ fn monitor_document(
         .unwrap_or_default();
     let mut footer = String::new();
     if snapshot_at.is_empty() {
-        let _ = write!(footer, "Reloads every {}s.", panel.refresh_seconds);
+        let _ = write!(
+            footer,
+            "Updates every {}s while a page is visible.",
+            panel.refresh_seconds
+        );
     } else {
         let _ = write!(
             footer,
-            "Server time {snapshot_at}. Reloads every {}s.",
+            "Server time {snapshot_at}. Updates every {}s while a page is visible.",
             panel.refresh_seconds
         );
     }
-    footer.push_str(" Close this window when you are done.");
-
     MonitorDocument {
         ui_kind: "connection_monitor",
         title: panel.title,
@@ -1644,7 +2031,7 @@ impl UiView {
         }
     }
 
-    /// How often this panel reloads itself, when it reloads at all.
+    /// How often this panel pushes a snapshot, when it is live at all.
     ///
     /// A schema does not change while someone reads it, and re-running a
     /// full-schema export every few seconds would hold a connection open for
@@ -1717,7 +2104,7 @@ mod tests {
         columns: &[ColumnInfo],
         rows: &[Value],
     ) -> String {
-        PanelFrontend::builtin(view.ui_kind(), PanelShape::Inspect)
+        PanelFrontend::builtin(view.ui_kind(), panel_shape(view))
             .render_page(&inspect_document(view, subject, columns, rows), None)
             .expect("afpsql's own inspect panel renders")
     }
@@ -1733,6 +2120,378 @@ mod tests {
                 type_name: "text".to_string(),
             },
         ]
+    }
+
+    fn named_columns(names: &[(&str, &str)]) -> Vec<ColumnInfo> {
+        names
+            .iter()
+            .map(|(name, type_name)| ColumnInfo {
+                name: (*name).to_string(),
+                type_name: (*type_name).to_string(),
+            })
+            .collect()
+    }
+
+    /// The generic columns every schema-snapshot row arrives in.
+    fn snapshot_columns() -> Vec<ColumnInfo> {
+        named_columns(&[
+            ("kind", "text"),
+            ("schema", "text"),
+            ("relation", "text"),
+            ("name", "text"),
+            ("object_type", "text"),
+            ("position", "int4"),
+            ("definition", "text"),
+            ("size_bytes", "int8"),
+            ("size", "text"),
+            ("estimated_rows", "int8"),
+            ("payload", "jsonb"),
+        ])
+    }
+
+    /// One row of the snapshot query, with the generic columns a given kind
+    /// leaves null actually left null — the shape this panel exists to unpack.
+    fn snapshot_row(kind: &str, name: &str, object_type: &str, payload: Value) -> Value {
+        serde_json::json!({
+            "kind": kind,
+            "schema": "public",
+            "relation": "orders",
+            "name": name,
+            "object_type": object_type,
+            "position": Value::Null,
+            "definition": Value::Null,
+            "size_bytes": Value::Null,
+            "size": Value::Null,
+            "estimated_rows": Value::Null,
+            "payload": payload,
+        })
+    }
+
+    /// A table with an identity primary key, one nullable column, and the
+    /// PostgreSQL 17 `NOT NULL` constraint row that restates the first.
+    fn table_snapshot() -> Vec<Value> {
+        let mut relation = snapshot_row(
+            "relation",
+            "orders",
+            "table",
+            serde_json::json!({
+                "owner": "app",
+                "persistence": "p",
+                "comment": "customer orders",
+            }),
+        );
+        relation["size"] = Value::from("16 kB");
+        relation["size_bytes"] = Value::from(16384);
+        // Never analyzed. `-1` is not a row count, and a panel that shows it as
+        // one is the reason this document exists.
+        relation["estimated_rows"] = Value::from(-1);
+
+        let mut id = snapshot_row(
+            "column",
+            "id",
+            "integer",
+            serde_json::json!({
+                "nullable": false,
+                "primary_key": true,
+                "identity": "a",
+                "generated": "",
+                "serial_sequence": Value::Null,
+                "comment": Value::Null,
+            }),
+        );
+        id["position"] = Value::from(1);
+
+        let mut label = snapshot_row(
+            "column",
+            "label",
+            "text",
+            serde_json::json!({
+                "nullable": true,
+                "primary_key": false,
+                "identity": "",
+                "generated": "",
+                "serial_sequence": Value::Null,
+                "comment": Value::Null,
+            }),
+        );
+        label["position"] = Value::from(2);
+        label["definition"] = Value::from("'none'::text");
+
+        let mut not_null = snapshot_row(
+            "constraint",
+            "orders_id_not_null",
+            "n",
+            serde_json::json!({
+                "type": "n",
+                "deferrable": false,
+                "deferred_by_default": false,
+                "validated": true,
+            }),
+        );
+        not_null["definition"] = Value::from("NOT NULL id");
+
+        let mut primary_key = snapshot_row(
+            "constraint",
+            "orders_pkey",
+            "primary key",
+            serde_json::json!({
+                "type": "p",
+                "deferrable": false,
+                "deferred_by_default": false,
+                "validated": true,
+            }),
+        );
+        primary_key["definition"] = Value::from("PRIMARY KEY (id)");
+
+        let mut index = snapshot_row(
+            "index",
+            "orders_pkey",
+            "btree",
+            serde_json::json!({
+                "primary": true,
+                "ready": true,
+                "unique": true,
+                "valid": true,
+            }),
+        );
+        index["definition"] =
+            Value::from("CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)");
+        index["size"] = Value::from("8192 bytes");
+
+        vec![relation, id, label, not_null, primary_key, index]
+    }
+
+    fn table_view() -> UiView {
+        UiView::Table {
+            name: "public.orders".to_string(),
+        }
+    }
+
+    /// The page down to where the unaltered result set begins.
+    ///
+    /// Every claim about what a person no longer has to decode belongs to this
+    /// part: the raw grid below it still shows the payload, the byte counts and
+    /// the catalog codes verbatim, and is meant to.
+    fn summarized_part(page: &str) -> &str {
+        page.split("<details class=\"raw\">")
+            .next()
+            .expect("a page always has a part before its raw table")
+    }
+
+    /// The whole point of the inspection redesign: a person reads an object,
+    /// not the union of eight object kinds the query returns.
+    #[test]
+    fn a_table_panel_reads_as_one_object_rather_than_as_the_rows_it_arrived_in() {
+        let page = inspect_page(
+            &table_view(),
+            "public.orders",
+            &snapshot_columns(),
+            &table_snapshot(),
+        );
+
+        // The card says what the object is, in words rather than catalog codes.
+        assert!(page.contains("<h1>Table</h1>"), "{page}");
+        assert!(page.contains("<dt>owner</dt><dd>app</dd>"), "{page}");
+        assert!(page.contains("<dt>size</dt><dd>16 kB</dd>"), "{page}");
+        assert!(page.contains("customer orders"), "{page}");
+        // `-1` is PostgreSQL for "never analyzed", and saying it as a number
+        // would be a lie about the table rather than a fact about the catalog.
+        assert!(page.contains("unknown — never analyzed"), "{page}");
+        assert!(!page.contains("<dd>-1</dd>"), "{page}");
+        // `persistence: "p"` is the default and carries no information; a code
+        // that does — `u`, `t` — is the one that gets a line.
+        assert!(!page.contains(">p<"), "{page}");
+
+        // Every fact a person came for is out of the payload JSON and into the
+        // column it belongs to.
+        assert!(page.contains("<h3>Columns</h3>"), "{page}");
+        assert!(page.contains("not null"), "{page}");
+        assert!(page.contains("primary key"), "{page}");
+        assert!(page.contains("identity, always"), "{page}");
+        assert!(page.contains("&#x27;none&#x27;::text"), "{page}");
+        // …and nowhere above the raw result set is a person asked to read JSON
+        // to find out. Asserted on the summarized part alone, because the raw
+        // grid at the bottom is *supposed* to still show the payload verbatim.
+        let summarized = summarized_part(&page);
+        assert!(!summarized.contains("primary_key"), "{summarized}");
+        assert!(!summarized.contains("&quot;"), "{summarized}");
+        assert!(!page.contains("$serde_json"), "{page}");
+
+        // The one constraint row that only restates a column's own `not null`
+        // is dropped; the one that says something new is kept.
+        assert!(page.contains("orders_pkey"), "{page}");
+        assert!(page.contains("PRIMARY KEY (id)"), "{page}");
+        assert!(!summarized.contains("orders_id_not_null"), "{summarized}");
+
+        // An index's definition is the only place its columns appear.
+        assert!(page.contains("<h3>Indexes</h3>"), "{page}");
+        assert!(page.contains("USING btree (id)"), "{page}");
+        assert!(page.contains("8192 bytes"), "{page}");
+
+        // The footer counts objects, not the rows the union happened to need.
+        assert!(
+            page.contains("2 columns · 1 constraint · 1 index"),
+            "{page}"
+        );
+        assert!(!page.contains("6 row(s)"), "{page}");
+
+        // Nothing summarized is thereby hidden: the exact result set the agent
+        // read is still on the page.
+        assert!(page.contains("Every row afpsql read (6)"), "{page}");
+        assert!(page.contains("<tbody>"), "{page}");
+    }
+
+    /// A panel pointed at a view is not a table, and does not say it is.
+    #[test]
+    fn a_view_is_named_for_what_it_is_and_shows_the_query_behind_it() {
+        let mut view_row = snapshot_row(
+            "relation",
+            "recent",
+            "view",
+            serde_json::json!({
+                "owner": "app",
+                "persistence": "p",
+                "comment": Value::Null,
+            }),
+        );
+        view_row["relation"] = Value::from("recent");
+        view_row["definition"] = Value::from("SELECT id FROM orders WHERE id > 100");
+        let page = inspect_page(
+            &UiView::Table {
+                name: "public.recent".to_string(),
+            },
+            "public.recent",
+            &snapshot_columns(),
+            &[view_row],
+        );
+        assert!(page.contains("<h1>View</h1>"), "{page}");
+        // The window's own label agrees with its heading rather than insisting
+        // on the verb that was typed.
+        assert!(
+            page.contains("<title>View — public.recent</title>"),
+            "{page}"
+        );
+        assert!(page.contains("<h3>Definition</h3>"), "{page}");
+        assert!(page.contains("SELECT id FROM orders"), "{page}");
+        // A view stores nothing, so a size and a row estimate would both be
+        // facts about something that does not exist.
+        assert!(!page.contains("<dt>size</dt>"), "{page}");
+        assert!(!page.contains("<dt>rows</dt>"), "{page}");
+    }
+
+    /// A schema panel is a list first and a detail second, because that is the
+    /// order a person reads one in.
+    #[test]
+    fn a_schema_panel_summarizes_each_relation_before_opening_any_of_them() {
+        let mut rows = table_snapshot();
+        for index in 0..4 {
+            let mut extra = snapshot_row(
+                "relation",
+                &format!("ledger_{index}"),
+                "table",
+                serde_json::json!({"owner": "app", "persistence": "p", "comment": Value::Null}),
+            );
+            extra["relation"] = Value::from(format!("ledger_{index}"));
+            extra["size"] = Value::from("8192 bytes");
+            rows.push(extra);
+        }
+        rows.push(snapshot_row(
+            "extension",
+            "pgcrypto",
+            "extension",
+            serde_json::json!({"version": "1.3"}),
+        ));
+
+        let page = inspect_page(
+            &UiView::Schema {
+                schema: "public".to_string(),
+            },
+            "public",
+            &snapshot_columns(),
+            &rows,
+        );
+        // Each relation says what it holds without being opened.
+        assert!(
+            page.contains("table · 2 columns · 1 constraint · 1 index · 16 kB"),
+            "{page}"
+        );
+        assert!(page.contains("pgcrypto"), "{page}");
+        assert!(page.contains("1.3"), "{page}");
+        // Five relations is a wall if they all open at once.
+        assert!(page.contains("<details class=\"relation\">"), "{page}");
+        assert!(
+            !page.contains("<details class=\"relation\" open>"),
+            "{page}"
+        );
+        assert!(page.contains("5 tables · 1 extension"), "{page}");
+
+        // A schema small enough to take in at a glance opens itself.
+        let small = inspect_page(
+            &UiView::Schema {
+                schema: "public".to_string(),
+            },
+            "public",
+            &snapshot_columns(),
+            &table_snapshot(),
+        );
+        assert!(
+            small.contains("<details class=\"relation\" open>"),
+            "{small}"
+        );
+    }
+
+    /// `ui indexes` returns one shape of row, so its work is grouping them
+    /// under the table each belongs to and saying which ones are not working.
+    #[test]
+    fn an_index_panel_groups_by_table_and_names_the_states_worth_noticing() {
+        let columns = named_columns(&[
+            ("schema", "text"),
+            ("table", "text"),
+            ("name", "text"),
+            ("method", "text"),
+            ("unique", "bool"),
+            ("primary", "bool"),
+            ("valid", "bool"),
+            ("ready", "bool"),
+            ("definition", "text"),
+            ("size_bytes", "int8"),
+            ("size", "text"),
+        ]);
+        let index = |table: &str, name: &str, valid: bool| {
+            serde_json::json!({
+                "schema": "public",
+                "table": table,
+                "name": name,
+                "method": "btree",
+                "unique": false,
+                "primary": false,
+                "valid": valid,
+                "ready": true,
+                "definition": format!("CREATE INDEX {name} ON public.{table} USING btree (id)"),
+                "size_bytes": 8192,
+                "size": "8192 bytes",
+            })
+        };
+        let page = inspect_page(
+            &UiView::Indexes {
+                schema: "public".to_string(),
+                table: None,
+            },
+            "public",
+            &columns,
+            &[
+                index("orders", "orders_id_idx", true),
+                index("orders", "orders_total_idx", false),
+                index("invoices", "invoices_id_idx", true),
+            ],
+        );
+        assert!(page.contains("<h2>public.orders</h2>"), "{page}");
+        assert!(page.contains("<h2>public.invoices</h2>"), "{page}");
+        assert!(page.contains("invalid — the planner ignores it"), "{page}");
+        assert!(page.contains("3 indexes on 2 tables"), "{page}");
+        // A size is stated once, in the unit a person reads it in — the raw
+        // byte count stays in the raw table where the agent's copy is.
+        assert!(!summarized_part(&page).contains(">8192<"), "{page}");
     }
 
     #[test]
@@ -1790,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_monitor_reloads_itself() {
+    fn only_the_monitor_has_a_live_refresh_interval() {
         assert_eq!(
             UiView::Schema {
                 schema: "public".to_string()
@@ -1808,20 +2567,14 @@ mod tests {
         );
     }
 
+    /// An object name is a person's to choose, so it reaches the page as text
+    /// whatever it says — in the summary a template writes as well as in the
+    /// cell it always went through.
     #[test]
-    fn cell_values_are_escaped_so_object_names_cannot_inject_markup() {
-        let rows = vec![serde_json::json!({
-            "column": "<script>alert(1)</script>",
-            "notes": Value::Null,
-        })];
-        let page = inspect_page(
-            &UiView::Table {
-                name: "public.orders".to_string(),
-            },
-            "public.orders",
-            &columns(),
-            &rows,
-        );
+    fn object_names_are_escaped_wherever_the_panel_repeats_them() {
+        let mut rows = table_snapshot();
+        rows[1]["name"] = Value::from("<script>alert(1)</script>");
+        let page = inspect_page(&table_view(), "public.orders", &snapshot_columns(), &rows);
         assert!(!page.contains("<script>alert(1)</script>"));
         assert!(page.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
         // A NULL must be visibly distinct from an empty string.
@@ -1830,34 +2583,82 @@ mod tests {
 
     #[test]
     fn the_panel_loads_no_script_and_declares_a_policy_that_forbids_one() {
-        let rows = vec![serde_json::json!({"column": "id", "notes": "primary key"})];
         let page = inspect_page(
             &UiView::Schema {
                 schema: "public".to_string(),
             },
             "public",
-            &columns(),
-            &rows,
+            &snapshot_columns(),
+            &table_snapshot(),
         );
         assert!(!page.contains("<script"));
         assert!(page.contains("<link rel=\"stylesheet\" href=\"style.css\">"));
         let nonce = UiCspNonce::generate().unwrap();
-        let plan_policy = plan_content_security_policy(&nonce);
-        for policy in [CONTENT_SECURITY_POLICY, plan_policy.as_str()] {
-            assert!(policy.contains("default-src 'none'"));
-            assert!(policy.contains("style-src 'self'"));
+        let watch = watch_page_policy().header_value();
+        let watch = watch.to_str().unwrap();
+        let plan = plan_page_policy(&nonce).header_value();
+        let plan = plan.to_str().unwrap();
+        for policy in [watch, plan] {
+            assert!(policy.contains("default-src 'none'"), "{policy}");
+            assert!(policy.contains("style-src 'self'"), "{policy}");
         }
         // Only the page that returns an answer may post one back — and only it
         // admits a script, by exact nonce rather than by kind.
-        assert!(CONTENT_SECURITY_POLICY.contains("form-action 'none'"));
-        assert!(!CONTENT_SECURITY_POLICY.contains("script-src"));
-        assert!(plan_policy.contains("form-action 'self'"));
-        assert!(plan_policy.contains(&format!("script-src 'nonce-{}'", nonce.as_str())));
+        assert!(watch.contains("form-action 'none'"), "{watch}");
+        assert!(!watch.contains("script-src"), "{watch}");
+        assert!(plan.contains("form-action 'self'"), "{plan}");
+        assert!(
+            plan.contains(&format!("script-src 'nonce-{}'", nonce.as_str())),
+            "{plan}"
+        );
     }
 
     #[test]
-    fn an_empty_result_says_so_instead_of_rendering_a_headerless_table() {
+    fn every_panel_follows_system_theme_and_keeps_decisions_keyboard_visible() {
+        for (kind, shape) in [
+            ("table_inspect", PanelShape::Table),
+            ("schema_inspect", PanelShape::Schema),
+            ("index_inspect", PanelShape::Index),
+            ("connection_monitor", PanelShape::Monitor),
+            (PLAN_UI_KIND, PanelShape::Decide),
+        ] {
+            // Both themes and the focus ring come from the stylesheet AFUI
+            // serves every session, so what a panel has to get right is
+            // linking it — and a panel carrying a second copy of the palette
+            // would be one whose appearance could drift from the rest of the
+            // machine with nothing to notice.
+            let style = PanelFrontend::builtin(kind, shape).stylesheet().unwrap();
+            let style = String::from_utf8_lossy(&style);
+            assert!(
+                !style.contains("color-scheme: light dark") && !style.contains("--afui-focus:"),
+                "{kind}: the panel is carrying a second copy of the theme"
+            );
+        }
+        // The one place a panel can forget it: the frame every panel extends.
         let page = inspect_page(
+            &UiView::Schema {
+                schema: "public".to_string(),
+            },
+            "public",
+            &snapshot_columns(),
+            &table_snapshot(),
+        );
+        assert!(
+            page.contains("<link rel=\"stylesheet\" href=\"__afui/base.css\">"),
+            "{page}"
+        );
+        let baseline = agent_first_ui::page_base_style_source();
+        assert!(baseline.contains("color-scheme: light dark"));
+        assert!(baseline.contains("@media (prefers-color-scheme: dark)"));
+        assert!(baseline.contains(":focus-visible"));
+    }
+
+    /// Nothing found is three different answers, and a panel that gave all
+    /// three the same sentence would send a person looking for the wrong
+    /// mistake — a typo in a name, an empty schema, an unindexed table.
+    #[test]
+    fn an_empty_panel_says_which_kind_of_empty_it_is() {
+        let indexes = inspect_page(
             &UiView::Indexes {
                 schema: "public".to_string(),
                 table: None,
@@ -1866,8 +2667,30 @@ mod tests {
             &columns(),
             &[],
         );
-        assert!(page.contains("No matching objects."));
-        assert!(!page.contains("<tbody>"));
+        assert!(
+            indexes.contains("Nothing in public is indexed."),
+            "{indexes}"
+        );
+        assert!(!indexes.contains("<tbody>"), "{indexes}");
+
+        let table = inspect_page(&table_view(), "public.orders", &snapshot_columns(), &[]);
+        assert!(
+            table.contains("No table, view or sequence named public.orders exists"),
+            "{table}"
+        );
+
+        let schema = inspect_page(
+            &UiView::Schema {
+                schema: "public".to_string(),
+            },
+            "public",
+            &snapshot_columns(),
+            &[],
+        );
+        assert!(
+            schema.contains("The schema public holds no objects."),
+            "{schema}"
+        );
     }
 
     #[test]
@@ -1926,13 +2749,22 @@ mod tests {
     }
 
     fn monitor_page(rows: &[Value], error: Option<&str>) -> String {
+        let nonce = UiCspNonce::generate().expect("monitor nonce");
+        let (writer, rx) = mpsc::channel::<Output>(1);
+        let (explain_writer, explain_rx) = mpsc::channel::<Output>(1);
         let panel = LivePanel {
             app: Arc::new(App::new(
                 RuntimeConfig::default(),
-                mpsc::channel::<Output>(1).0,
+                writer,
                 crate::Capability::ReadOnly,
             )),
-            rx: Mutex::new(mpsc::channel::<Output>(1).1),
+            rx: Mutex::new(rx),
+            explain_app: Arc::new(App::new(
+                RuntimeConfig::default(),
+                explain_writer,
+                crate::Capability::ReadOnly,
+            )),
+            explain_rx: Mutex::new(explain_rx),
             sql: String::new(),
             params: Vec::new(),
             subject: "127.0.0.1:5432/orders".to_string(),
@@ -1942,28 +2774,71 @@ mod tests {
                 "connection_monitor",
                 PanelShape::Monitor,
             )),
-            reloads: AtomicU64::new(0),
+            nonce,
+            page: RwLock::new(String::new()),
+            updates: AtomicU64::new(0),
             last_row_count: AtomicUsize::new(0),
         };
         panel
             .frontend
             .render_page(
                 &monitor_document(&panel, &activity_columns(), rows, error),
-                None,
+                Some(&panel.nonce),
             )
             .expect("afpsql's own connection monitor renders")
     }
 
-    /// The rule this panel exists for: a monitor frozen at open is the wrong
-    /// product, and with no JavaScript the only thing that makes it move is
-    /// this one line.
+    /// The rule this panel exists for: fresh state and a request can travel in
+    /// opposite directions without either one turning into a page navigation.
     #[test]
-    fn the_monitor_asks_the_browser_to_reload_it() {
+    fn the_monitor_declares_and_binds_its_full_duplex_surface() {
         let page = monitor_page(&[backend(11, "orders", "app", "active", 3)], None);
-        assert!(page.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
-        assert!(!page.contains("<script"));
-        assert!(page.contains("Reloads every 5s."));
+        assert!(!page.contains("http-equiv=\"refresh\""));
+        assert!(page.contains("data-afpsql-monitor-snapshot"));
+        assert!(page.contains("data-afpsql-explain-form"));
+        assert!(page.contains("data-afpsql-live-status"));
+        assert!(page.contains("data-afpsql-explain-status"));
+        assert!(page.contains("aria-keyshortcuts=\"Meta+Enter Control+Enter\""));
+        assert!(page.contains("<details class=\"raw\"><summary>All backends (1)"));
+        assert!(page.contains("afui.connect"));
+        assert!(page.find("data-afpsql-explain-panel") < page.find("Longest running"));
+        assert!(page.contains("Updates every 5s while a page is visible."));
         assert!(page.contains("Server time 2026-08-06 09:41:02.123 UTC"));
+    }
+
+    #[test]
+    fn the_monitor_protocol_offers_plain_explain_but_not_analyze() {
+        let request: LivePanelAction = serde_json::from_value(serde_json::json!({
+            "type": "explain",
+            "sql": "select * from orders",
+        }))
+        .expect("plain EXPLAIN request parses");
+        let LivePanelAction::Explain { sql } = request else {
+            panic!("explain action");
+        };
+        let wrapped = crate::cli::wrap_explain_text_sql(&sql);
+        assert_eq!(wrapped, "explain (format text) select * from orders");
+        assert!(!wrapped.to_ascii_lowercase().contains("analyze"));
+
+        assert!(
+            serde_json::from_value::<LivePanelAction>(serde_json::json!({
+                "type": "explain",
+                "sql": "select * from orders",
+                "analyze": true,
+            }))
+            .is_err(),
+            "the live surface must not grow an ANALYZE switch"
+        );
+    }
+
+    #[test]
+    fn the_monitor_refresh_lease_requires_a_recent_observer() {
+        let now = tokio::time::Instant::now();
+        let mut observation = LiveObservation::default();
+        assert!(!observation.active(now));
+        observation.observe(now);
+        assert!(observation.active(now + Duration::from_secs(30)));
+        assert!(!observation.active(now + Duration::from_secs(31)));
     }
 
     #[test]
@@ -1994,10 +2869,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_reload_is_shown_and_the_page_keeps_reloading() {
+    fn a_failed_update_is_shown_and_the_runtime_keeps_the_page_live() {
         let page = monitor_page(&[], Some("connection refused"));
-        assert!(page.contains("This reload failed: connection refused"));
-        assert!(page.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
+        assert!(page.contains("This update failed: connection refused"));
+        assert!(page.contains("afui.connect"));
         assert!(page.contains("The server reported no backends."));
     }
 
@@ -2067,6 +2942,23 @@ mod tests {
         }
     }
 
+    /// The declaration vocabulary a decide page must carry is `UiPage`'s to
+    /// check now, on the parse tree it already built. What is still afpsql's
+    /// is that its runtime and its own page agree on that vocabulary: a
+    /// runtime binding a word no page declares is a control that never
+    /// appears, and a page declaring a word no runtime binds does nothing.
+    #[test]
+    fn the_built_in_decide_page_declares_exactly_what_the_runtime_binds() {
+        let runtime = frontend::decision_runtime().expect("the decision runtime builds");
+        let page = plan_page(&facts("select 1", true, described()), "select 1");
+        for declared in runtime.declarations() {
+            assert!(
+                page.contains(&format!("{DECISION_ATTRIBUTE}=\"{declared}\"")),
+                "the built-in page declares no `{declared}` control: {page}"
+            );
+        }
+    }
+
     /// afpsql's own decide page, rendered exactly as it is served — runtime
     /// spliced in, controls declared, nonce bound.
     fn plan_page(facts: &PlanFacts, subject: &str) -> String {
@@ -2096,6 +2988,8 @@ mod tests {
         assert!(!approved(&Outcome::Expired));
     }
 
+    /// Only the decided endings are afpsql's own word; the rest are AFUI's,
+    /// spelled once for every tool rather than once per delivery here.
     #[test]
     fn every_ending_is_named_for_the_agent_that_asked() {
         assert_eq!(
@@ -2106,8 +3000,8 @@ mod tests {
             ending_of(&Outcome::Completed(PlanDecision::Refuse)),
             "refused"
         );
-        assert_eq!(ending_of(&Outcome::Closed), "window_closed");
-        assert_eq!(ending_of(&Outcome::Expired), "credential_expired");
+        assert_eq!(ending_of(&Outcome::Closed), "closed");
+        assert_eq!(ending_of(&Outcome::Expired), "expired");
     }
 
     #[test]
@@ -2247,6 +3141,123 @@ mod tests {
         let (error, _) = crate::readonly_policy::readonly_refusal("begin", true)
             .expect("transaction control must be refused");
         assert!(error.contains("transaction control"));
+    }
+
+    /// A locked profile's refusal is decided once, before `run` looks at which
+    /// panel was asked for — `view_panel` vs `plan_panel` today, and a future
+    /// window-vs-published-session delivery choice tomorrow.
+    /// `locked_profile_panel_refusal` takes neither a panel nor a delivery, on
+    /// purpose: that is what proves the same `error.code` and the same
+    /// message cover every panel through every delivery it could ever gain,
+    /// rather than needing a new case each time a delivery is added.
+    #[test]
+    fn locked_profile_refuses_every_panel_regardless_of_delivery() {
+        assert!(locked_profile_panel_refusal(false).is_none());
+        let (message, hint) =
+            locked_profile_panel_refusal(true).expect("a locked profile must refuse every panel");
+        assert!(message.contains("no exit for what the database holds"));
+        assert_eq!(
+            hint,
+            "read the same data with the matching `afpsql inspect` command"
+        );
+        // Not "a published session also needs a browser" — that reasoning
+        // would have waved a published session through rather than catching
+        // it, so the refusal must not lean on window-only vocabulary.
+        assert!(!message.contains("browser"));
+        assert!(!message.contains("profile directory"));
+    }
+
+    // ── delivery ─────────────────────────────
+
+    use agent_first_ui::UiDeliveryMode;
+
+    #[test]
+    fn an_explicit_mode_wins_over_the_environment() {
+        let _guard = crate::test_env::env_lock();
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe { std::env::set_var(agent_first_ui::DELIVERY_ENV, "session") };
+        let plan = UiDeliveryPlan::resolve(Some(UiDeliveryMode::Window));
+        // SAFETY: the lock is still held.
+        unsafe { std::env::remove_var(agent_first_ui::DELIVERY_ENV) };
+        assert_eq!(plan.unwrap().mode(), UiDeliveryMode::Window);
+    }
+
+    #[test]
+    fn no_mode_and_no_environment_defaults_to_window() {
+        let _guard = crate::test_env::env_lock();
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe { std::env::remove_var(agent_first_ui::DELIVERY_ENV) };
+        assert_eq!(
+            UiDeliveryPlan::resolve(None).unwrap().mode(),
+            UiDeliveryMode::Window
+        );
+    }
+
+    #[test]
+    fn no_mode_falls_back_to_the_environment() {
+        let _guard = crate::test_env::env_lock();
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe { std::env::set_var(agent_first_ui::DELIVERY_ENV, "session") };
+        let plan = UiDeliveryPlan::resolve(None);
+        // SAFETY: the lock is still held.
+        unsafe { std::env::remove_var(agent_first_ui::DELIVERY_ENV) };
+        assert_eq!(plan.unwrap().mode(), UiDeliveryMode::Session);
+    }
+
+    /// The one AFUI delivery this spore does not offer, from either source,
+    /// refused while the plan is being built — before a person is ever told
+    /// anything is ready. afpsql declines it by choosing `resolve` over
+    /// `resolve_allowing_link`; the refusal itself, and the list of what is on
+    /// offer, is AFUI's.
+    #[test]
+    fn link_is_refused_whichever_source_it_came_from() {
+        let error = UiDeliveryPlan::resolve(Some(UiDeliveryMode::Link)).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("`link`"), "{message}");
+        assert!(message.contains("`window`"), "{message}");
+        assert!(message.contains("`session`"), "{message}");
+
+        let _guard = crate::test_env::env_lock();
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe { std::env::set_var(agent_first_ui::DELIVERY_ENV, "link") };
+        let plan = UiDeliveryPlan::resolve(None);
+        // SAFETY: the lock is still held.
+        unsafe { std::env::remove_var(agent_first_ui::DELIVERY_ENV) };
+        assert!(plan.is_err());
+    }
+
+    #[test]
+    fn an_unrecognised_environment_value_is_rejected_not_defaulted() {
+        let _guard = crate::test_env::env_lock();
+        // SAFETY: this test module's environment lock is held for the mutation.
+        unsafe { std::env::set_var(agent_first_ui::DELIVERY_ENV, "lan") };
+        let plan = UiDeliveryPlan::resolve(None);
+        // SAFETY: the lock is still held.
+        unsafe { std::env::remove_var(agent_first_ui::DELIVERY_ENV) };
+        let message = plan.unwrap_err().to_string();
+        assert!(message.contains("window"));
+        assert!(message.contains("session"));
+    }
+
+    /// A readiness event carries the delivery facts under AFUI's names, beside
+    /// the panel's own — neither side overwrites the other.
+    #[test]
+    fn a_readiness_event_carries_the_delivery_facts_beside_the_panel_facts() {
+        let facts = UiDeliveryFacts {
+            mode: UiDeliveryMode::Session,
+            session_id: "abc".to_owned(),
+            link_url_secret: None,
+            idle_timeout_s: None,
+            grace_period_s: None,
+        };
+        let event = ready_event(&facts, serde_json::json!({ "ui_kind": "table", "rows": 3 }));
+        assert_eq!(event["ui_kind"], "table");
+        assert_eq!(event["rows"], 3);
+        assert_eq!(event["mode"], "session");
+        assert_eq!(event["session_id"], "abc");
+        // A delivery with no clock and no URL says so by omission.
+        assert!(event.get("link_url_secret").is_none());
+        assert!(event.get("idle_timeout_s").is_none());
     }
 
     /// A `QueryRun` is what both the first render and every reload read, so it

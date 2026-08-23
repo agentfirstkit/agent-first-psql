@@ -1,0 +1,37 @@
+{#-
+  `schema_inspect`: every object in one schema.
+
+  A schema is read in two motions — find the relation, then read it — so the
+  page is a scannable list of one-line summaries, each opening onto the same
+  detail `ui table` shows. `document.expanded` is afpsql's judgement about
+  whether there are few enough relations that opening them all helps rather
+  than buries.
+-#}
+{% extends "templates/layout.html.j2" %}
+{% block panel %}
+{% if document.empty %}<p class="empty">{{ document.empty }}</p>
+{% else %}
+{% if document.extensions %}<h2>Extensions</h2>
+<ul class="objects">
+{% for extension in document.extensions %}<li><p class="line"><span class="ident">{{ extension.name }}</span>{% if extension.version %} <span class="kind">{{ extension.version }}</span>{% endif %}</p></li>
+{% endfor %}</ul>
+{% endif %}
+{% if document.relations %}<h2>Objects</h2>
+{% for relation in document.relations %}<details class="relation"{% if document.expanded %} open{% endif %}>
+<summary><span class="ident">{{ relation.name }}</span> <span class="kind">{{ relation.summary }}</span></summary>
+{% include "templates/relation.html.j2" %}
+</details>
+{% endfor %}
+{% endif %}
+{% if document.routines %}<h2>Functions</h2>
+{% for routine in document.routines %}<details class="relation">
+<summary><span class="ident">{{ routine.name }}</span> <span class="kind">{% if routine.language %}{{ routine.language }}{% endif %}{% if routine.returns %} → {{ routine.returns }}{% endif %}</span></summary>
+{% if routine.definition %}<pre class="sql">{{ routine.definition }}</pre>{% endif %}
+</details>
+{% endfor %}
+{% endif %}
+<details class="raw"><summary>Every row afpsql read ({{ document.row_count }})</summary>
+{% include "templates/table.html.j2" %}
+</details>
+{% endif %}
+{% endblock %}

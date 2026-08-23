@@ -254,7 +254,15 @@ pub async fn connect_stdio_bridge(
     let target = bridge_target(&settings, &endpoint)?;
     let command = remote_stream_bridge_command(&settings, &target);
     let args = build_bridge_ssh_args(&settings, &command);
-    let mut child = tokio::process::Command::new("ssh")
+    // A locked profile pins the endpoint and the transport, so it has to pin
+    // which `ssh` too: a bare name is resolved against the caller's `PATH`, and
+    // under a locked profile the caller is exactly who the profile constrains.
+    let program = if cfg.profile_pinned {
+        crate::readonly_policy::trusted_program("ssh")?
+    } else {
+        std::path::PathBuf::from("ssh")
+    };
+    let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

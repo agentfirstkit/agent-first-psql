@@ -75,8 +75,16 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app
 
 Keep the role out of writer/owner memberships and audit `PUBLIC`, function
 `EXECUTE`, `SECURITY DEFINER`, extensions, predefined roles, sequences, and RLS
-visibility separately. Output redaction prevents display of secret fields; it
-does not mean connection secrets never leave the process.
+visibility separately.
+
+Output redaction covers connection, configuration and control metadata only. It
+is not a guard on what a query returns: rows, column values, SQL text and the
+parameters shown to a human approver are all emitted exactly as the database
+gave them, including a column named `api_key_secret`. Redacting them would make
+afpsql report something other than what is in the database, which is the one
+thing this tool must never do — so a caller that must not see a value has to
+avoid selecting it. Redaction of connection metadata also does not mean
+connection secrets never leave the process.
 
 PostgreSQL READ ONLY rejects temporary-object creation, sequence `nextval`, and
 writes performed inside SECURITY DEFINER functions. PostgreSQL still permits
@@ -250,6 +258,9 @@ Session connection shape supports:
 - `docker_user`
 - `docker_context`
 - `docker_runtime`
+- `apple_name`
+- `apple_user`
+- `apple_runtime`
 - `podman_name`
 - `podman_user`
 - `podman_runtime`
@@ -294,11 +305,11 @@ three. For `--ssh-via` chains the bridge runs on the final `--ssh` host, and
 only that host needs an interpreter.
 
 Container transport fields start a no-TTY exec bridge through one driver
-(`docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a small stdio
-bridge inside the container. The PostgreSQL host/port or Unix socket is
-interpreted inside the container. Container transport can use `dsn_secret`,
-`conninfo_secret`, or discrete connection fields and likewise requires one
-PostgreSQL endpoint.
+(`apple`, `docker`, `podman`, `nerdctl`, `compose`, or `kubectl`) and run a
+small stdio bridge inside the container. The `apple` family invokes the Apple
+`container` CLI. The PostgreSQL host/port or Unix socket is interpreted inside
+the container. Container transport can use `dsn_secret`, `conninfo_secret`, or
+discrete connection fields and likewise requires one PostgreSQL endpoint.
 
 The driver is not named separately: it is the family of fields used. Each field
 is scoped to one driver by its own name, so a driver cannot be asked for an
@@ -652,6 +663,51 @@ libpq `PG*` environment variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`,
 `PGPASSWORD`, `PGSSLMODE`) fill connection fields that were not provided via
 flags or secrets, listing which variables were used.
 
+## Panel delivery (`--mode`)
+
+Every `afpsql ui` panel — `schema`, `table`, `indexes`, `connections`, `plan` —
+takes an optional `--mode window|session`. `window` opens an isolated browser
+window on this machine; `session` registers the panel only, for a person who
+is not here to reach with `afui session serve`. Priority when `--mode` is
+absent is `AFUI_DELIVERY` (also `window` or `session`), then `window` — AFUI's
+own `UiDeliveryPlan::resolve` rule, applied here rather than reimplemented. An
+`AFUI_DELIVERY` value neither command recognizes is rejected, listing the
+legal words, rather than silently defaulting to a window nobody is there to
+see.
+
+`--mode` on a panel is a different axis from `afpsql --mode cli|pipe|psql`:
+the two never appear on the same command line, since `ui` has no runtime mode
+of its own, and each is scoped to its own command in the registry.
+
+The kit's third delivery, `link` — a URL another device can open directly,
+with no `afui` binary involved in reaching it — is not offered here, and does
+not appear in a panel's `--help`. `link` binds every interface and advertises
+the result on the network with no tunnel; for rows read out of a database
+that is a wider, unencrypted exit than `--stdout-file`, which an
+administrator-locked readonly profile already refuses (see above) for the
+same reason it refuses every panel outright, regardless of `--mode`. `window`
+never leaves this screen; `session` stays on loopback and is reached only
+through afui's own registry, so neither carries that exposure.
+
+The `ui_ready` progress event every panel emits carries AFUI's own delivery
+facts beside the panel's: `mode`, naming the delivery with the same word
+`--mode` and `AFUI_DELIVERY` accept, and `session_id`, the identity that panel
+is listed under in `afui session list`. Which delivery reached a person
+changes nothing about what `ui plan` accepts as an answer: only
+`Completed(Approve)` — pressing the approve control — runs the statement, and
+a closed window, a remotely-refused session, and a lapsed credential are all
+still a refusal. The `ending` field on a `ui plan` result reports `approved`
+or `refused` for a decision and AFUI's own `closed` or `expired` for every
+other way a panel stops.
+
+`ui connections` renders one opening snapshot before registration so a broken
+database connection fails on the agent's stream. After that, periodic queries
+are observation-driven: a visible page renews a short lease over the existing
+AFUI runtime, and polling stops within 30 seconds after every page is gone or
+hidden. The retained snapshot remains available, and polling resumes when a
+page becomes visible again. These runtime calls do not count as AFUI attention
+and do not extend a remote page's lifetime.
+
 ## Replacing a panel (`afui frontend`)
 
 Every `afpsql ui` panel is a MiniJinja template rendered against a typed
@@ -667,7 +723,7 @@ whether it is trusted; afpsql owns what the files mean.
 | `plan_confirm` | `afpsql ui plan` |
 
 Install one with `afui frontend init --provider-id afpsql --ui-kind <KIND>` and
-turn it on with `afui frontend enable`. `ui_api_version` is `1`.
+turn it on with `afui frontend enable`. `ui_api_version` is `4`.
 
 Files an override may supply, each independently — a file it does not supply
 comes from afpsql, so replacing one page keeps the rest:
@@ -677,15 +733,34 @@ comes from afpsql, so replacing one page keeps the rest:
 | `templates/page.html.j2` | The panel body for this `ui_kind` |
 | `templates/layout.html.j2` | The frame every page extends |
 | `templates/table.html.j2` | The result table partial |
+| `templates/relation.html.j2` | One relation's card, columns, constraints, indexes and triggers |
 | `templates/decided.html.j2` | What `plan_confirm` shows after an answer |
-| `templates/<anything>.j2` | Partials of your own, reachable with `{% include %}` |
+| `templates/<path>.j2` | An additional partial, including nested paths, discovered at runtime and available by its full path |
 | `style.css` | The stylesheet |
 | `assets/**` | Stylesheets, images and fonts, served from the session origin |
+
+A replacement `page.html.j2` or `decided.html.j2` that wants afpsql's frame
+extends it by the same path a person sees in their own frontend directory:
+`{% extends "templates/layout.html.j2" %}`, and likewise `{% include
+"templates/table.html.j2" %}` for the result table or `{% include
+"templates/relation.html.j2" %}` for whichever `document.relations` entry is in
+scope. Including one you have not supplied gets afpsql's own.
 
 Templates render against `document`, which carries everything the panel worked
 out — already counted, sorted, classified and formatted. Reorder it, regroup it,
 drop what you do not want; you cannot arrive at a different answer than the one
 the agent read, because the panel and `afpsql inspect` run the same SQL.
+
+The three inspection panels run one query that returns eight kinds of object
+unioned into one set of generic columns — the shape `afpsql inspect` prints, and
+the shape an agent wants. What their documents carry is that result already read
+back apart: `document.relations` is one entry per relation with its `columns`,
+`constraints`, `indexes` and `triggers` attached, its `facts` worded (`owner`,
+`size`, a row estimate that says "never analyzed" rather than `-1`), and its
+catalog codes translated into the tags beside each entry. Constraint rows that
+only restate a column's own `not null` are not carried, because every column
+already answers that. `document.table` is still the untouched result set, so a
+page can show both.
 
 Three things an override cannot do, and they are enforced rather than requested:
 
@@ -698,6 +773,17 @@ Three things an override cannot do, and they are enforced rather than requested:
   per-session nonce, is what binds that declaration to the route that runs or
   refuses the statement. A declaration afpsql does not recognise binds to
   nothing. A page that declares neither control does not open.
+- **Replace the live protocol.** `connection_monitor` must declare the snapshot,
+  EXPLAIN form/input/result, and live-status hooks its trusted runtime binds.
+  Fresh snapshots are AFUI retained state and plain `EXPLAIN (FORMAT JSON)` is
+  a typed AFUI call, both without reloading the page. AFUI owns correlation,
+  reconnect, latest-state replacement, and caller-safe errors; the frontend
+  may arrange the declarations however it likes, but cannot add an `ANALYZE`
+  switch or ship a different runtime. The built-in frontend keeps only the
+  current plan result; retaining a longer history is a frontend presentation
+  choice, not durable database state. The terminal result reports
+  `update_count`; it also retains the former `reload_count` name as a
+  compatibility alias with the same value.
 - **Turn escaping off.** `|safe`, a `filter safe` block and `autoescape` are
   refused, and every value a panel prints — including anything PostgreSQL
   returned — is escaped.
@@ -738,6 +824,9 @@ Optional runtime fallback variables:
 - `AFPSQL_CONTAINER_DOCKER_USER`
 - `AFPSQL_CONTAINER_DOCKER_CONTEXT`
 - `AFPSQL_CONTAINER_DOCKER_RUNTIME`
+- `AFPSQL_CONTAINER_APPLE_NAME`
+- `AFPSQL_CONTAINER_APPLE_USER`
+- `AFPSQL_CONTAINER_APPLE_RUNTIME`
 - `AFPSQL_CONTAINER_PODMAN_NAME`
 - `AFPSQL_CONTAINER_PODMAN_USER`
 - `AFPSQL_CONTAINER_PODMAN_RUNTIME`

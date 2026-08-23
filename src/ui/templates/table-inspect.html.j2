@@ -1,0 +1,18 @@
+{#-
+  `table_inspect`: one relation, opened. The layout header already names it, so
+  this page goes straight to what it is made of.
+
+  The unsummarized result set is kept at the bottom rather than dropped: it is
+  the same rows `afpsql inspect table --full` prints, so a person can check the
+  panel against the agent's copy without leaving the window.
+-#}
+{% extends "templates/layout.html.j2" %}
+{% block panel %}
+{% if document.empty %}<p class="empty">{{ document.empty }}</p>
+{% else %}{% for relation in document.relations %}{% include "templates/relation.html.j2" %}
+{% endfor %}
+<details class="raw"><summary>Every row afpsql read ({{ document.row_count }})</summary>
+{% include "templates/table.html.j2" %}
+</details>
+{% endif %}
+{% endblock %}

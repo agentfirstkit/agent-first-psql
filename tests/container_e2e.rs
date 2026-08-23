@@ -4,10 +4,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/container_runtime.rs"]
+mod test_container_runtime;
 #[path = "support/env.rs"]
 mod test_env;
 
-const POSTGRES_ALIAS: &str = "postgres";
+use test_container_runtime::TestContainerRuntime;
 
 // `#[ignore]` is what keeps this out of a plain `cargo test`; the container
 // leg opts in with `--ignored`. Once it is running it must assert or fail —
@@ -15,7 +17,7 @@ const POSTGRES_ALIAS: &str = "postgres";
 // that exercised nothing, which is how the fixed entrypoint exists to prevent.
 #[test]
 #[ignore]
-fn docker_container_transport_select_one() {
+fn container_transport_select_one() {
     assert_eq!(
         test_env::env_value("AFPSQL_E2E").as_deref(),
         Some("1"),
@@ -31,14 +33,17 @@ fn docker_container_transport_select_one() {
         .unwrap_or_else(|| "postgres:16".to_string());
     let bridge_image = test_env::env_value("AFPSQL_E2E_BRIDGE_IMAGE")
         .unwrap_or_else(|| "ubuntu:22.04".to_string());
-    let _guard = DockerE2eGuard {
+    let runtime = TestContainerRuntime::selected();
+    let published_postgres = runtime.published_port(5432);
+    let _guard = ContainerE2eGuard {
+        runtime,
         containers: vec![postgres_name.clone(), bridge_name.clone()],
         network: network.clone(),
     };
 
-    docker_success(["network", "create", &network], "create docker network");
-    docker_success(
-        [
+    runtime.create_network(&network);
+    runtime.success(
+        &[
             "run",
             "-d",
             "--rm",
@@ -46,10 +51,8 @@ fn docker_container_transport_select_one() {
             &postgres_name,
             "--network",
             &network,
-            "--network-alias",
-            POSTGRES_ALIAS,
             "-p",
-            "127.0.0.1::5432",
+            &published_postgres.spec,
             "-e",
             "POSTGRES_USER=test",
             "-e",
@@ -60,8 +63,8 @@ fn docker_container_transport_select_one() {
         ],
         "start postgres container",
     );
-    docker_success(
-        [
+    runtime.success(
+        &[
             "run",
             "-d",
             "--rm",
@@ -78,23 +81,24 @@ fn docker_container_transport_select_one() {
     );
 
     assert!(
-        wait_for_postgres(&postgres_name),
+        wait_for_postgres(runtime, &postgres_name),
         "postgres container did not become ready"
     );
     assert!(
-        bridge_has_interpreter(&bridge_name),
+        bridge_has_interpreter(runtime, &bridge_name),
         "bridge container must provide sh plus python3, python, or perl"
     );
+    let postgres_host = runtime.network_host(&postgres_name);
 
-    let published_postgres_port = docker_mapped_port(&postgres_name, "5432/tcp");
+    let published_postgres_port = published_postgres.host_port;
 
     let readonly = env!("CARGO_BIN_EXE_afpsql-readonly");
     let output_result = Command::new(readonly)
         .args([
-            "--container-docker-name",
+            runtime.name_flag(),
             &bridge_name,
             "--host",
-            POSTGRES_ALIAS,
+            &postgres_host,
             "--port",
             "5432",
             "--user",
@@ -129,10 +133,10 @@ fn docker_container_transport_select_one() {
 
     let write_result = Command::new(readonly)
         .args([
-            "--container-docker-name",
+            runtime.name_flag(),
             &bridge_name,
             "--host",
-            POSTGRES_ALIAS,
+            &postgres_host,
             "--port",
             "5432",
             "--user",
@@ -168,14 +172,14 @@ fn docker_container_transport_select_one() {
         String::from_utf8_lossy(&write.stderr)
     );
 
-    assert_explicit_transaction_boundaries_and_types(&bridge_name);
-    assert_encoding_fallback_executes_once(&bridge_name);
+    assert_explicit_transaction_boundaries_and_types(runtime, &bridge_name, &postgres_host);
+    assert_encoding_fallback_executes_once(runtime, &bridge_name, &postgres_host);
 
     assert_readonly_policy_rejects(
         [
-            "--container-docker-name",
+            runtime.name_flag(),
             &bridge_name,
-            "--container-docker-runtime",
+            runtime.runtime_flag(),
             "false",
             "--sql",
             "select 1",
@@ -244,10 +248,10 @@ fn docker_container_transport_select_one() {
             [
                 "--ssh",
                 &ssh_destination,
-                "--container-docker-name",
+                runtime.name_flag(),
                 &bridge_name,
                 "--host",
-                POSTGRES_ALIAS,
+                &postgres_host,
                 "--port",
                 "5432",
                 "--user",
@@ -264,20 +268,33 @@ fn docker_container_transport_select_one() {
     }
 }
 
-fn container_write(bridge_name: &str, sql: &str) -> std::process::Output {
-    container_write_logging(bridge_name, sql, Some("query.row_encoding_degraded"))
+fn container_write(
+    runtime: TestContainerRuntime,
+    bridge_name: &str,
+    postgres_host: &str,
+    sql: &str,
+) -> std::process::Output {
+    container_write_logging(
+        runtime,
+        bridge_name,
+        postgres_host,
+        sql,
+        Some("query.row_encoding_degraded"),
+    )
 }
 
 fn container_write_logging(
+    runtime: TestContainerRuntime,
     bridge_name: &str,
+    postgres_host: &str,
     sql: &str,
     log_filter: Option<&str>,
 ) -> std::process::Output {
     let mut args = vec![
-        "--container-docker-name",
+        runtime.name_flag(),
         bridge_name,
         "--host",
-        POSTGRES_ALIAS,
+        postgres_host,
         "--port",
         "5432",
         "--user",
@@ -301,9 +318,18 @@ fn container_write_logging(
         .expect("run container write")
 }
 
-fn assert_encoding_fallback_executes_once(bridge_name: &str) {
+fn assert_encoding_fallback_executes_once(
+    runtime: TestContainerRuntime,
+    bridge_name: &str,
+    postgres_host: &str,
+) {
     let table = format!("afpsql_fallback_once_{}", std::process::id());
-    let create = container_write(bridge_name, &format!("create table {table}(n int)"));
+    let create = container_write(
+        runtime,
+        bridge_name,
+        postgres_host,
+        &format!("create table {table}(n int)"),
+    );
     assert!(
         create.status.success(),
         "create fallback fixture: {}",
@@ -311,7 +337,9 @@ fn assert_encoding_fallback_executes_once(bridge_name: &str) {
     );
 
     let explain = container_write(
+        runtime,
         bridge_name,
+        postgres_host,
         &format!("explain analyze insert into {table} values (1) returning n"),
     );
     assert!(
@@ -327,7 +355,9 @@ fn assert_encoding_fallback_executes_once(bridge_name: &str) {
     );
 
     let count = container_write(
+        runtime,
         bridge_name,
+        postgres_host,
         &format!("select count(*)::int as count from {table}"),
     );
     assert!(
@@ -345,7 +375,13 @@ fn assert_encoding_fallback_executes_once(bridge_name: &str) {
     // The degradation notice is a log event, so it must honor --log like every
     // other one. An agent that asked for no logs must not get one injected into
     // its stream. `explain` triggers the same wrap failure without writing.
-    let unlogged = container_write_logging(bridge_name, "explain select 1", None);
+    let unlogged = container_write_logging(
+        runtime,
+        bridge_name,
+        postgres_host,
+        "explain select 1",
+        None,
+    );
     assert!(
         unlogged.status.success(),
         "unlogged fallback statement: {}",
@@ -357,11 +393,20 @@ fn assert_encoding_fallback_executes_once(bridge_name: &str) {
         String::from_utf8_lossy(&unlogged.stderr)
     );
 
-    let drop_table = container_write(bridge_name, &format!("drop table {table}"));
+    let drop_table = container_write(
+        runtime,
+        bridge_name,
+        postgres_host,
+        &format!("drop table {table}"),
+    );
     assert!(drop_table.status.success(), "drop fallback fixture");
 }
 
-fn assert_explicit_transaction_boundaries_and_types(bridge_name: &str) {
+fn assert_explicit_transaction_boundaries_and_types(
+    runtime: TestContainerRuntime,
+    bridge_name: &str,
+    postgres_host: &str,
+) {
     let requests = [
         serde_json::json!({"code":"begin","id":"default_begin"}),
         serde_json::json!({
@@ -408,10 +453,10 @@ fn assert_explicit_transaction_boundaries_and_types(bridge_name: &str) {
             "pipe",
             "--output-to",
             "stdout",
-            "--container-docker-name",
+            runtime.name_flag(),
             bridge_name,
             "--host",
-            POSTGRES_ALIAS,
+            postgres_host,
             "--port",
             "5432",
             "--user",
@@ -512,39 +557,6 @@ fn assert_readonly_success<const N: usize>(args: [&str; N], context: &str) {
     );
 }
 
-fn docker_mapped_port(container: &str, port: &str) -> String {
-    let output = Command::new("docker")
-        .args(["port", container, port])
-        .output()
-        .expect("query Docker mapped port");
-    assert!(output.status.success());
-    let mapping = String::from_utf8(output.stdout).expect("Docker port output is UTF-8");
-    mapping
-        .trim()
-        .rsplit_once(':')
-        .map(|(_, port)| port.to_string())
-        .expect("Docker port mapping contains a port")
-}
-
-fn docker_success<const N: usize>(args: [&str; N], context: &str) {
-    let output_result = Command::new("docker").args(args).output();
-    assert!(
-        output_result.is_ok(),
-        "{context} failed: {:?}",
-        output_result.as_ref().err()
-    );
-    let output = match output_result {
-        Ok(output) => output,
-        Err(_) => return,
-    };
-    assert!(
-        output.status.success(),
-        "{context} failed: {}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// Wait until PostgreSQL accepts the connection the bridge is about to make.
 ///
 /// `pg_isready` defaults to the Unix socket, and the postgres image runs its
@@ -554,13 +566,12 @@ fn docker_success<const N: usize>(args: [&str; N], context: &str) {
 /// is refused, which is the only connection this test makes: readiness has to
 /// be asked of the transport the caller uses, not of whichever one answers
 /// first.
-fn wait_for_postgres(name: &str) -> bool {
+fn wait_for_postgres(runtime: TestContainerRuntime, name: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        let status = Command::new("docker")
-            .args([
-                "exec",
-                name,
+        if runtime.exec_status(
+            name,
+            &[
                 "pg_isready",
                 "-h",
                 "127.0.0.1",
@@ -570,9 +581,8 @@ fn wait_for_postgres(name: &str) -> bool {
                 "test",
                 "-d",
                 "test",
-            ])
-            .status();
-        if matches!(status, Ok(status) if status.success()) {
+            ],
+        ) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -580,31 +590,28 @@ fn wait_for_postgres(name: &str) -> bool {
     false
 }
 
-fn bridge_has_interpreter(name: &str) -> bool {
-    let status = Command::new("docker")
-        .args([
-            "exec",
-            name,
+fn bridge_has_interpreter(runtime: TestContainerRuntime, name: &str) -> bool {
+    runtime.exec_status(
+        name,
+        &[
             "sh",
             "-c",
             "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || command -v perl >/dev/null 2>&1",
-        ])
-        .status();
-    matches!(status, Ok(status) if status.success())
+        ],
+    )
 }
 
-struct DockerE2eGuard {
+struct ContainerE2eGuard {
+    runtime: TestContainerRuntime,
     containers: Vec<String>,
     network: String,
 }
 
-impl Drop for DockerE2eGuard {
+impl Drop for ContainerE2eGuard {
     fn drop(&mut self) {
         for name in &self.containers {
-            let _ = Command::new("docker").args(["rm", "-f", name]).status();
+            self.runtime.delete_container(name);
         }
-        let _ = Command::new("docker")
-            .args(["network", "rm", &self.network])
-            .status();
+        self.runtime.delete_network(&self.network);
     }
 }

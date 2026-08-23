@@ -11,6 +11,16 @@ cd "$ROOTPATH"
 
 MODE="${1:-all}"
 FILTER="${2:-}"
+AFPSQL_TEST_CONTAINER_NAME=""
+
+cleanup_test_database() {
+  if [ -n "$AFPSQL_TEST_CONTAINER_NAME" ]; then
+    container delete --force "$AFPSQL_TEST_CONTAINER_NAME" >/dev/null 2>&1 || true
+    AFPSQL_TEST_CONTAINER_NAME=""
+  fi
+}
+
+trap cleanup_test_database EXIT
 
 # Integration and e2e talk to a real PostgreSQL. Accept it from the environment
 # or from a local dotenv so a developer does not have to export it every time.
@@ -31,17 +41,120 @@ load_local_test_env() {
   done
 }
 
-require_test_database() {
+start_local_test_database() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "integration tests require DATABASE_URL or AFPSQL_TEST_DSN_SECRET outside macOS" >&2
+    return 1
+  fi
+  command -v container >/dev/null 2>&1 || {
+    echo "Apple container is required for local macOS integration tests" >&2
+    return 2
+  }
+  command -v afdata >/dev/null 2>&1 || {
+    echo "afdata is required to inspect the local test container safely" >&2
+    return 2
+  }
+
+  container system start >/dev/null
+  AFPSQL_TEST_CONTAINER_NAME="afpsql-test-pg-${PPID}-$$"
+  local image="${AFPSQL_E2E_POSTGRES_IMAGE:-postgres:16}"
+  container run \
+    --detach \
+    --rm \
+    --name "$AFPSQL_TEST_CONTAINER_NAME" \
+    --env POSTGRES_USER=test \
+    --env POSTGRES_PASSWORD=test \
+    --env POSTGRES_DB=test \
+    "$image" >/dev/null
+
+  local ready="0"
+  for _ in {1..120}; do
+    if container exec "$AFPSQL_TEST_CONTAINER_NAME" \
+      pg_isready -h 127.0.0.1 -p 5432 -U test -d test >/dev/null 2>&1; then
+      ready="1"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ "$ready" != "1" ]; then
+    echo "temporary PostgreSQL container did not become ready" >&2
+    return 1
+  fi
+
+  local address_cidr
+  local address
+  address_cidr="$(container inspect "$AFPSQL_TEST_CONTAINER_NAME" | afdata value - 0.status.networks.0.ipv4Address)"
+  address="${address_cidr%%/*}"
+  if [ -z "$address" ]; then
+    echo "temporary PostgreSQL container has no IPv4 address" >&2
+    return 1
+  fi
+  export AFPSQL_TEST_DSN_SECRET="postgresql://test:test@${address}:5432/test?sslmode=disable"
+  export DATABASE_URL="$AFPSQL_TEST_DSN_SECRET"
+  echo "==> local integration PostgreSQL: $AFPSQL_TEST_CONTAINER_NAME (private container address; no host port)" >&2
+}
+
+ensure_test_database() {
   load_local_test_env
   if [ -z "${DATABASE_URL:-}" ] && [ -z "${AFPSQL_TEST_DSN_SECRET:-}" ]; then
-    echo "integration tests require DATABASE_URL or AFPSQL_TEST_DSN_SECRET" >&2
-    echo "copy tests/.env.example to tests/.env.local and fill it in, or export the variable" >&2
-    echo "(a wrapper that already exports it satisfies this too — this loader only fills the gap)" >&2
-    return 1
+    start_local_test_database
+    return
+  fi
+
+  if [ "$(uname -s)" = "Darwin" ]; then
+    local configured_dsn
+    for configured_dsn in "${DATABASE_URL:-}" "${AFPSQL_TEST_DSN_SECRET:-}"; do
+      case "$configured_dsn" in
+        *localhost:5432* | *127.0.0.1:5432* | *\[::1\]:5432*)
+          echo "refusing to run local integration tests against host PostgreSQL port 5432" >&2
+          echo "unset the test DSN to use a disposable Apple container, or configure a separate test port" >&2
+          return 2
+          ;;
+      esac
+    done
   fi
 }
 
+select_test_container_runtime() {
+  local runtime="${AFPSQL_TEST_CONTAINER_RUNTIME:-}"
+  if [ -z "$runtime" ]; then
+    if [ "${CI:-}" = "true" ]; then
+      runtime="docker"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+      runtime="apple"
+    else
+      runtime="docker"
+    fi
+  fi
+
+  case "$runtime" in
+    apple)
+      command -v container >/dev/null 2>&1 || {
+        echo "Apple container is required for local macOS container e2e" >&2
+        return 2
+      }
+      container system start >/dev/null
+      ;;
+    docker)
+      command -v docker >/dev/null 2>&1 || {
+        echo "Docker is required for the selected CI container e2e runtime" >&2
+        return 2
+      }
+      docker info >/dev/null
+      ;;
+    *)
+      echo "AFPSQL_TEST_CONTAINER_RUNTIME must be apple or docker" >&2
+      return 2
+      ;;
+  esac
+  export AFPSQL_TEST_CONTAINER_RUNTIME="$runtime"
+}
+
 run_static() {
+  # Parsing is not linting, and this ran neither until now. The pinned version
+  # lives in the script itself, mirrored from the monorepo and compared byte for
+  # byte there, so this spore and its siblings cannot drift onto different rules.
+  "$ROOTPATH/scripts/install-shellcheck.sh" --check "$ROOTPATH"
   cargo fmt --all --check
   cargo clippy --all-targets -- -D warnings
 }
@@ -68,7 +181,7 @@ run_unit() {
 # Without it those tests silently pass as "ignored", which is how a broken
 # output contract once reached a release.
 run_integration() {
-  require_test_database
+  ensure_test_database
   cargo build
   if [ -n "$FILTER" ]; then
     cargo test --features db-tests --tests "$FILTER"
@@ -77,9 +190,10 @@ run_integration() {
   fi
 }
 
-# Container transport e2e builds its own PostgreSQL and bridge containers, so it
-# needs Docker rather than the integration database.
+# Container transport e2e builds its own PostgreSQL and bridge containers. Local
+# macOS uses Apple container; CI explicitly selects Docker.
 run_container() {
+  select_test_container_runtime
   AFPSQL_E2E=1 cargo test --features db-tests --test container_e2e -- --ignored --nocapture
 }
 

@@ -15,17 +15,25 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use agent_first_ui::test_support::{FrontendOnDisk, InstalledFrontend};
+use serde_json::Value;
 
 #[path = "support/env.rs"]
 mod test_env;
+
+/// The contract every frontend here declares.
+///
+/// Named rather than repeated, because a version bump that this suite has to be
+/// edited in seven places for is a version bump somebody will half-apply — and
+/// a frontend left on the old number is skipped as incompatible, which several
+/// of these cases would then pass by asserting afpsql's own page.
+const UI_API_VERSION: &str = "4";
 
 const STUB_BROWSER: &str = r#"#!/bin/sh
 set -eu
@@ -43,7 +51,7 @@ curl -sS -o "$AFPSQL_STUB_DIR/style" "${url}style.css"
 /// A panel nobody could mistake for afpsql's own — and, more to the point, one
 /// whose *structure* is not afpsql's: the table is gone, the rows are a
 /// definition list, and the footer says something else.
-const CUSTOM_INSPECT: &str = "{% extends \"layout.html.j2\" %}\n\
+const CUSTOM_INSPECT: &str = "{% extends \"templates/layout.html.j2\" %}\n\
 {% block panel %}\n\
 <section data-my-panel><h2>MY OWN SCHEMA PANEL</h2>\n\
 <dl class=\"mine\">{% for row in document.table.rows %}\
@@ -140,41 +148,38 @@ impl Panel {
 
     /// What `afui frontend init` writes, plus files of the person's own.
     fn install(&self, ui_kind: &str, ui_api_version: &str, files: &[(&str, &str)]) -> PathBuf {
-        let root = self.frontend_root(ui_kind);
-        fs::create_dir_all(root.join("templates")).expect("frontend templates directory");
-        fs::write(
-            root.join("frontend.json"),
-            serde_json::to_string_pretty(&json!({
-                "frontend_id": "my_psql_panel",
-                "ui_api_version": ui_api_version,
-            }))
-            .expect("frontend manifest"),
-        )
-        .expect("write frontend manifest");
+        let mut frontend = InstalledFrontend::new(&self.root, "afpsql", ui_kind, ui_api_version)
+            .with_frontend_id("my_psql_panel");
         for (name, text) in files {
-            fs::write(root.join(name), text).expect("write frontend file");
+            frontend = frontend.with_file(*name, *text);
         }
-        root
+        frontend
+            .install()
+            .expect("install the frontend")
+            .root()
+            .to_path_buf()
     }
 
     /// What `afui frontend enable` records: the exact contents, trusted.
     ///
-    /// The fingerprint is recomputed here rather than shelled out to `afui`, so
-    /// a change to AFUI's algorithm shows up as this suite failing to serve a
-    /// trusted frontend — loudly, not as a quiet pass.
+    /// AFUI computes the fingerprint, through the same code it trusts against.
+    /// This used to be a blake3 walk repeated here, which agreed with AFUI
+    /// exactly until AFUI's algorithm changed — at which point this suite
+    /// would have failed for a reason it is not about.
+    ///
+    /// `AFUI_CONFIG_DIR` names where the trust store goes, and the drive below
+    /// sets it per run; naming the same directory here is what makes the two
+    /// agree.
+    ///
+    /// This used to set the process-wide variable and restore it, on the
+    /// assumption that the suite ran single-threaded. It does not: cargo runs
+    /// these on several threads, so two tests trusting at once wrote into each
+    /// other's config directory and one of them then served afpsql's built-in
+    /// page instead of its override. Nothing here touches the environment now.
     fn trust(&self, ui_kind: &str) {
-        let trust = json!({
-            "frontends": {
-                format!("workspace:afpsql:{ui_kind}"): {
-                    "fingerprint": fingerprint(&self.frontend_root(ui_kind)),
-                },
-            },
-        });
-        fs::write(
-            self.config_dir.join("trust.json"),
-            serde_json::to_string_pretty(&trust).expect("trust store"),
-        )
-        .expect("write trust store");
+        FrontendOnDisk::at(self.frontend_root(ui_kind), "afpsql", ui_kind)
+            .trust_in(&self.config_dir)
+            .expect("trust the frontend");
     }
 }
 
@@ -203,8 +208,14 @@ impl Drive {
             .clone()
     }
 
+    /// Whether afpsql's own schema panel is what the browser received.
+    ///
+    /// Keyed on the structure afpsql builds — a relation opening onto its own
+    /// detail — rather than on any one string, so a page that merely failed to
+    /// say "MY OWN SCHEMA PANEL" cannot pass as afpsql's.
     fn is_builtin_page(&self) -> bool {
-        self.page.contains("<span class=\"name\">") && !self.page.contains("MY OWN SCHEMA PANEL")
+        self.page.contains("<details class=\"relation\"")
+            && !self.page.contains("MY OWN SCHEMA PANEL")
     }
 }
 
@@ -248,40 +259,6 @@ fn binary() -> PathBuf {
         .join("afpsql")
 }
 
-/// AFUI's content fingerprint: blake3 per file, keyed by relative path.
-fn fingerprint(root: &Path) -> String {
-    fn walk(root: &Path, directory: &Path, files: &mut BTreeMap<String, String>) {
-        for entry in fs::read_dir(directory).expect("read frontend directory") {
-            let path = entry.expect("frontend entry").path();
-            if path.is_dir() {
-                walk(root, &path, files);
-                continue;
-            }
-            let relative = path
-                .strip_prefix(root)
-                .expect("frontend file is inside the frontend")
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.insert(
-                relative,
-                blake3::hash(&fs::read(&path).expect("read frontend file"))
-                    .to_hex()
-                    .to_string(),
-            );
-        }
-    }
-    let mut files = BTreeMap::new();
-    walk(root, root, &mut files);
-    let mut hasher = blake3::Hasher::new();
-    for (path, hash) in files {
-        hasher.update(path.as_bytes());
-        hasher.update(&[0]);
-        hasher.update(hash.as_bytes());
-        hasher.update(&[0]);
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
 /// The whole lifecycle of a watch panel, in the order a person lives it.
 ///
 /// One test rather than six, because each step is the previous step's workspace
@@ -314,7 +291,7 @@ fn a_user_frontend_serves_a_panel_only_once_it_is_installed_compatible_and_trust
     //    an agent can see that it is not serving.
     panel.install(
         "schema_inspect",
-        "1",
+        UI_API_VERSION,
         &[
             ("templates/page.html.j2", CUSTOM_INSPECT),
             ("style.css", CUSTOM_STYLE),
@@ -342,7 +319,13 @@ fn a_user_frontend_serves_a_panel_only_once_it_is_installed_compatible_and_trust
         trusted.page
     );
     assert!(trusted.page.contains("data-my-panel"), "{}", trusted.page);
-    // Structure, not colour: afpsql's table is gone from the page entirely.
+    // Structure, not colour: afpsql's own sections are gone from the page
+    // entirely — the relation blocks and the raw table below them alike.
+    assert!(
+        !trusted.page.contains("<details class=\"relation\""),
+        "{}",
+        trusted.page
+    );
     assert!(
         !trusted.page.contains("<span class=\"name\">"),
         "{}",
@@ -396,6 +379,84 @@ fn a_user_frontend_serves_a_panel_only_once_it_is_installed_compatible_and_trust
     // …and the same frontend still serves when safe mode is not set, so step 5
     // proved safe mode rather than another revoked fingerprint.
     assert!(open().page.contains("EDITED AFTER TRUST"));
+}
+
+/// Open-ended partial names remain part of the frontend contract after the
+/// page assembly moved into UiPage. The partial is nested and not one afpsql
+/// knows at compile time, so this proves discovery rather than a fixed list.
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn an_arbitrarily_named_override_partial_is_discovered_at_runtime() {
+    let panel = Panel::new("runtime-partial");
+    panel.install(
+        "schema_inspect",
+        UI_API_VERSION,
+        &[
+            (
+                "templates/page.html.j2",
+                "{% extends \"templates/layout.html.j2\" %}{% block panel %}\
+                 {% include \"templates/cards/custom-summary.j2\" %}{% endblock %}",
+            ),
+            (
+                "templates/cards/custom-summary.j2",
+                "<p data-custom-partial>runtime partial</p>",
+            ),
+        ],
+    );
+    panel.trust("schema_inspect");
+
+    let drive = panel.open(&["ui", "schema", "public"], &[]);
+    assert_eq!(drive.status, 0, "{:?}", drive.events);
+    assert!(drive.page.contains("data-custom-partial"), "{}", drive.page);
+    assert!(drive.page.contains("runtime partial"), "{}", drive.page);
+}
+
+/// The partial that renders one relation is part of the contract rather than an
+/// internal detail of afpsql's own page: a person may reuse afpsql's rendering
+/// of an object inside a page they wrote, without shipping a copy of it that
+/// would then drift.
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn an_override_may_include_afpsqls_relation_partial_without_shipping_one() {
+    let panel = Panel::new("relation-partial");
+    panel.install(
+        "schema_inspect",
+        UI_API_VERSION,
+        &[(
+            "templates/page.html.j2",
+            "{% extends \"templates/layout.html.j2\" %}{% block panel %}\
+             <section data-my-panel>{% for relation in document.relations %}\
+             <h2>{{ relation.name }}</h2>\
+             {% include \"templates/relation.html.j2\" %}\
+             {% endfor %}</section>{% endblock %}",
+        )],
+    );
+    panel.trust("schema_inspect");
+
+    let drive = panel.open(&["ui", "schema", "public"], &[]);
+    assert_eq!(drive.status, 0, "{:?}", drive.events);
+    assert_eq!(drive.ready()["ui_frontend_id"], "my_psql_panel");
+    assert!(drive.page.contains("data-my-panel"), "{}", drive.page);
+    // afpsql's own column table, rendered inside the person's own frame.
+    assert!(
+        drive.page.contains("<table class=\"detail\">"),
+        "{}",
+        drive.page
+    );
+    assert!(drive.page.contains("afpsql_ui_fixture"), "{}", drive.page);
+    // And the page is theirs: afpsql's own collapsed relation blocks are gone,
+    // so this is the partial doing the work rather than the built-in page.
+    assert!(
+        !drive.page.contains("<details class=\"relation\""),
+        "{}",
+        drive.page
+    );
 }
 
 /// 6. The one behaviour a fallback would destroy.
@@ -457,7 +518,7 @@ fn an_unreadable_frontend_manifest_is_an_error_rather_than_a_fallback() {
     let panel = Panel::new("unreadable");
     let root = panel.install(
         "schema_inspect",
-        "1",
+        UI_API_VERSION,
         &[("templates/page.html.j2", CUSTOM_INSPECT)],
     );
     fs::write(root.join("frontend.json"), "{ not json").expect("break the manifest");
@@ -479,7 +540,7 @@ fn a_frontend_replaces_exactly_the_panel_it_was_installed_for() {
     let panel = Panel::new("per-kind");
     panel.install(
         "table_inspect",
-        "1",
+        UI_API_VERSION,
         &[("templates/page.html.j2", CUSTOM_INSPECT)],
     );
     panel.trust("table_inspect");
@@ -505,10 +566,10 @@ fn a_frontend_that_tries_to_ship_javascript_is_refused_rather_than_served() {
     let panel = Panel::new("script");
     panel.install(
         "schema_inspect",
-        "1",
+        UI_API_VERSION,
         &[(
             "templates/page.html.j2",
-            "{% extends \"layout.html.j2\" %}{% block panel %}\
+            "{% extends \"templates/layout.html.j2\" %}{% block panel %}\
              <script>fetch('/approve',{method:'POST'})</script>{% endblock %}",
         )],
     );
@@ -518,6 +579,35 @@ fn a_frontend_that_tries_to_ship_javascript_is_refused_rather_than_served() {
     assert_eq!(drive.status, 1, "{:?}", drive.events);
     assert!(!drive.opened);
     assert_eq!(drive.error()["code"], "ui_frontend_unsafe");
+}
+
+/// The monitor's real process serves the live surface, not the former
+/// navigation loop, and its terminal event preserves the old count field while
+/// callers move to the name that matches the new transport.
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[test]
+fn the_connection_monitor_uses_the_afui_runtime_and_keeps_its_result_contract() {
+    let panel = Panel::new("connection-monitor");
+    let drive = panel.open(&["ui", "connections", "--refresh", "2"], &[]);
+
+    assert_eq!(drive.status, 0, "{:?}", drive.events);
+    assert!(drive.page.contains("data-afpsql-monitor-snapshot"));
+    assert!(drive.page.contains("data-afpsql-explain-form"));
+    assert!(drive.page.contains("afui.connect"));
+    assert!(!drive.page.contains("http-equiv=\"refresh\""));
+    assert_eq!(drive.ready()["refresh_seconds"], 2);
+
+    let result = drive
+        .events
+        .iter()
+        .find(|event| event["kind"] == "result")
+        .expect("the monitor emits one terminal result")["result"]
+        .clone();
+    assert_eq!(result["closed"], true);
+    assert_eq!(result["reload_count"], result["update_count"]);
 }
 
 // ── the decide panel ────────────────────────
@@ -535,7 +625,7 @@ fn a_frontend_that_tries_to_ship_javascript_is_refused_rather_than_served() {
 #[test]
 fn a_decide_panel_can_be_restructured_and_still_cannot_write_its_own_semantics() {
     let panel = Panel::new("decide");
-    let custom_plan = "{% extends \"layout.html.j2\" %}\n\
+    let custom_plan = "{% extends \"templates/layout.html.j2\" %}\n\
 {% block panel %}\n\
 <article data-my-plan><h2>MY OWN CONFIRM PAGE</h2>\n\
 <p class=\"where\">{{ document.target }}</p>\n\
@@ -547,7 +637,7 @@ fn a_decide_panel_can_be_restructured_and_still_cannot_write_its_own_semantics()
 {% endblock %}\n";
     panel.install(
         "plan_confirm",
-        "1",
+        UI_API_VERSION,
         &[("templates/page.html.j2", custom_plan)],
     );
     panel.trust("plan_confirm");
@@ -580,7 +670,7 @@ fn a_decide_panel_can_be_restructured_and_still_cannot_write_its_own_semantics()
         .clone();
     assert_eq!(result["decision"], "refused");
     assert_eq!(result["executed"], false);
-    assert_eq!(result["ending"], "window_closed");
+    assert_eq!(result["ending"], "closed");
 }
 
 /// A decide page that declares no control is a broken override, and is reported
@@ -594,10 +684,10 @@ fn a_decide_panel_with_no_declared_control_is_a_broken_override_not_a_silent_win
     let panel = Panel::new("decide-empty");
     panel.install(
         "plan_confirm",
-        "1",
+        UI_API_VERSION,
         &[(
             "templates/page.html.j2",
-            "{% extends \"layout.html.j2\" %}{% block panel %}\
+            "{% extends \"templates/layout.html.j2\" %}{% block panel %}\
              <p>Trust me, it is fine.</p>{% endblock %}",
         )],
     );

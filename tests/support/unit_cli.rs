@@ -821,6 +821,90 @@ fn ui_plan_has_no_streaming_or_dry_run_shape() {
     }
 }
 
+/// `--mode` on a panel carries no static default: `None` is what an
+/// invocation that never wrote the flag resolves to, and only `ui::run`
+/// decides what `None` means (`explicit > AFUI_DELIVERY > window`). A
+/// default written into the registry here would make that priority
+/// unreachable — see `UiDeliveryPlan::resolve`'s own warning about it.
+#[cfg(feature = "ui")]
+#[test]
+fn panel_mode_has_no_default_and_is_parsed_when_given() {
+    let invocation = match resolve(&["afpsql", "ui", "table", "orders"]) {
+        Ok(invocation) => invocation,
+        Err(error) => panic!("ui table with no --mode was rejected: {}", error.message),
+    };
+    match run_ui_table(&invocation) {
+        Ok(Mode::Ui(UiRequest { delivery, .. })) => assert_eq!(delivery, None),
+        Ok(_) => panic!("ui table did not resolve to a ui request"),
+        Err(error) => panic!("ui table did not resolve: {}", error.message),
+    }
+
+    for (word, mode) in [
+        ("window", UiDeliveryMode::Window),
+        ("session", UiDeliveryMode::Session),
+    ] {
+        let invocation = match resolve(&["afpsql", "ui", "table", "orders", "--mode", word]) {
+            Ok(invocation) => invocation,
+            Err(error) => panic!("--mode {word} was rejected: {}", error.message),
+        };
+        match run_ui_table(&invocation) {
+            Ok(Mode::Ui(UiRequest { delivery, .. })) => assert_eq!(delivery, Some(mode)),
+            Ok(_) => panic!("ui table --mode {word} did not resolve to a ui request"),
+            Err(error) => panic!("ui table --mode {word} did not resolve: {}", error.message),
+        }
+    }
+}
+
+/// `link` is a real `UiDeliveryMode`, but not one this spore's `--mode`
+/// accepts: a published panel puts database rows on a network address with
+/// no tunnel, which `ui::resolve_delivery_mode` refuses for every panel
+/// regardless of where the word came from. Pinning it at the registry means
+/// `--help` can never drift into advertising a capability the runner then
+/// rejects.
+#[cfg(feature = "ui")]
+#[test]
+fn panel_mode_does_not_accept_link() {
+    for args in [
+        vec![
+            "afpsql", "ui", "table", "--dsn", "env:X", "orders", "--mode", "link",
+        ],
+        vec![
+            "afpsql", "ui", "plan", "--sql", "select 1", "--mode", "link",
+        ],
+    ] {
+        assert!(
+            registry().resolve_from(args.clone()).is_err(),
+            "{args:?} should have been rejected: `link` is not a registered `--mode` value"
+        );
+    }
+}
+
+/// All five panels take the same `--mode`, not five separately-registered
+/// axes that could drift apart on which words they accept.
+#[cfg(feature = "ui")]
+#[test]
+fn every_panel_offers_the_same_two_delivery_words() {
+    for base in [
+        vec!["afpsql", "ui", "schema", "--dsn", "env:X", "public"],
+        vec!["afpsql", "ui", "table", "--dsn", "env:X", "orders"],
+        vec!["afpsql", "ui", "indexes", "--dsn", "env:X"],
+        vec!["afpsql", "ui", "connections", "--dsn", "env:X"],
+        vec![
+            "afpsql", "ui", "plan", "--dsn", "env:X", "--sql", "select 1",
+        ],
+    ] {
+        for word in ["window", "session"] {
+            let mut args = base.clone();
+            args.push("--mode");
+            args.push(word);
+            assert!(
+                registry().resolve_from(args.clone()).is_ok(),
+                "{args:?} should have resolved"
+            );
+        }
+    }
+}
+
 #[test]
 fn short_flags_do_not_exist() {
     // The registry has no short syntax at all, so `-h` is not a rejected alias

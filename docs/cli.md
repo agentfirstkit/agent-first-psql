@@ -42,7 +42,7 @@ A **shape** is one legal set of arguments that may appear together, under a stab
 - [`afpsql skill install`](#afpsql-skill-install) — Install the Agent-First PSQL skill.
 - [`afpsql skill status`](#afpsql-skill-status) — Show whether the Agent-First PSQL skill is installed, valid, and up to date.
 - [`afpsql skill uninstall`](#afpsql-skill-uninstall) — Remove an afpsql-managed Agent-First PSQL skill.
-- [`afpsql ui connections`](#afpsql-ui-connections) — Open a live panel counting server connections against max_connections; reloads itself.
+- [`afpsql ui connections`](#afpsql-ui-connections) — Open a live server-connection panel with plain EXPLAIN input.
 - [`afpsql ui indexes`](#afpsql-ui-indexes) — Open a panel listing indexes with their definitions, size, and validity.
 - [`afpsql ui plan`](#afpsql-ui-plan) — Show one statement to a person and run it only if they approve; closing refuses.
 - [`afpsql ui schema`](#afpsql-ui-schema) — Open a panel showing every relation in one schema and its columns.
@@ -55,31 +55,31 @@ Run one SQL action per process, or open a long-lived pipe session.
 #### `query-inline` — Run inline --sql and return one bounded result
 
 ```
-afpsql --sql <SQL> [--param <N=VALUE>...] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--dry-run] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql --sql <SQL> [--param <N=VALUE>...] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--dry-run] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 #### `query-file` — Run SQL read from --sql-file and return one bounded result
 
 ```
-afpsql --sql-file <PATH> [--param <N=VALUE>...] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--dry-run] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql --sql-file <PATH> [--param <N=VALUE>...] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--dry-run] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 #### `query-inline-stream` — Stream inline --sql as ordered row batches on one stream
 
 ```
-afpsql --sql <SQL> [--param <N=VALUE>...] --stream-rows [--batch-rows <N>] [--batch-bytes <N>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql --sql <SQL> [--param <N=VALUE>...] --stream-rows [--batch-rows <N>] [--batch-bytes <N>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 #### `query-file-stream` — Stream SQL read from --sql-file as ordered row batches on one stream
 
 ```
-afpsql --sql-file <PATH> [--param <N=VALUE>...] --stream-rows [--batch-rows <N>] [--batch-bytes <N>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql --sql-file <PATH> [--param <N=VALUE>...] --stream-rows [--batch-rows <N>] [--batch-bytes <N>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--explain <plan|analyze>] [--mode cli] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 #### `pipe` — Open a long-lived JSONL session that reads requests from stdin
 
 ```
-afpsql --mode pipe [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql --mode pipe [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 #### `psql-translation` — Translate a psql command line: every remaining argument is psql's own (-c, -f, -l, -h, -p, -U, -d, -v, DBNAME USERNAME), parsed by the compatibility layer rather than by this registry
@@ -127,6 +127,9 @@ Arguments across every shape above:
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -150,7 +153,7 @@ Arguments across every shape above:
 List server backends with state, wait event, age, and the max_connections limit.
 
 ```
-afpsql inspect connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all]
+afpsql inspect connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all]
 ```
 
 | Argument | Meaning |
@@ -171,6 +174,9 @@ afpsql inspect connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -195,7 +201,7 @@ afpsql inspect connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>
 Summarize the connected database: schema/table/view/sequence counts and size.
 
 ```
-afpsql inspect database [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql inspect database [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 | Argument | Meaning |
@@ -216,6 +222,9 @@ afpsql inspect database [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -239,7 +248,7 @@ afpsql inspect database [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 List databases on the connected server with size, encoding, and connection facts.
 
 ```
-afpsql inspect databases [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all]
+afpsql inspect databases [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all]
 ```
 
 | Argument | Meaning |
@@ -260,6 +269,9 @@ afpsql inspect databases [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] 
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -284,7 +296,7 @@ afpsql inspect databases [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] 
 List indexes with definitions, size, validity, and optional usage stats.
 
 ```
-afpsql inspect indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--table <TABLE>] [--stats]
+afpsql inspect indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--table <TABLE>] [--stats]
 ```
 
 | Argument | Meaning |
@@ -305,6 +317,9 @@ afpsql inspect indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -331,7 +346,7 @@ afpsql inspect indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 Export full schema metadata for one schema.
 
 ```
-afpsql inspect schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
+afpsql inspect schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
 ```
 
 | Argument | Meaning |
@@ -352,6 +367,9 @@ afpsql inspect schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -377,7 +395,7 @@ afpsql inspect schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 List user-visible schemas with owner, object counts, and size.
 
 ```
-afpsql inspect schemas [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql inspect schemas [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 | Argument | Meaning |
@@ -398,6 +416,9 @@ afpsql inspect schemas [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -421,7 +442,7 @@ afpsql inspect schemas [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [-
 Export a stable full-schema snapshot for machine consumption.
 
 ```
-afpsql inspect snapshot [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
+afpsql inspect snapshot [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
 ```
 
 | Argument | Meaning |
@@ -442,6 +463,9 @@ afpsql inspect snapshot [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -467,7 +491,7 @@ afpsql inspect snapshot [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [
 Describe a table's columns: types, nullability, defaults, primary key, comments.
 
 ```
-afpsql inspect table <NAME> [--full] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
+afpsql inspect table <NAME> [--full] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...]
 ```
 
 | Argument | Meaning |
@@ -490,6 +514,9 @@ afpsql inspect table <NAME> [--full] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--h
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -513,7 +540,7 @@ afpsql inspect table <NAME> [--full] [--dsn <SOURCE>] [--conninfo <SOURCE>] [--h
 List tables in a schema with owner, estimated rows, and size.
 
 ```
-afpsql inspect tables [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
+afpsql inspect tables [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
 ```
 
 | Argument | Meaning |
@@ -534,6 +561,9 @@ afpsql inspect tables [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -559,7 +589,7 @@ afpsql inspect tables [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--
 List views (regular and materialized) in a schema with owner.
 
 ```
-afpsql inspect views [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
+afpsql inspect views [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--like <PATTERN>]
 ```
 
 | Argument | Meaning |
@@ -580,6 +610,9 @@ afpsql inspect views [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--p
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -712,10 +745,10 @@ Arguments across every shape above:
 
 ### `afpsql ui connections`
 
-Open a live panel counting server connections against max_connections; reloads itself.
+Open a live server-connection panel with plain EXPLAIN input.
 
 ```
-afpsql ui connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--all] [--refresh <SECONDS>]
+afpsql ui connections [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] [--all] [--refresh <SECONDS>]
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
@@ -738,6 +771,9 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -755,15 +791,16 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-kubectl-context` | Kubernetes context to run the exec against |
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--mode` | How this reaches the person: window a browser window is open on this machine; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `--all` | Include PostgreSQL's own background backends, not just client connections |
-| `--refresh` | Seconds between reloads; minimum 2 |
+| `--refresh` | Seconds between live snapshots; minimum 2 |
 
 ### `afpsql ui indexes`
 
 Open a panel listing indexes with their definitions, size, and validity.
 
 ```
-afpsql ui indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--schema <SCHEMA>] [--table <TABLE>]
+afpsql ui indexes [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] [--schema <SCHEMA>] [--table <TABLE>]
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
@@ -786,6 +823,9 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -803,6 +843,7 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-kubectl-context` | Kubernetes context to run the exec against |
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--mode` | How this reaches the person: window a browser window is open on this machine; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `--schema` | Schema to filter on |
 | `--table` | Table to filter on; `schema.table` overrides --schema |
 
@@ -813,13 +854,13 @@ Show one statement to a person and run it only if they approve; closing refuses.
 #### `ui_plan` — Show inline --sql for approval
 
 ```
-afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] --sql <SQL> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
+afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] --sql <SQL> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
 ```
 
 #### `ui_plan_file` — Show the statement read from --sql-file for approval
 
 ```
-afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] --sql-file <PATH> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
+afpsql ui plan [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] --sql-file <PATH> [--param <N=VALUE>...] [--permission <read|write|ssh-read|ssh-write|container-read|container-write>] [--statement-timeout-ms <MS>] [--lock-timeout-ms <MS>] [--inline-max-rows <N>] [--inline-max-bytes <N>]
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
@@ -844,6 +885,9 @@ Arguments across every shape above:
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -861,6 +905,7 @@ Arguments across every shape above:
 | `--container-kubectl-context` | Kubernetes context to run the exec against |
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--mode` | How this reaches the person: window a browser window is open on this machine; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `--sql` | Inline SQL to show and, once approved, run |
 | `--sql-file` | File to read the statement from; `-` reads it from stdin |
 | `--param` | Positional bind parameter in N=value form; repeat for more parameters. Bare null/true/false bind as JSON null/booleans; prefix with `text:` to bind any value as a literal string |
@@ -875,7 +920,7 @@ Arguments across every shape above:
 Open a panel showing every relation in one schema and its columns.
 
 ```
-afpsql ui schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] <SCHEMA>
+afpsql ui schema [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] <SCHEMA>
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
@@ -898,6 +943,9 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -915,6 +963,7 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-kubectl-context` | Kubernetes context to run the exec against |
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--mode` | How this reaches the person: window a browser window is open on this machine; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `SCHEMA` | Schema to inspect, for example `public` |
 
 ### `afpsql ui table`
@@ -922,7 +971,7 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 Open a panel describing one table: columns, constraints, indexes, and triggers.
 
 ```
-afpsql ui table [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] <NAME>
+afpsql ui table [--dsn <SOURCE>] [--conninfo <SOURCE>] [--host <HOST>] [--port <PORT>] [--user <USER>] [--dbname <DBNAME>] [--password <SOURCE>] [--ssh <USER@HOST>] [--ssh-via <USER@HOST>...] [--ssh-option <OPTION>...] [--ssh-remote-socket <PATH>] [--ssh-sudo-user <USER>] [--container-docker-name <NAME>] [--container-docker-user <USER>] [--container-docker-context <CONTEXT>] [--container-docker-runtime <COMMAND>] [--container-apple-name <NAME>] [--container-apple-user <USER>] [--container-apple-runtime <COMMAND>] [--container-podman-name <NAME>] [--container-podman-user <USER>] [--container-podman-runtime <COMMAND>] [--container-nerdctl-name <NAME>] [--container-nerdctl-user <USER>] [--container-nerdctl-runtime <COMMAND>] [--container-compose-service <NAME>] [--container-compose-user <USER>] [--container-compose-file <FILE>...] [--container-compose-project <NAME>] [--container-compose-runtime <COMMAND>] [--container-kubectl-pod <NAME>] [--container-kubectl-container <NAME>] [--container-kubectl-namespace <NAMESPACE>] [--container-kubectl-context <CONTEXT>] [--container-kubectl-runtime <COMMAND>] [--log <FILTER>...] [--mode <window|session>] <NAME>
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`); redirect with `--stdout-file` or `--stderr-file`.
@@ -945,6 +994,9 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-docker-user` | Container OS user to run the docker exec bridge as |
 | `--container-docker-context` | Docker context to run the exec against |
 | `--container-docker-runtime` | Docker runtime command; defaults to docker |
+| `--container-apple-name` | Run an Apple container exec stdio bridge in this container before connecting |
+| `--container-apple-user` | Container OS user to run the Apple container exec bridge as |
+| `--container-apple-runtime` | Apple container runtime command; defaults to container |
 | `--container-podman-name` | Run a podman exec stdio bridge in this container before connecting |
 | `--container-podman-user` | Container OS user to run the podman exec bridge as |
 | `--container-podman-runtime` | Podman runtime command; defaults to podman |
@@ -962,6 +1014,7 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 | `--container-kubectl-context` | Kubernetes context to run the exec against |
 | `--container-kubectl-runtime` | Kubectl runtime command; defaults to kubectl |
 | `--log` | Diagnostic log filter: startup, connect, query, transport, mode, an exact event such as query.error, or all. Comma-separated or repeated |
+| `--mode` | How this reaches the person: window a browser window is open on this machine; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `NAME` | Table name; `schema.table` overrides the default `public` schema |
 
 ## Exit codes
@@ -981,4 +1034,4 @@ Every structural failure emits one strict JSON `kind:"error"` event on stderr, l
 
 Two exit-1 codes describe the tool itself rather than the call: `cli_invocation_invalid` means the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce — and `output_setup_failed` means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established. Both are defects to report, not inputs to correct; retrying the same command cannot help.
 
-Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. No error message quotes a raw value it was given — an error event is routinely logged, and the input may hold secrets.
+Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. Error events are routinely logged, so a message never quotes a value that came from an argument able to carry a credential — a header, a cookie, a token, a password, a proxy URL, an environment value, a form field. Such an error names the argument and the shape that was wrong, and stops there. A value that cannot be a secret — a path, a dot-path, a session name — is quoted, because an error that cannot say which one it means is not worth logging either.

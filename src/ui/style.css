@@ -1,46 +1,34 @@
+/* Panel appearance only. The palette, the reset, the focus ring, `[hidden]`
+   and the page inset come from `__afui/base.css`, which the session serves and
+   the layout links first. */
+
 :root {
-  color-scheme: light dark;
-  --page: #ffffff;
-  --ink: #14171a;
-  --muted: #5b6570;
-  --line: #dfe3e8;
-  --head: #f4f6f8;
+  /* One value the baseline has no opinion about: a cell holding no value at
+     all, which has to read as dimmer than the muted text around it without
+     reading as disabled. */
   --null: #98a2ad;
-  --warn: #8a4b00;
-  --warn-bg: #fff6e8;
-  --go: #0b5c2e;
-  --go-bg: #e8f5ec;
+  /* How far a panel's content sits from the edge. The baseline widens this on
+     a phone to clear the hardware. */
+  --afui-page-padding: 1.5rem;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --page: #16191c;
-    --ink: #e7eaee;
-    --muted: #9aa4af;
-    --line: #2b3036;
-    --head: #1e2226;
     --null: #6d7681;
-    --warn: #f0b464;
-    --warn-bg: #2a2016;
-    --go: #7fd7a0;
-    --go-bg: #16241b;
   }
-}
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  padding: 1.5rem;
-  background: var(--page);
-  color: var(--ink);
-  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
 header {
   margin-bottom: 1.25rem;
+}
+
+/* Inside a frame that draws a head, this page does not draw a second one: the
+ * program and the database this session is on are already up there, and the
+ * live line beside them is sent up as it changes. Only the live monitor asks —
+ * a panel that is waiting for a decision keeps its own head wherever it is
+ * shown. */
+body[data-frame-head="true"] > header {
+  display: none;
 }
 
 h1 {
@@ -49,21 +37,21 @@ h1 {
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--afui-muted);
 }
 
 .subject {
   margin: 0.15rem 0 0;
   font-size: 1.35rem;
   font-weight: 600;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--afui-mono);
 }
 
 /* Schema output is wide. The table scrolls inside this box so the page itself
    never scrolls sideways. */
 .scroll {
   overflow-x: auto;
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 6px;
 }
 
@@ -73,15 +61,15 @@ table {
   border-collapse: collapse;
   width: max-content;
   min-width: 100%;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--afui-mono);
   font-size: 13px;
 }
 
 thead th {
   position: sticky;
   top: 0;
-  background: var(--head);
-  border-bottom: 1px solid var(--line);
+  background: var(--afui-panel-strong);
+  border-bottom: 1px solid var(--afui-line);
   padding: 0.5rem 0.75rem;
   text-align: left;
   white-space: nowrap;
@@ -96,12 +84,12 @@ th .type {
   display: block;
   font-weight: 400;
   font-size: 11px;
-  color: var(--muted);
+  color: var(--afui-muted);
 }
 
 tbody td {
   padding: 0.4rem 0.75rem;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--afui-line);
   vertical-align: top;
   white-space: pre-wrap;
   /* Only genuinely long values wrap — an index definition or a jsonb payload.
@@ -120,16 +108,16 @@ td.null {
 }
 
 .empty {
-  color: var(--muted);
+  color: var(--afui-muted);
   padding: 2rem;
   text-align: center;
-  border: 1px dashed var(--line);
+  border: 1px dashed var(--afui-line);
   border-radius: 6px;
 }
 
 footer {
   margin-top: 1rem;
-  color: var(--muted);
+  color: var(--afui-muted);
   font-size: 12px;
 }
 
@@ -139,7 +127,16 @@ h2 {
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--afui-muted);
+}
+
+h3 {
+  margin: 1.25rem 0 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--afui-muted);
 }
 
 /* Something the page needs a person to notice: a reload that failed, or a
@@ -147,15 +144,156 @@ h2 {
 .warn {
   margin: 0 0 1rem;
   padding: 0.6rem 0.75rem;
-  border: 1px solid var(--warn);
+  border: 1px solid var(--afui-warn-ink);
   border-radius: 6px;
-  background: var(--warn-bg);
-  color: var(--warn);
+  background: var(--afui-warn-bg);
+  color: var(--afui-warn-ink);
 }
 
 .hint {
-  color: var(--muted);
+  color: var(--afui-muted);
   font-size: 12px;
+}
+
+/* ── inspection panels ── */
+
+/* What the object is, before what it contains. Reads as a caption rather than
+   as data, because it is context for everything below it. */
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 1.75rem;
+  margin: 0;
+}
+
+.facts > div {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.facts dt {
+  color: var(--afui-muted);
+  font-size: 12px;
+}
+
+.facts dd {
+  margin: 0;
+  font-family: var(--afui-mono);
+  overflow-wrap: anywhere;
+}
+
+/* A column list is a table because it is one: same fields, every row. The
+   objects attached to a relation are not — each is a name, a few flags, and one
+   long definition — so they are a list instead. */
+table.detail td.ordinal {
+  color: var(--afui-muted);
+  text-align: right;
+}
+
+.ident {
+  font-family: var(--afui-mono);
+  font-weight: 600;
+}
+
+/* What something is, beside what it is called. */
+.kind {
+  color: var(--afui-muted);
+  font-size: 12px;
+}
+
+.note {
+  color: var(--afui-muted);
+}
+
+/* A fact worth a glance and no more: `unique`, `identity, always`. */
+.tag {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border: 1px solid var(--afui-line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--afui-muted);
+  white-space: nowrap;
+}
+
+/* A tag a person has to act on rather than merely note. */
+.tag.warn-tag {
+  border-color: var(--afui-warn-ink);
+  background: var(--afui-warn-bg);
+  color: var(--afui-warn-ink);
+}
+
+.objects {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--afui-line);
+  border-radius: 6px;
+}
+
+.objects > li {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--afui-line);
+}
+
+.objects > li:last-child {
+  border-bottom: none;
+}
+
+.objects .line {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+/* An index or constraint definition: the part that says what it actually
+   covers, kept legible without competing with the name above it. */
+.objects p.sql {
+  margin: 0.25rem 0 0;
+  font-family: var(--afui-mono);
+  font-size: 12px;
+  color: var(--afui-muted);
+  overflow-wrap: anywhere;
+}
+
+/* One relation inside a schema panel: closed, it is a one-line summary; open,
+   it is the same detail the table panel shows. */
+details.relation {
+  border: 1px solid var(--afui-line);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+details.relation > summary {
+  cursor: pointer;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+details.relation[open] > summary {
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--afui-line);
+}
+
+/* The result set the agent read, unaltered. Present so nothing the panel
+   summarized is hidden by having been summarized — closed, because a person who
+   wanted this shape would have run `afpsql inspect`. */
+details.raw {
+  margin-top: 2rem;
+}
+
+details.raw > summary {
+  cursor: pointer;
+  color: var(--afui-muted);
+  font-size: 12px;
+  margin-bottom: 0.5rem;
 }
 
 /* ── connection monitor ── */
@@ -163,6 +301,17 @@ h2 {
 /* The number the panel exists for, at the size it deserves. */
 .capacity {
   margin-bottom: 0.5rem;
+}
+
+.monitor-live {
+  margin: -0.75rem 0 1rem;
+  color: var(--afui-muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.monitor-live[data-state="error"] {
+  color: var(--afui-warn-ink);
 }
 
 .capacity meter {
@@ -175,14 +324,14 @@ h2 {
   margin: 0.4rem 0 0;
   font-size: 2rem;
   font-weight: 600;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--afui-mono);
 }
 
 .count .of,
 .count .unit {
   font-size: 0.9rem;
   font-weight: 400;
-  color: var(--muted);
+  color: var(--afui-muted);
 }
 
 /* Three tallies of the same snapshot, side by side while there is room. */
@@ -200,7 +349,7 @@ h2 {
 .groups dl,
 .waits dl {
   margin: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 6px;
 }
 
@@ -210,7 +359,7 @@ h2 {
   justify-content: space-between;
   gap: 1rem;
   padding: 0.35rem 0.75rem;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--afui-line);
 }
 
 .groups dl > div:last-child,
@@ -220,14 +369,14 @@ h2 {
 
 .groups dt,
 .waits dt {
-  color: var(--muted);
+  color: var(--afui-muted);
   overflow-wrap: anywhere;
 }
 
 .groups dd,
 .waits dd {
   margin: 0;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-family: var(--afui-mono);
   font-variant-numeric: tabular-nums;
 }
 
@@ -240,25 +389,87 @@ h2 {
   max-height: 4.5em;
   overflow-y: auto;
   font-size: 12px;
-  color: var(--muted);
+  color: var(--afui-muted);
 }
 
 /* This panel's own connection is one of the rows it reports. */
 .longest tr.self td {
-  background: var(--head);
+  background: var(--afui-panel-strong);
+}
+
+/* The monitor remains a live read while this independent request travels in
+   the other direction over the same session. */
+.explain-panel {
+  margin: 1.25rem 0 0.5rem;
+  padding: 0.9rem 1rem 1rem;
+  border: 1px solid var(--afui-line);
+  border-radius: 6px;
+  background: var(--afui-panel-strong);
+}
+
+.explain-panel h2 { margin-top: 0; }
+
+.explain-panel form {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.explain-panel textarea {
+  width: 100%;
+  min-height: 8rem;
+  resize: vertical;
+  border: 1px solid var(--afui-line);
+  border-radius: 6px;
+  padding: 0.75rem;
+  background: var(--afui-page);
+  color: var(--afui-ink);
+  font: 13px/1.45 var(--afui-mono);
+}
+
+.explain-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.explain-actions button {
+  min-height: 2.5rem;
+  padding: 0.55rem 1rem;
+  border: 1px solid var(--afui-ok-ink);
+  border-radius: 6px;
+  background: var(--afui-ok-bg);
+  color: var(--afui-ok-ink);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.explain-actions button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.explain-result {
+  max-height: 32rem;
+  overflow: auto;
+}
+
+.explain-result[data-state="error"] {
+  color: var(--afui-warn-ink);
 }
 
 /* ── plan confirmation ── */
 
 .plan {
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 6px;
   padding: 1rem;
 }
 
 /* A statement afpsql reads as a write does not look like every other page. */
 .plan.writes {
-  border-color: var(--warn);
+  border-color: var(--afui-warn-ink);
 }
 
 .terms,
@@ -271,7 +482,7 @@ h2 {
   display: flex;
   gap: 1rem;
   padding: 0.35rem 0;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--afui-line);
 }
 
 .details > div:last-child {
@@ -281,7 +492,7 @@ h2 {
 .terms dt,
 .details dt {
   flex: 0 0 8rem;
-  color: var(--muted);
+  color: var(--afui-muted);
 }
 
 .terms dd,
@@ -293,10 +504,10 @@ h2 {
 pre.sql {
   margin: 1rem 0;
   padding: 0.75rem;
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 6px;
-  background: var(--head);
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  background: var(--afui-panel-strong);
+  font-family: var(--afui-mono);
   font-size: 13px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -304,6 +515,7 @@ pre.sql {
 
 .decide {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   margin-top: 1.25rem;
 }
@@ -312,19 +524,62 @@ pre.sql {
   font: inherit;
   padding: 0.6rem 1.1rem;
   border-radius: 6px;
-  border: 1px solid var(--line);
-  background: var(--page);
-  color: var(--ink);
+  border: 1px solid var(--afui-line);
+  background: var(--afui-page);
+  color: var(--afui-ink);
   cursor: pointer;
 }
 
+.decide button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.decision-status {
+  align-self: center;
+  color: var(--afui-muted);
+  font-size: 12px;
+}
+
+body[data-decision-pending] .decide {
+  cursor: wait;
+}
+
 .decide .approve {
-  border-color: var(--go);
-  background: var(--go-bg);
-  color: var(--go);
+  border-color: var(--afui-ok-ink);
+  background: var(--afui-ok-bg);
+  color: var(--afui-ok-ink);
   font-weight: 600;
 }
 
 .decide .refuse {
   font-weight: 600;
+}
+
+@media (max-width: 560px) {
+  body {
+    padding: 1rem;
+  }
+
+  .terms > div,
+  .details > div {
+    display: grid;
+    gap: 0.1rem;
+  }
+
+  .terms dt,
+  .details dt {
+    flex-basis: auto;
+  }
+
+  .decide button {
+    flex: 1 1 10rem;
+  }
+}
+
+@media (pointer: coarse) {
+  .decide button,
+  .explain-actions button {
+    min-height: 44px;
+  }
 }
