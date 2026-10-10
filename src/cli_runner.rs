@@ -130,30 +130,37 @@ pub async fn run(
         std::process::exit(4);
     }
 
-    app.requests_total.fetch_add(1, Ordering::Relaxed);
-    handler::execute_query(
-        &app,
-        None,
-        Some("default".to_string()),
-        sql,
-        params,
-        options,
-        None,
-    )
-    .await;
-
-    app.executor.shutdown().await;
-    drop(app);
-
-    let mut had_error = false;
-    while let Some(event) = rx.recv().await {
-        if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
-            had_error = true;
+    // Draining must run while the query sends batches: waiting for execution
+    // first would fill the bounded channel and prevent either side progressing.
+    let query = async move {
+        app.requests_total.fetch_add(1, Ordering::Relaxed);
+        handler::execute_query(
+            &app,
+            None,
+            Some("default".to_string()),
+            sql,
+            params,
+            options,
+            None,
+        )
+        .await;
+        app.executor.shutdown().await;
+        // Close the sender after execution so the drain includes every event.
+        drop(app);
+    };
+    let drain = async {
+        let mut had_error = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, Output::Error { .. } | Output::SqlError { .. }) {
+                had_error = true;
+            }
+            if sink.emit(&event).is_err() {
+                std::process::exit(4);
+            }
         }
-        if sink.emit(&event).is_err() {
-            std::process::exit(4);
-        }
-    }
+        had_error
+    };
+    let ((), had_error) = tokio::join!(query, drain);
 
     std::process::exit(if had_error { 1 } else { 0 });
 }

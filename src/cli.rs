@@ -916,6 +916,7 @@ fn inspect_table_command() -> CommandSpec {
 /// returns a result to the agent and exits, while a `ui` call blocks on a
 /// person and returns only once they close the window. One verb cannot own both
 /// endings.
+#[cfg(feature = "ui")]
 fn ui_view_command(name: &'static str, about: &'static str) -> CommandSpec {
     with_connection_args(CommandSpec::new(["ui", name]).about(about)).arg(ui_delivery_mode_arg())
 }
@@ -949,10 +950,12 @@ fn ui_view_command(name: &'static str, about: &'static str) -> CommandSpec {
 pub(crate) const UI_DELIVERY: agent_first_ui::cli::UiDeliveryOffer =
     agent_first_ui::cli::UiDeliveryOffer::Local;
 
+#[cfg(feature = "ui")]
 fn ui_delivery_mode_arg() -> ArgSpec {
     UI_DELIVERY.arg("--mode")
 }
 
+#[cfg(feature = "ui")]
 fn ui_combination(id: &'static str, extra: &[&'static str]) -> Combination {
     let mut optional: Vec<&str> = extra.to_vec();
     optional.push("mode");
@@ -963,6 +966,7 @@ fn ui_combination(id: &'static str, extra: &[&'static str]) -> Combination {
         .output(stream_output())
 }
 
+#[cfg(feature = "ui")]
 fn ui_schema_command() -> CommandSpec {
     ui_view_command(
         "schema",
@@ -972,6 +976,7 @@ fn ui_schema_command() -> CommandSpec {
     .combination(ui_combination("ui_schema", &[]).required(["name"]))
 }
 
+#[cfg(feature = "ui")]
 fn ui_table_command() -> CommandSpec {
     ui_view_command(
         "table",
@@ -984,6 +989,7 @@ fn ui_table_command() -> CommandSpec {
     .combination(ui_combination("ui_table", &[]).required(["name"]))
 }
 
+#[cfg(feature = "ui")]
 fn ui_indexes_command() -> CommandSpec {
     ui_view_command(
         "indexes",
@@ -3067,6 +3073,7 @@ pub(crate) fn wrap_explain_sql(user_sql: &str, analyze: bool) -> String {
 /// The structured CLI keeps JSON because agents consume it. The live panel is
 /// read by a person, so PostgreSQL's indented text plan is the useful shape and
 /// avoids making the browser reverse-engineer a protocol result into a tree.
+#[cfg(feature = "ui")]
 pub(crate) fn wrap_explain_text_sql(user_sql: &str) -> String {
     let body = crate::db::trim_trailing_statement_terminators(user_sql);
     format!("explain (format text) {body}")

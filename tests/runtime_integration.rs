@@ -30,6 +30,34 @@ fn unique_suffix() -> String {
     format!("{}_{}", std::process::id(), nanos)
 }
 
+fn activity_sql(marker: &str) -> String {
+    format!(
+        "select count(*)::int as n from pg_stat_activity where pid <> pg_backend_pid() and state = 'active' and query like '%{marker}%'"
+    )
+}
+
+/// Block until a statement carrying `marker` is executing on the server.
+fn wait_until_active(marker: &str) {
+    let activity_sql = activity_sql(marker);
+    for _ in 0..50 {
+        let out = Command::new(bin())
+            .arg("--dsn")
+            .arg(test_dsn())
+            .arg("--sql")
+            .arg(&activity_sql)
+            .output()
+            .expect("query pg_stat_activity");
+        if out.status.success() {
+            let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
+            if v["result"]["rows"][0]["n"].as_i64().unwrap_or(0) > 0 {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("query marked {marker} did not become active");
+}
+
 fn run_write_sql(sql: &str) -> std::process::Output {
     Command::new(bin())
         .arg("--dsn")
@@ -1397,25 +1425,7 @@ fn pipe_query_then_close_timeout_path() {
 )]
 #[test]
 fn pipe_config_and_cancel_existing_query() {
-    let payload = serde_json::json!({
-        "code": "query",
-        "id": "q1",
-        "sql": "select pg_sleep(1)"
-    })
-    .to_string()
-        + "\n"
-        + &serde_json::json!({
-            "code":"config",
-            "inline_max_rows": 2,
-            "statement_timeout_ms": 1000
-        })
-        .to_string()
-        + "\n"
-        + &serde_json::json!({"code":"cancel","id":"q1"}).to_string()
-        + "\n"
-        + &serde_json::json!({"code":"close"}).to_string()
-        + "\n";
-
+    let marker = format!("afpsql_config_cancel_{}", unique_suffix());
     let mut child = Command::new(bin())
         .arg("--mode")
         .arg("pipe")
@@ -1427,12 +1437,40 @@ fn pipe_config_and_cancel_existing_query() {
         .spawn()
         .expect("spawn afpsql");
 
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(payload.as_bytes())
-        .expect("write stdin");
+    let mut stdin = child.stdin.take().expect("stdin");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "code": "query",
+            "id": "q1",
+            "sql": format!("select pg_sleep(20) /* {marker} */")
+        })
+    )
+    .expect("write q1");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"config","inline_max_rows":2,"statement_timeout_ms":1000})
+    )
+    .expect("write config");
+    stdin.flush().expect("flush q1 and config");
+
+    // The cancel has to find q1 running on the server. Written in the same
+    // burst as q1 it is dispatched before q1 has a connection, no server-side
+    // cancel is ever sent, and the assertions below hold for any
+    // implementation.
+    wait_until_active(&marker);
+
+    writeln!(stdin, "{}", serde_json::json!({"code":"cancel","id":"q1"})).expect("write cancel");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"code":"query","id":"q2","sql":"select pg_sleep(0.2)"})
+    )
+    .expect("write q2");
+    writeln!(stdin, "{}", serde_json::json!({"code":"close"})).expect("write close");
+    drop(stdin);
 
     let out = child.wait_with_output().expect("wait output");
     assert!(
@@ -1442,6 +1480,12 @@ fn pipe_config_and_cancel_existing_query() {
     );
     let text = String::from_utf8(out.stdout).expect("utf8");
     assert!(text.contains("\"code\":\"config\""));
+    let q1_outcome = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["kind"] == "error" && event["error"]["id"] == "q1")
+        .unwrap_or_else(|| panic!("q1 was running and must report its cancellation: {text}"));
+    assert_eq!(q1_outcome["error"]["code"], "cancelled", "{text}");
     // Exactly one outcome event for q1: the SELECT result, or a terminal
     // `cancelled`, or the SQL error — never two of them.
     //
@@ -1474,6 +1518,15 @@ fn pipe_config_and_cancel_existing_query() {
     assert_eq!(
         outcomes_for_q1, 1,
         "expected one outcome for q1, got {outcomes_for_q1}; output: {text}"
+    );
+    let q2 = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["result"]["id"] == "q2" || event["error"]["id"] == "q2")
+        .expect("q2 outcome");
+    assert_eq!(
+        q2["kind"], "result",
+        "the following query must not receive q1's cancel: {text}"
     );
     assert!(text.contains("\"code\":\"close\""));
 }
@@ -1993,28 +2046,8 @@ fn pipe_cancel_requests_server_side_cancel_for_active_query() {
     .expect("write long query");
     stdin.flush().expect("flush long query");
 
-    let activity_sql = format!(
-        "select count(*)::int as n from pg_stat_activity where pid <> pg_backend_pid() and state = 'active' and query like '%{marker}%'"
-    );
-    let mut saw_active = false;
-    for _ in 0..50 {
-        let out = Command::new(bin())
-            .arg("--dsn")
-            .arg(test_dsn())
-            .arg("--sql")
-            .arg(&activity_sql)
-            .output()
-            .expect("query pg_stat_activity");
-        if out.status.success() {
-            let v: Value = serde_json::from_slice(&out.stdout).expect("json output");
-            if v["result"]["rows"][0]["n"].as_i64().unwrap_or(0) > 0 {
-                saw_active = true;
-                break;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert!(saw_active, "long query did not become active");
+    let activity_sql = activity_sql(&marker);
+    wait_until_active(&marker);
 
     writeln!(
         stdin,

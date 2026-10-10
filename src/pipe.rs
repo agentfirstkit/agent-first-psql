@@ -15,6 +15,8 @@ use std::time::Instant;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::sync::mpsc;
 
+const PIPE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) enum PipeInput {
     WriterStopped,
     Line(std::io::Result<Option<Result<String, ()>>>),
@@ -75,7 +77,11 @@ pub async fn run(
     loop {
         let read = match next_pipe_input(&mut reader, &mut writer).await {
             PipeInput::WriterStopped => {
-                runtime.app.executor.shutdown().await;
+                shutdown_runtime(
+                    &runtime,
+                    tokio::time::Instant::now() + PIPE_SHUTDOWN_TIMEOUT,
+                )
+                .await;
                 std::process::exit(4);
             }
             PipeInput::Line(read) => read,
@@ -134,8 +140,11 @@ pub async fn run(
         }
     }
 
-    wait_for_workers_shutdown(&runtime).await;
-    runtime.app.executor.shutdown().await;
+    shutdown_runtime(
+        &runtime,
+        tokio::time::Instant::now() + PIPE_SHUTDOWN_TIMEOUT,
+    )
+    .await;
     send_close_event(&runtime.app).await;
     drop(runtime);
     match writer.await {
@@ -167,6 +176,8 @@ enum SessionOp {
         id: Option<String>,
         session: String,
         read_only: bool,
+        /// The endpoint and transport accepted with the permission check.
+        session_cfg: Box<SessionConfig>,
     },
     Commit {
         id: Option<String>,
@@ -251,7 +262,6 @@ async fn dispatch_input(runtime: &Arc<PipeRuntime>, input: Input) -> bool {
                 .await;
                 return false;
             }
-            *runtime.app.config.write().await = cfg_snapshot.clone();
             dispatch_config_invalidation(runtime, sessions, cfg_snapshot).await;
         }
         Input::Cancel { id } => dispatch_cancel(&runtime.app, id).await,
@@ -378,29 +388,13 @@ async fn dispatch_begin(
     }
 
     let tx = get_session_worker(runtime, &resolved_session).await;
-    if tx
-        .send(SessionOp::Begin {
-            id: id.clone(),
-            session: resolved_session,
-            read_only,
-        })
-        .await
-        .is_err()
-    {
-        let _ = app
-            .writer
-            .send(Output::Error {
-                id,
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: "session worker is unavailable".to_string(),
-                sqlstate: None,
-                message: None,
-                detail: None,
-                hint: Some("retry; the session worker will be restarted".to_string()),
-                retryable: true,
-                trace: Trace::only_duration(0),
-            })
-            .await;
+    if let Err(error) = tx.try_send(SessionOp::Begin {
+        id: id.clone(),
+        session: resolved_session,
+        read_only,
+        session_cfg: Box::new(session_cfg),
+    }) {
+        send_worker_queue_error(app, id, error).await;
     }
 }
 
@@ -457,21 +451,8 @@ async fn enqueue_tx_finish(
             session: resolved_session,
         }
     };
-    if tx.send(op).await.is_err() {
-        let _ = app
-            .writer
-            .send(Output::Error {
-                id,
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: "session worker is unavailable".to_string(),
-                sqlstate: None,
-                message: None,
-                detail: None,
-                hint: Some("retry; the session worker will be restarted".to_string()),
-                retryable: true,
-                trace: Trace::only_duration(0),
-            })
-            .await;
+    if let Err(error) = tx.try_send(op) {
+        send_worker_queue_error(app, id, error).await;
     }
 }
 
@@ -585,22 +566,9 @@ async fn dispatch_query(
         cancel_slot,
         state,
     };
-    if tx.send(SessionOp::Query(Box::new(queued))).await.is_err() {
+    if let Err(error) = tx.try_send(SessionOp::Query(Box::new(queued))) {
         let _ = app.in_flight.lock().await.remove(&key);
-        let _ = app
-            .writer
-            .send(Output::Error {
-                id: Some(key),
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: "session worker is unavailable".to_string(),
-                sqlstate: None,
-                message: None,
-                detail: None,
-                hint: Some("retry the query; the session worker will be restarted".to_string()),
-                retryable: true,
-                trace: Trace::only_duration(0),
-            })
-            .await;
+        send_worker_queue_error(app, Some(key), error).await;
     }
 }
 
@@ -699,7 +667,12 @@ async fn dispatch_cancel(app: &Arc<App>, id: String) {
 
     // Running. Ask, then say only that it was asked. The entry stays in flight
     // and the id stays taken until the worker emits the real outcome.
-    let sent = query.cancel_server_query().await;
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        query.cancel_server_query(),
+    )
+    .await
+    .unwrap_or_else(|_| Err("server-side cancel timed out after 5 seconds".to_owned()));
     let hint = match sent {
         Ok(true) => "cancel sent to the server; wait for this id's result, sql_error \
                      (`57014` means it was stopped), or error"
@@ -785,7 +758,8 @@ async fn session_worker_loop(app: Arc<App>, mut rx: mpsc::Receiver<SessionOp>) {
                 id,
                 session,
                 read_only,
-            } => exec_tx_begin_on_worker(&app, id, session, read_only).await,
+                session_cfg,
+            } => exec_tx_begin_on_worker(&app, id, session, read_only, &session_cfg).await,
             SessionOp::Commit { id, session } => {
                 exec_tx_finish_on_worker(&app, id, session, true).await
             }
@@ -811,23 +785,11 @@ async fn dispatch_session_info(
     let session = crate::conn::resolve_session_name(&cfg, requested_session.as_deref());
     drop(cfg);
     let worker = get_session_worker(runtime, &session).await;
-    if worker
-        .send(SessionOp::SessionInfo {
-            id: id.clone(),
-            session,
-        })
-        .await
-        .is_err()
-    {
-        send_protocol_error(
-            &runtime.app,
-            id,
-            error_code::INVALID_REQUEST,
-            "session worker is unavailable",
-            Some("retry; the session worker will be restarted"),
-            true,
-        )
-        .await;
+    if let Err(error) = worker.try_send(SessionOp::SessionInfo {
+        id: id.clone(),
+        session,
+    }) {
+        send_worker_queue_error(&runtime.app, id, error).await;
     }
 }
 
@@ -836,9 +798,23 @@ async fn dispatch_config_invalidation(
     sessions: Vec<String>,
     cfg_snapshot: RuntimeConfig,
 ) {
+    let mut reservations = Vec::with_capacity(sessions.len());
     for session in sessions {
         let worker = get_session_worker(runtime, &session).await;
-        let _ = worker.send(SessionOp::Invalidate { session }).await;
+        match worker.try_reserve_owned() {
+            Ok(permit) => reservations.push((session, permit)),
+            Err(error) => {
+                // No invalidation has been sent and no configuration installed.
+                // Dropping every reservation restores each queue's capacity.
+                drop(reservations);
+                send_worker_queue_error(&runtime.app, None, error).await;
+                return;
+            }
+        }
+    }
+    *runtime.app.config.write().await = cfg_snapshot.clone();
+    for (session, permit) in reservations {
+        let _sender = permit.send(SessionOp::Invalidate { session });
     }
     let _ = runtime.app.writer.send(Output::Config(cfg_snapshot)).await;
 }
@@ -848,32 +824,12 @@ async fn exec_tx_begin_on_worker(
     id: Option<String>,
     session: String,
     read_only: bool,
+    session_cfg: &SessionConfig,
 ) {
-    let cfg = app.config.read().await.clone();
-    let Some(session_cfg) = cfg.sessions.get(&session).cloned() else {
-        let _ = app
-            .writer
-            .send(Output::Error {
-                id,
-                error_code: error_code::INVALID_REQUEST.to_string(),
-                error: format!("unknown session: {session}"),
-                sqlstate: None,
-                message: None,
-                detail: None,
-                hint: Some(
-                    "list active sessions with a `config` request, or omit `session` to use the default"
-                        .to_string(),
-                ),
-                retryable: false,
-                trace: Trace::only_duration(0),
-            })
-            .await;
-        return;
-    };
     let start = Instant::now();
     match app
         .executor
-        .tx_begin(&session, &session_cfg, read_only)
+        .tx_begin(&session, session_cfg, read_only)
         .await
     {
         Ok(()) => {
@@ -963,7 +919,8 @@ async fn cleanup_finished_queries(app: &Arc<App>) {
         .retain(|_, query| !query.state.is_finished());
 }
 
-async fn wait_for_workers_shutdown(runtime: &Arc<PipeRuntime>) {
+/// One deadline covers worker draining and the executor's client locks.
+async fn shutdown_runtime(runtime: &Arc<PipeRuntime>, deadline: tokio::time::Instant) {
     let handles: Vec<tokio::task::JoinHandle<()>> = runtime
         .workers
         .lock()
@@ -971,14 +928,44 @@ async fn wait_for_workers_shutdown(runtime: &Arc<PipeRuntime>) {
         .drain()
         .map(|(_, worker)| worker.handle)
         .collect();
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    for handle in handles {
-        let now = Instant::now();
-        let remain = deadline.saturating_duration_since(now);
-        if tokio::time::timeout(remain, handle).await.is_err() {
-            // timeout waiting this task; move on
+    for mut handle in handles {
+        if tokio::time::timeout_at(deadline, &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _joined = handle.await;
         }
     }
+    // Cancelling shutdown drops the executor's owned session entries. A local
+    // deadline cannot establish how an unfinished write settled on the server.
+    let _finished = tokio::time::timeout_at(deadline, runtime.app.executor.shutdown()).await;
+}
+
+async fn send_worker_queue_error<T>(
+    app: &Arc<App>,
+    id: Option<String>,
+    error: mpsc::error::TrySendError<T>,
+) {
+    let (message, hint) = match error {
+        mpsc::error::TrySendError::Full(_) => (
+            "session worker queue is full",
+            "retry after queued operations complete",
+        ),
+        mpsc::error::TrySendError::Closed(_) => (
+            "session worker is unavailable",
+            "retry; the session worker will be restarted",
+        ),
+    };
+    send_protocol_error(
+        app,
+        id,
+        error_code::INVALID_REQUEST,
+        message,
+        Some(hint),
+        true,
+    )
+    .await;
 }
 
 async fn send_close_event(app: &Arc<App>) {
@@ -1108,4 +1095,480 @@ pub(crate) fn has_session_override(session: &SessionConfig) -> bool {
         || session.password_secret.is_some()
         || session.ssh.has_transport_fields()
         || session.container.has_transport_fields()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::db::{DbExecutor, DryRunOutcome, ExecError, ExecOutcome, ExecRequest};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{Mutex, Notify};
+
+    #[tokio::test]
+    async fn an_unresponsive_cancel_returns_before_the_next_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let executor = Arc::new(BarrierExecutor::default());
+        let (runtime, mut outputs) = fixture(executor, config_with_host("old"));
+        let slot = crate::db::new_cancel_slot();
+        slot.set_fallback_context_for_test(crate::types::SessionConfig {
+            dsn_secret: Some(format!("postgresql://test@{address}/test?sslmode=disable")),
+            ..Default::default()
+        })
+        .await;
+        let state = Arc::new(handler::QueryState::queued());
+        assert!(state.try_start());
+        runtime.app.in_flight.lock().await.insert(
+            "q1".to_owned(),
+            handler::InFlightQuery {
+                cancel_slot: slot,
+                state,
+            },
+        );
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            dispatch_cancel(&runtime.app, "q1".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(7));
+        let event = outputs.recv().await.unwrap();
+        assert!(
+            matches!(event, Output::CancelRequested { hint, .. } if hint.contains("timed out"))
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            shutdown_runtime(
+                &runtime,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap();
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    struct MarkDropped<'a>(&'a AtomicBool);
+
+    impl Drop for MarkDropped<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct BarrierExecutor {
+        started: Notify,
+        release: Notify,
+        events: Mutex<Vec<String>>,
+        query_dropped: AtomicBool,
+        shutdown_started: AtomicBool,
+        shutdown_dropped: AtomicBool,
+        block_shutdown: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl DbExecutor for BarrierExecutor {
+        async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
+            self.events.lock().await.push(format!(
+                "query:{}",
+                req.session_cfg.host.as_deref().unwrap_or("unset")
+            ));
+            if req.sql == "select hold" {
+                let _dropped = MarkDropped(&self.query_dropped);
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(ExecOutcome::Command { affected: 0 })
+        }
+
+        async fn prepare_only(&self, _req: ExecRequest<'_>) -> Result<DryRunOutcome, ExecError> {
+            Err(ExecError::Internal(
+                "unexpected dry run in fixture".to_string(),
+            ))
+        }
+
+        async fn tx_begin(
+            &self,
+            _session_name: &str,
+            session_cfg: &SessionConfig,
+            read_only: bool,
+        ) -> Result<(), ExecError> {
+            self.events.lock().await.push(format!(
+                "begin:{}:{read_only}",
+                session_cfg.host.as_deref().unwrap_or("unset")
+            ));
+            Ok(())
+        }
+
+        async fn invalidate_sessions(&self, sessions: &[String]) {
+            for session in sessions {
+                self.events
+                    .lock()
+                    .await
+                    .push(format!("invalidate:{session}"));
+            }
+        }
+
+        async fn shutdown(&self) {
+            self.shutdown_started.store(true, Ordering::SeqCst);
+            let _dropped = MarkDropped(&self.shutdown_dropped);
+            if self.block_shutdown {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    fn fixture(
+        executor: Arc<BarrierExecutor>,
+        config: RuntimeConfig,
+    ) -> (Arc<PipeRuntime>, mpsc::Receiver<Output>) {
+        let (writer, outputs) = mpsc::channel(128);
+        let mut app = App::new(config, writer, crate::Capability::ReadWrite);
+        app.executor = executor;
+        (Arc::new(PipeRuntime::new(Arc::new(app))), outputs)
+    }
+
+    fn config_with_host(host: &str) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
+        config.sessions.insert(
+            config.default_session.clone(),
+            SessionConfig {
+                host: Some(host.to_string()),
+                ..SessionConfig::default()
+            },
+        );
+        config
+    }
+
+    fn input(value: serde_json::Value) -> Input {
+        serde_json::from_value(value).expect("fixture input")
+    }
+
+    fn assert_queue_error(output: Output, expected_id: Option<&str>, expected_message: &str) {
+        match output {
+            Output::Error {
+                id,
+                error_code,
+                error,
+                retryable,
+                ..
+            } => {
+                assert_eq!(id.as_deref(), expected_id);
+                assert_eq!(error_code, crate::protocol::error_code::INVALID_REQUEST);
+                assert_eq!(error, expected_message);
+                assert!(retryable);
+            }
+            _ => panic!("expected a retryable queue error"),
+        }
+    }
+
+    async fn paused_worker(
+        runtime: &Arc<PipeRuntime>,
+        session: &str,
+        capacity: usize,
+    ) -> mpsc::Receiver<SessionOp> {
+        let (tx, rx) = mpsc::channel(capacity);
+        runtime.workers.lock().await.insert(
+            session.to_string(),
+            SessionWorker {
+                tx,
+                handle: tokio::spawn(std::future::pending()),
+            },
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_full_worker_queue_rejects_every_operation_without_blocking_cancel() {
+        let executor = Arc::new(BarrierExecutor::default());
+        let (runtime, mut outputs) = fixture(executor.clone(), config_with_host("old"));
+        dispatch_input(
+            &runtime,
+            input(serde_json::json!({"code":"query","id":"hold","sql":"select hold"})),
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            executor.started.notified(),
+        )
+        .await
+        .expect("worker reached the barrier");
+        while outputs.try_recv().is_ok() {}
+
+        for index in 0..MAX_ACTIVE_QUERIES {
+            dispatch_input(
+                &runtime,
+                input(serde_json::json!({"code":"session_info","id":format!("queued-{index}")})),
+            )
+            .await;
+        }
+        for (id, request) in [
+            (
+                "begin",
+                serde_json::json!({"code":"begin","id":"begin","read_only":true}),
+            ),
+            ("commit", serde_json::json!({"code":"commit","id":"commit"})),
+            (
+                "rollback",
+                serde_json::json!({"code":"rollback","id":"rollback"}),
+            ),
+            (
+                "info",
+                serde_json::json!({"code":"session_info","id":"info"}),
+            ),
+            (
+                "query",
+                serde_json::json!({"code":"query","id":"query","sql":"select 1"}),
+            ),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                dispatch_input(&runtime, input(request)),
+            )
+            .await
+            .expect("a full queue must not suspend the input dispatcher");
+            assert_queue_error(
+                outputs.recv().await.expect("queue error"),
+                Some(id),
+                "session worker queue is full",
+            );
+        }
+        assert!(!runtime.app.in_flight.lock().await.contains_key("query"));
+        assert!(runtime.app.in_flight.lock().await.contains_key("hold"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatch_input(
+                &runtime,
+                input(serde_json::json!({"code":"cancel","id":"hold"})),
+            ),
+        )
+        .await
+        .expect("cancel remains dispatchable with a full session queue");
+        assert!(
+            matches!(outputs.recv().await, Some(Output::CancelRequested { id, .. }) if id == "hold")
+        );
+
+        shutdown_runtime(
+            &runtime,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(executor.query_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn config_reservations_are_all_or_nothing_for_full_and_closed_queues() {
+        for closed in [false, true] {
+            let executor = Arc::new(BarrierExecutor::default());
+            let mut config = RuntimeConfig::default();
+            for session in ["a", "b"] {
+                config.sessions.insert(
+                    session.to_string(),
+                    SessionConfig {
+                        host: Some("old".to_string()),
+                        ..SessionConfig::default()
+                    },
+                );
+            }
+            let (runtime, mut outputs) = fixture(executor, config);
+            let mut first_rx = paused_worker(&runtime, "a", 2).await;
+            let mut second_rx = Some(paused_worker(&runtime, "b", 1).await);
+            let first_tx = get_session_worker(&runtime, "a").await;
+            let second_tx = get_session_worker(&runtime, "b").await;
+            if closed {
+                drop(second_rx.take());
+            } else {
+                assert!(
+                    second_tx
+                        .try_send(SessionOp::SessionInfo {
+                            id: None,
+                            session: "b".to_string()
+                        })
+                        .is_ok()
+                );
+            }
+            let before =
+                serde_json::to_value(&*runtime.app.config.read().await).expect("old config");
+            let first_capacity = first_tx.capacity();
+            dispatch_input(
+                &runtime,
+                input(serde_json::json!({
+                    "code":"config",
+                    "sessions":{"a":{"host":"new"},"b":{"host":"new"}}
+                })),
+            )
+            .await;
+            assert_queue_error(
+                outputs.recv().await.expect("config rejection"),
+                None,
+                if closed {
+                    "session worker is unavailable"
+                } else {
+                    "session worker queue is full"
+                },
+            );
+            assert_eq!(
+                serde_json::to_value(&*runtime.app.config.read().await).expect("unchanged config"),
+                before
+            );
+            assert_eq!(
+                first_tx.capacity(),
+                first_capacity,
+                "failed reservations must restore capacity"
+            );
+            assert!(matches!(
+                first_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(
+                matches!(outputs.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "a rejected patch must not emit a Config result"
+            );
+            if let Some(second_rx) = second_rx.as_mut() {
+                assert!(matches!(
+                    second_rx.try_recv(),
+                    Ok(SessionOp::SessionInfo { .. })
+                ));
+                assert!(matches!(
+                    second_rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+            shutdown_runtime(
+                &runtime,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_keeps_its_accepted_config_before_fifo_invalidation() {
+        let executor = Arc::new(BarrierExecutor::default());
+        let config = config_with_host("old");
+        let session = config.default_session.clone();
+        let (runtime, mut outputs) = fixture(executor.clone(), config);
+        dispatch_input(
+            &runtime,
+            input(serde_json::json!({"code":"query","id":"hold","sql":"select hold"})),
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            executor.started.notified(),
+        )
+        .await
+        .expect("worker barrier");
+        dispatch_input(
+            &runtime,
+            input(serde_json::json!({"code":"begin","id":"begin","read_only":true})),
+        )
+        .await;
+        dispatch_input(
+            &runtime,
+            input(
+                serde_json::json!({"code":"config","sessions":{(session.clone()):{"host":"new"}}}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            runtime.app.config.read().await.sessions[&session]
+                .host
+                .as_deref(),
+            Some("new")
+        );
+        dispatch_input(
+            &runtime,
+            input(serde_json::json!({"code":"query","id":"after","sql":"select 1"})),
+        )
+        .await;
+        executor.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match outputs.recv().await.expect("worker result") {
+                    Output::Result { id: Some(id), .. } if id == "after" => break,
+                    Output::Error { error, .. } => panic!("unexpected worker error: {error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the new query finishes after invalidation");
+        assert_eq!(
+            *executor.events.lock().await,
+            vec![
+                "query:old".to_string(),
+                "begin:old:true".to_string(),
+                format!("invalidate:{session}"),
+                "query:new".to_string(),
+            ]
+        );
+        shutdown_runtime(
+            &runtime,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_uses_one_deadline_and_reaps_an_aborted_worker() {
+        let executor = Arc::new(BarrierExecutor {
+            block_shutdown: true,
+            ..BarrierExecutor::default()
+        });
+        let (runtime, _outputs) = fixture(executor.clone(), config_with_host("old"));
+        dispatch_input(
+            &runtime,
+            input(serde_json::json!({"code":"query","id":"hold","sql":"select hold"})),
+        )
+        .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            executor.started.notified(),
+        )
+        .await
+        .expect("worker barrier");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            shutdown_runtime(
+                &runtime,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("executor shutdown shares the worker's deadline");
+        assert!(
+            executor.query_dropped.load(Ordering::SeqCst),
+            "the worker future must be dropped before shutdown returns"
+        );
+        assert!(runtime.workers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_also_cancels_an_executor_wait_without_workers() {
+        let executor = Arc::new(BarrierExecutor {
+            block_shutdown: true,
+            ..BarrierExecutor::default()
+        });
+        let (runtime, _outputs) = fixture(executor.clone(), config_with_host("old"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            shutdown_runtime(
+                &runtime,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("a client-lock wait cannot bypass the shutdown deadline");
+        assert!(executor.shutdown_started.load(Ordering::SeqCst));
+        assert!(executor.shutdown_dropped.load(Ordering::SeqCst));
+    }
 }

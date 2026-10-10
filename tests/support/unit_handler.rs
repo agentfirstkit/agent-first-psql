@@ -419,6 +419,35 @@ async fn execute_query_maps_executor_outcomes() {
 }
 
 #[tokio::test]
+async fn execute_query_reports_internal_failures_as_internal_error() {
+    let (app, mut rx) = test_app_with_executor(
+        RuntimeConfig::default(),
+        Err(ExecError::Internal("boom".to_owned())),
+    );
+    execute_query(
+        &app,
+        Some("q1".to_owned()),
+        Some("default".to_owned()),
+        "select 1".to_owned(),
+        vec![],
+        QueryOptions::default(),
+        None,
+    )
+    .await;
+    match rx.recv().await.unwrap() {
+        Output::Error {
+            error_code,
+            retryable,
+            ..
+        } => {
+            assert_eq!(error_code, crate::protocol::error_code::INTERNAL_ERROR);
+            assert!(!retryable);
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn execute_query_marks_transient_sqlstates_retryable() {
     let cfg = RuntimeConfig::default();
     // `57014` is not here: a statement the server stopped is answered as a

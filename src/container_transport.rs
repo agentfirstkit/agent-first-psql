@@ -151,22 +151,27 @@ impl ContainerBridgeGuard {
     }
 
     pub async fn shutdown(mut self, timeout: Duration) {
-        if let Some(task) = self.connection_task.take() {
-            let mut task = task;
-            if tokio::time::timeout(timeout, &mut task).await.is_err() {
-                task.abort();
-            }
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Drop must still own all tasks when an outer shutdown deadline fires.
+        if let Some(task) = self.connection_task.as_mut()
+            && tokio::time::timeout_at(deadline, &mut *task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
-        if let Some(task) = self.stderr_task.take() {
-            let mut task = task;
-            if tokio::time::timeout(timeout, &mut task).await.is_err() {
-                task.abort();
-            }
+        drop(self.connection_task.take());
+        if let Some(task) = self.stderr_task.as_mut()
+            && tokio::time::timeout_at(deadline, &mut *task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
-        if let Some(mut child) = self.child.take() {
+        drop(self.stderr_task.take());
+        if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
-            let _ = tokio::time::timeout(timeout, child.wait()).await;
+            let _ = tokio::time::timeout_at(deadline, child.wait()).await;
         }
+        drop(self.child.take());
     }
 }
 
@@ -799,13 +804,24 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
             driver.flag_family()
         ));
     };
-    if target.trim().is_empty() {
-        return Err(format!("{target_flag} requires a non-empty value"));
+    // The target is a positional in the runtime's argv (`kubectl exec` takes
+    // the pod before any `--`), and over SSH the runtime is the first word of
+    // the remote command, which `ssh` still scans for options after the
+    // destination. Neither may be shaped like an option.
+    if target.trim().is_empty() || target.trim_start().starts_with('-') {
+        return Err(format!(
+            "{target_flag} requires a non-empty value that does not start with `-`"
+        ));
+    }
+    let runtime = runtime.unwrap_or_else(|| driver.default_runtime().to_string());
+    if runtime.trim().is_empty() || runtime.trim_start().starts_with('-') {
+        return Err(format!(
+            "{} requires a non-empty value that does not start with `-`",
+            driver.flag_family().replace('*', "runtime")
+        ));
     }
     if let Some(destination) = ssh_destination.as_ref() {
-        if destination.trim().is_empty() {
-            return Err("--ssh requires a non-empty USER@HOST destination".to_string());
-        }
+        crate::ssh_transport::validate_ssh_destination(destination)?;
     } else if !cfg.ssh.options.is_empty() {
         return Err(
             "--ssh is required when --ssh-option is combined with container transport".to_string(),
@@ -816,7 +832,7 @@ fn resolve_container_settings(cfg: &SessionConfig) -> Result<ContainerSettings, 
     }
 
     Ok(ContainerSettings {
-        runtime: runtime.unwrap_or_else(|| driver.default_runtime().to_string()),
+        runtime,
         driver,
         target,
         user,
@@ -1028,6 +1044,80 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    async fn parked_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.expect("task started");
+        (task, observed)
+    }
+
+    #[tokio::test]
+    async fn cancelling_container_shutdown_aborts_owned_connection_and_stderr_tasks() {
+        let (connection, connection_dropped) = parked_task().await;
+        let (stderr, stderr_dropped) = parked_task().await;
+        let guard = ContainerBridgeGuard {
+            child: None,
+            connection_task: Some(connection),
+            stderr_task: Some(stderr),
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                guard.shutdown(Duration::from_secs(1))
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), connection_dropped)
+            .await
+            .expect("connection must not detach")
+            .expect("connection dropped");
+        tokio::time::timeout(Duration::from_secs(1), stderr_dropped)
+            .await
+            .expect("stderr must not detach")
+            .expect("stderr dropped");
+    }
+
+    #[tokio::test]
+    async fn cancelling_container_stderr_wait_keeps_its_task_owned() {
+        let (stderr, stderr_dropped) = parked_task().await;
+        let guard = ContainerBridgeGuard {
+            child: None,
+            connection_task: None,
+            stderr_task: Some(stderr),
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                guard.shutdown(Duration::from_secs(1))
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), stderr_dropped)
+            .await
+            .expect("stderr wait must not detach")
+            .expect("stderr dropped");
+    }
     use crate::types::ContainerConfig;
 
     const TEST_NONCE: &str = "deadbeefcafef00d";
@@ -1412,6 +1502,96 @@ mod tests {
         };
         let err = resolve_container_settings(&cfg);
         assert!(matches!(err, Err(message) if message.contains("--ssh is required")));
+    }
+
+    /// Every caller-supplied value that reaches `ssh` or the runtime as a
+    /// positional is refused when it is shaped like an option, before any argv
+    /// is built from it.
+    #[test]
+    fn settings_reject_option_shaped_positionals() -> Result<(), String> {
+        // Settings resolution reads the container environment fallbacks that
+        // other tests set while holding this lock.
+        let _guard = crate::test_env::env_lock();
+        let docker = |name: &str| crate::types::ContainerConfig {
+            docker_name: Some(name.to_string()),
+            ..Default::default()
+        };
+        for destination in ["-oProxyCommand=x", "  -oProxyCommand=x", "  "] {
+            let cfg = SessionConfig {
+                container: docker("pg"),
+                ssh: crate::types::SshConfig {
+                    destination: Some(destination.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_container_settings(&cfg),
+                Err(
+                    "--ssh requires a non-empty USER@HOST destination that does not start with `-`"
+                        .to_string()
+                ),
+                "destination {destination:?}"
+            );
+        }
+
+        let cfg = SessionConfig {
+            container: crate::types::ContainerConfig {
+                kubectl_pod: Some("-it".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_container_settings(&cfg),
+            Err(
+                "--container-kubectl-pod requires a non-empty value that does not start with `-`"
+                    .to_string()
+            )
+        );
+
+        let cfg = SessionConfig {
+            container: crate::types::ContainerConfig {
+                docker_runtime: Some("-oProxyCommand=x".to_string()),
+                ..docker("pg")
+            },
+            ssh: crate::types::SshConfig {
+                destination: Some("reviewer@example.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_container_settings(&cfg),
+            Err(
+                "--container-docker-runtime requires a non-empty value that does not start with `-`"
+                    .to_string()
+            )
+        );
+
+        let cfg = SessionConfig {
+            container: docker("pg"),
+            ssh: crate::types::SshConfig {
+                destination: Some("reviewer@example.test".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let settings = resolve_container_settings(&cfg)?;
+        let args = build_bridge_ssh_args(
+            &settings,
+            &ContainerTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+            },
+            "nonce",
+        )?;
+        assert_eq!(
+            args[..4],
+            ["-T", "-o", "BatchMode=yes", "reviewer@example.test"]
+        );
+        assert!(args[4].starts_with("docker exec -i -- pg "));
+        Ok(())
     }
 
     #[test]

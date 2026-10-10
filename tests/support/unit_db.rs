@@ -626,3 +626,129 @@ fn assert_duplicate_column_error(out: Result<ExecOutcome, ExecError>, column: &s
                 && message.contains("AS aliases")
     ));
 }
+
+#[cfg_attr(
+    not(feature = "db-tests"),
+    ignore = "requires PostgreSQL test database"
+)]
+#[tokio::test]
+async fn failed_explicit_transactions_block_writes_until_settled() {
+    let cfg = test_session_config(crate::test_env::required_test_dsn());
+    let exec = PostgresExecutor::new();
+    let table = format!("afpsql_lost_tx_r2_{}", std::process::id());
+    execute_command(
+        &exec,
+        &cfg,
+        "admin",
+        &format!("create table {table}(n int)"),
+    )
+    .await
+    .unwrap();
+    for (session, commit) in [("rollback_case", false), ("commit_case", true)] {
+        exec.tx_begin(session, &cfg, false).await.unwrap();
+        let opts = write_test_options();
+        let pid = match exec
+            .execute(ExecRequest {
+                session_name: session,
+                session_cfg: &cfg,
+                sql: "select pg_backend_pid()::bigint as pid",
+                params: &[],
+                opts: &opts,
+                cancel_slot: None,
+                transport_log: None,
+            })
+            .await
+            .unwrap()
+        {
+            ExecOutcome::Rows { rows, .. } => rows[0]["pid"].as_i64().unwrap(),
+            other => panic!("expected pid, got {other:?}"),
+        };
+        assert_eq!(query_i64(&exec, &cfg, "admin", &format!("select case when pg_terminate_backend({pid}) then 1::bigint else 0::bigint end as n"), "n").await.unwrap(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for n in [1, 2] {
+            assert!(matches!(
+                execute_command(
+                    &exec,
+                    &cfg,
+                    session,
+                    &format!("insert into {table} values ({n})")
+                )
+                .await,
+                Err(ExecError::InvalidRequest { .. })
+            ));
+        }
+        assert_eq!(
+            query_i64(
+                &exec,
+                &cfg,
+                "admin",
+                &format!("select count(*)::bigint as n from {table}"),
+                "n"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        if commit {
+            assert!(matches!(
+                exec.tx_commit(session, &cfg).await,
+                Err(ExecError::TransactionLostRolledBack)
+            ));
+        } else {
+            exec.tx_rollback(session, &cfg).await.unwrap();
+        }
+        execute_command(
+            &exec,
+            &cfg,
+            session,
+            &format!("insert into {table} values (3)"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_i64(
+                &exec,
+                &cfg,
+                "admin",
+                &format!("select count(*)::bigint as n from {table}"),
+                "n"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        execute_command(&exec, &cfg, "admin", &format!("delete from {table}"))
+            .await
+            .unwrap();
+    }
+    let invalid_cfg =
+        test_session_config("postgresql://test@127.0.0.1:0/test?sslmode=disable".to_owned());
+    assert!(
+        exec.tx_begin("failed_begin", &invalid_cfg, false)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        execute_command(
+            &exec,
+            &cfg,
+            "failed_begin",
+            &format!("insert into {table} values (4)")
+        )
+        .await,
+        Err(ExecError::InvalidRequest { .. })
+    ));
+    exec.tx_rollback("failed_begin", &cfg).await.unwrap();
+    execute_command(
+        &exec,
+        &cfg,
+        "failed_begin",
+        &format!("insert into {table} values (5)"),
+    )
+    .await
+    .unwrap();
+    execute_command(&exec, &cfg, "admin", &format!("drop table {table}"))
+        .await
+        .unwrap();
+    exec.shutdown().await;
+}

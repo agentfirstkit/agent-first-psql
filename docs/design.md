@@ -121,8 +121,12 @@ because it currently selects write permission by default.
 
 The ordinary readonly entrypoint is not a host sandbox. It accepts local SQL
 files, arbitrary explicitly named secret environment variables, config secret
-files, SSH options, custom container runtimes, stream redirection, skill
-management, and caller-selected direct/SSH/container targets. These capabilities
+files, stream redirection, skill management, and caller-selected
+direct/SSH/container targets. Container runtimes are
+fixed unless selected by an administrator-locked profile. Explicit SSH options
+are limited to `ConnectionAttempts`, `ConnectTimeout`, `Port`, `ProxyJump`,
+`ServerAliveCountMax`, `ServerAliveInterval`, and `TCPKeepAlive`; other SSH
+settings belong in `~/.ssh/config`. These capabilities
 can read local data or start processes even though the final database permission
 cannot leave the read family.
 
@@ -137,19 +141,22 @@ For narrower host authorization, the executable basename itself can bind a
 trusted profile: `afpsql-readonly-NAME` loads the fixed root-owned file
 `/etc/afpsql/readonly-profiles/NAME.json`. Selection is outside agent-controlled
 CLI/pipe data. The locked mode rejects connection flags and pipe session
-patches, while allowing administrator profile values to use SSH config files,
-ProxyCommand, identity paths, or custom runtimes. Root ownership, a 64 KiB size
+patches, while allowing administrator profile values to select custom runtimes.
+Explicit SSH options retain the ordinary allowlist; settings such as
+ProxyCommand and identity paths belong in `~/.ssh/config`. Root ownership, a 64 KiB size
 cap, and no group/world write bits establish the Unix trust boundary.
 
 ## Config secret source architecture
 
-Canonical and psql-compatible argument parsers translate each
-`--*-secret-config FILE` plus `--*-secret-config-path DOT_PATH` pair into a
-typed config reference. A single
-in-process resolver detects JSON, TOML, YAML, or dotenv through
-agent-first-data's document layer, reads the file once, resolves the dot-path,
-and requires a non-empty string. It never invokes a shell, expands dotenv
-variables, or writes the value into argv or the process environment.
+Canonical and psql-compatible argument parsers accept `--dsn SOURCE`,
+`--conninfo SOURCE`, and `--password SOURCE`. Each source is a literal value,
+`env:NAME`, or `file:PATH#DOT_PATH`, resolved through AFDATA's typed value-source
+model. The canonical registry validates the accepted source grammar before
+startup resolution; the psql-compatible parser uses the same source parser.
+For file sources, one in-process resolver detects JSON, TOML, YAML, dotenv, or
+INI through agent-first-data's document layer, reads the file once, resolves the
+dot-path, and requires a non-empty string. It never invokes a shell, expands
+dotenv variables, or writes the value into argv or the process environment.
 
 Parser-library errors are converted into source-safe CLI errors containing only
 the flag, file, dot-path, format, and safe line/column metadata. The resolved
@@ -182,6 +189,13 @@ Rules:
 - config changes invalidate affected sessions
 - invalidation creates a new backend session on next use
 - checked-out work must keep any required transport resources alive until it finishes
+
+Admission never waits for space in a worker queue. Configuration updates reserve
+all affected queues before installing their snapshot, and both queries and
+transaction opening carry the configuration accepted with their permission
+check. Shutdown has one deadline across worker joins and database-client locks;
+cancellation keeps connection task handles owned until cleanup and cannot
+establish the outcome of a write without its server response.
 
 This is a reliability contract. It should not be documented as a pooler or a
 performance feature.

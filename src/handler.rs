@@ -963,7 +963,7 @@ pub(crate) async fn emit_exec_error(
                 .writer
                 .send(Output::Error {
                     id: id.clone(),
-                    error_code: error_code::INVALID_REQUEST.to_string(),
+                    error_code: error_code::INTERNAL_ERROR.to_string(),
                     error: message,
                     sqlstate: None,
                     message: None,
@@ -981,7 +981,7 @@ pub(crate) async fn emit_exec_error(
                 log_event::QUERY_ERROR,
                 id.as_deref(),
                 Some(resolved_session),
-                Some(error_code::INVALID_REQUEST),
+                Some(error_code::INTERNAL_ERROR),
                 None,
                 &trace,
             )

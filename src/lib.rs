@@ -198,7 +198,6 @@ fn reject_readonly(error: &str, hint: &str) -> ! {
 mod test_env;
 
 #[cfg(test)]
-#[path = "../tests/support/unit_main.rs"]
 mod main_tests {
     use crate::limits::{MAX_PARAMS, MAX_SQL_BYTES};
     use crate::logutil::build_startup_log;

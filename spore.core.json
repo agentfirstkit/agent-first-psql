@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-psql",
   "name": "Agent-First PSQL",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default.",
@@ -13,23 +13,21 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Treat a cancel as a request rather than an outcome: a running query gets a cancel_requested acknowledgement, keeps its id, and its own terminal event still arrives, while only a query still queued — which never reached the database — is claimed atomically and reported cancelled",
-    "Stop reporting a committed write as cancelled, and decide the outcome from whether a cancel was requested for that query rather than from SQLSTATE 57014, which PostgreSQL also sends when statement_timeout expires",
-    "Stop reconnecting inside tx_commit and tx_rollback, so a dead backend no longer receives a COMMIT on a brand-new connection that PostgreSQL answers with a success tag while the original transaction is already gone",
-    "Rebuild the table, schema and indexes panels around objects instead of the schema snapshot's row shape, moving grouping, the constraint rows that only restate a column's not null, and reading estimated_rows -1 as never analyzed into a document builder; the untouched result set stays on the page behind a details block and ui_api_version is 2",
-    "Add templates/relation.html.j2 to the frontend contract, shared by the table and schema pages and includable by an override that ships no copy of it",
-    "Add --mode window|session to the five ui panels, resolved through AFUI's own delivery plan with explicit --mode over AFUI_DELIVERY over window, so a machine with no display can still open one",
-    "Refuse link before a panel does any work or its readiness event goes out, and ground the locked-profile refusal in where the data behind a panel can leave the process rather than in host capability, so both hold for every delivery a panel could gain",
-    "Stop drawing a second head inside a framed session: the monitor hides its header and sends up the live line, while a panel waiting for a decision keeps its own head because a person is being asked to answer for what that page says",
-    "Add the Apple container transport (--container-apple-name, --container-apple-user, --container-apple-runtime) and run the local container gates on it",
-    "Name the config directory when a test trusts a frontend instead of pointing a process-wide variable at it, so two tests trusting at once no longer write into each other's store and serve the built-in page under an assertion that points nowhere near the cause",
-    "Stop counting a cancel acknowledgement as an outcome in the pipe test, and assert it is acknowledged at most once",
-    "Upgrade Agent-First Data to 0.34.0 and Agent-First UI to 0.5.0"
+    "Fail a refused SSH setting instead of falling back to a direct local connection",
+    "Validate every SSH positional and reject options the SSH bridge cannot honor",
+    "Limit explicit SSH options to an allowlist and custom container runtimes to locked profiles",
+    "Keep a failed or lost transaction blocking the session until rollback",
+    "Drain streamed one-shot output while the query runs",
+    "Reject work on a full session queue instead of blocking stdin",
+    "Bound shutdown with one five-second deadline",
+    "Send a cancel once, and release a driver whose server stops answering",
+    "Never suggest rerunning a write to recover truncated RETURNING output",
+    "Upgrade to Agent-First UI 0.6.1 and Agent-First Data 0.35.0"
   ],
   "bonds": [
     {
       "relation": "depends_on",
-      "uri": "cmn://agentfirstkit.com/b3.BmXjdNCjzm7ChFXVQ6FeKzfhuSjt3HvfGRbfCepefMUR",
+      "uri": "cmn://agentfirstkit.com/b3.DfMUqiQWZqqo1YkmzSwxZuG75PLy6dRGMQmuNrSiEidg",
       "id": "agent-first-data",
       "reason": "All request/response fields use Agent-First Data suffix conventions and output formats"
     }

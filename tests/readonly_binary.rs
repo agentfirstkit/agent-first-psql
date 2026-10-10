@@ -330,6 +330,64 @@ fn readonly_pipe_rejects_unsafe_transport_config_patches() {
     assert_eq!(events.matches(r#""code":"invalid_request""#).count(), 2);
 }
 
+/// A container target on an SSH host builds its own `ssh` argv, so the
+/// destination has to be refused there too: an option-shaped destination would
+/// otherwise carry any `-o` past the read-only SSH option allowlist.
+#[test]
+fn readonly_rejects_option_shaped_ssh_destination_for_container_targets() {
+    let payload = concat!(
+        r#"{"code":"config","sessions":{"default":{"ssh":"-oProxyCommand=false","docker_name":"pg"}}}"#,
+        "\n",
+        r#"{"code":"query","id":"q","sql":"select 1"}"#,
+        "\n",
+        r#"{"code":"close"}"#,
+        "\n",
+    );
+    let mut child = Command::new(readonly())
+        .args(["--mode", "pipe", "--output-to", "stdout"])
+        .env_remove("AFPSQL_SSH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn readonly pipe");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(payload.as_bytes())
+        .expect("write input");
+    let output = child.wait_with_output().expect("wait");
+    assert!(output.status.success());
+    let rejected: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("json event"))
+        .filter(|event| event["error"]["id"] == "q")
+        .collect();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_option_shaped_destination_error(&rejected[0]);
+
+    let value = error(
+        Command::new(readonly())
+            .args(["--container-docker-name", "pg", "--sql", "select 1"])
+            .env("AFPSQL_SSH", "-oProxyCommand=false")
+            .output()
+            .expect("run readonly with an environment SSH destination"),
+    );
+    assert_option_shaped_destination_error(&value);
+}
+
+fn assert_option_shaped_destination_error(event: &Value) {
+    assert_eq!(event["kind"], "error", "{event}");
+    assert_eq!(event["error"]["code"], "connect_failed", "{event}");
+    assert_eq!(
+        event["error"]["message"],
+        "--ssh requires a non-empty USER@HOST destination that does not start with `-`",
+        "{event}"
+    );
+    assert_eq!(event["error"]["retryable"], false, "{event}");
+}
+
 #[test]
 fn readonly_dry_run_rejects_transaction_control_before_connecting() {
     let value = error(

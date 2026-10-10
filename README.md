@@ -137,9 +137,13 @@ compatibility and does not expose afpsql permission flags.
 Use `afpsql-readonly` as a client-side guard when an agent needs database reads.
 It hard-rejects write permissions, read-write pipe transactions, transaction
 control SQL, and psql translation mode while continuing to support the same
-SQL files, secret env/config sources, SSH options, container runtimes, stream
-redirection, and skill management as `afpsql`. Its name promises no PostgreSQL
-write permission; it is not a general host capability sandbox.
+SQL files, secret env/config sources, fixed container runtimes, stream
+redirection, and skill management.
+Explicit SSH options are limited to `ConnectionAttempts`, `ConnectTimeout`, `Port`, `ProxyJump`,
+`ServerAliveCountMax`, `ServerAliveInterval`, and `TCPKeepAlive`.
+Put other SSH settings in `~/.ssh/config`. Custom container runtimes require an
+administrator-locked profile. Its name promises no PostgreSQL write permission;
+it is not a general host capability sandbox.
 
 This executable is not the database authorization boundary. In adversarial
 deployments, use a dedicated PostgreSQL reader role with only the required
@@ -273,6 +277,9 @@ scoop bucket add agentfirstkit https://github.com/agentfirstkit/scoop-bucket && 
 git clone https://github.com/agentfirstkit/agent-first-psql
 cargo install --path agent-first-psql
 ```
+
+Prebuilt archives are also available from
+[GitHub Releases](https://github.com/agentfirstkit/agent-first-psql/releases).
 
 Then install the embedded [Agent Skill](skills/agent-first-psql/SKILL.md) so the agent
 follows afpsql's behavior rules. `skill install` targets Codex, Claude Code,

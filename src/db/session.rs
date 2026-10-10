@@ -25,8 +25,9 @@ pub struct CancelState {
 
 pub(super) struct SessionEntry {
     pub(super) client: Mutex<Option<SessionClient>>,
-    /// True while an explicit `BEGIN` is open on this session's connection
-    /// (set by `begin`, cleared by `commit`/`rollback`). When set, the
+    /// 0 means idle, 1 read-write, 2 read-only, and 3 failed/lost.
+    /// A failed transaction blocks queries until commit/rollback settles it.
+    /// While an explicit `BEGIN` is open on this session's connection, the
     /// executor bypasses its implicit `BEGIN..COMMIT` wrap and runs queries
     /// directly on the open transaction.
     pub(super) explicit_tx: AtomicU8,
@@ -42,6 +43,18 @@ pub(super) struct SessionClient {
 
 pub(super) struct TransportSelection {
     pub(super) duration_ms: u64,
+}
+
+struct ConnectionDriverGuard {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ConnectionDriverGuard {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl Drop for SessionClient {
@@ -65,16 +78,14 @@ pub fn new_cancel_slot() -> CancelSlot {
 pub async fn cancel_query(slot: &CancelSlot) -> Result<bool, String> {
     slot.cancelled.store(true, Ordering::SeqCst);
     let token = slot.token.lock().await.clone();
-    let token_attempted = token.is_some();
     let token_error = match token {
         Some(token) => {
             let tls =
                 make_supported_tls().map_err(|e| format!("create TLS connector failed: {e}"))?;
-            token
-                .cancel_query(tls)
-                .await
-                .err()
-                .map(|e| format!("server-side cancel failed: {e}"))
+            match token.cancel_query(tls).await {
+                Ok(()) => return Ok(true),
+                Err(error) => Some(format!("server-side cancel failed: {error}")),
+            }
         }
         None => None,
     };
@@ -91,14 +102,16 @@ pub async fn cancel_query(slot: &CancelSlot) -> Result<bool, String> {
         return Err(token_error);
     }
 
-    if token_attempted {
-        return Ok(true);
-    }
-
     backend_cancel
 }
 
 impl CancelState {
+    #[cfg(test)]
+    pub(crate) async fn set_fallback_context_for_test(&self, cfg: SessionConfig) {
+        *self.backend_pid.lock().await = Some(1);
+        *self.session_cfg.lock().await = Some(cfg);
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -141,6 +154,14 @@ pub(super) fn new_session_map() -> SessionMap {
 impl SessionEntry {
     pub(super) fn explicit_tx_active(&self) -> bool {
         self.explicit_tx.load(Ordering::SeqCst) != 0
+    }
+
+    pub(super) fn explicit_tx_failed(&self) -> bool {
+        self.explicit_tx.load(Ordering::SeqCst) == 3
+    }
+
+    pub(super) fn fail_explicit_tx(&self) {
+        self.explicit_tx.store(3, Ordering::SeqCst);
     }
 
     pub(super) fn explicit_tx_read_only(&self) -> Option<bool> {
@@ -233,7 +254,12 @@ pub(super) async fn connect_session(
     }
 
     let pg_cfg = resolve_pg_config(cfg).map_err(ExecError::from)?;
-    if crate::ssh_transport::needs_stdio_bridge(cfg) {
+    // A refused SSH setting ends the connection attempt here. Falling through
+    // to the direct connect below would reach whatever answers on the local
+    // host and port instead of the endpoint the caller named behind SSH.
+    let needs_ssh_bridge = crate::ssh_transport::needs_stdio_bridge(cfg)
+        .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
+    if needs_ssh_bridge {
         let (client, bridge) = crate::ssh_transport::connect_stdio_bridge(cfg, &pg_cfg)
             .await
             .map_err(|e| ExecError::Connect(Box::new(ConnectError::from(e))))?;
@@ -258,16 +284,18 @@ pub(super) async fn connect_session(
         ))))
     })?;
     let (client, connection) = pg_cfg.connect(tls).await.map_err(map_connect_error)?;
-    let connection_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let mut connection_driver = ConnectionDriverGuard {
+        task: Some(tokio::spawn(async move {
+            let _ = connection.await;
+        })),
+    };
     let backend_pid = fetch_backend_pid(&client).await?;
 
     Ok((
         SessionClient {
             client: Some(client),
             backend_pid,
-            connection_task: Some(connection_task),
+            connection_task: connection_driver.task.take(),
             ssh_bridge: None,
             container_bridge: None,
         },
@@ -386,7 +414,7 @@ async fn cancel_backend_from_slot(slot: &CancelSlot) -> Result<bool, String> {
 
     let client = connect_session(&session_cfg)
         .await
-        .map_err(|e| format!("pg_cancel_backend connect failed: {e:?}"))?;
+        .map_err(|e| format!("pg_cancel_backend connect failed: {e}"))?;
     let result = async {
         let Some(pg_client) = client.0.client.as_ref() else {
             return Err("pg_cancel_backend connection unavailable".to_string());
@@ -428,20 +456,176 @@ impl SessionClient {
         // Let tokio-postgres send Terminate; aborting the driver leaves the
         // backend visible until TCP cleanup notices the dead client.
         drop(self.client.take());
-        if let Some(task) = self.connection_task.take() {
-            let mut task = task;
-            if tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut task)
+        // Keep the handle in `self` until it has settled: an outer shutdown
+        // deadline can cancel this future while it is awaiting the driver, and
+        // Drop must still be able to abort that driver.
+        if let Some(task) = self.connection_task.as_mut()
+            && tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut *task)
                 .await
                 .is_err()
-            {
-                task.abort();
-            }
+        {
+            task.abort();
+            let _joined = task.await;
         }
+        drop(self.connection_task.take());
         if let Some(bridge) = self.ssh_bridge.take() {
             bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
         }
         if let Some(bridge) = self.container_bridge.take() {
             bridge.shutdown(SESSION_SHUTDOWN_TIMEOUT).await;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_successful_cancel_token_does_not_open_a_fallback_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            let length = initial.read_u32().await.unwrap();
+            let mut startup = vec![0; (length - 4) as usize];
+            initial.read_exact(&mut startup).await.unwrap();
+            initial
+                .write_all(&[
+                    b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2, b'Z',
+                    0, 0, 0, 5, b'I',
+                ])
+                .await
+                .unwrap();
+            let (mut cancel, _) = listener.accept().await.unwrap();
+            assert_eq!(cancel.read_u32().await.unwrap(), 16);
+            assert_eq!(cancel.read_u32().await.unwrap(), 80_877_102);
+            assert_eq!(cancel.read_u32().await.unwrap(), 1);
+            assert_eq!(cancel.read_u32().await.unwrap(), 2);
+            drop(cancel);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "successful token cancellation must not open a second cancel connection"
+            );
+        });
+        let (client, connection) = tokio_postgres::connect(
+            &format!("postgresql://test@{address}/test?sslmode=disable"),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .unwrap();
+        let driver = tokio::spawn(connection);
+        let slot = new_cancel_slot();
+        *slot.token.lock().await = Some(client.cancel_token());
+        *slot.backend_pid.lock().await = Some(1);
+        *slot.session_cfg.lock().await = Some(SessionConfig {
+            dsn_secret: Some(format!("postgresql://test@{address}/test?sslmode=disable")),
+            ..Default::default()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), cancel_query(&slot))
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        peer.await.unwrap();
+        drop(client);
+        driver.abort();
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_direct_connection_setup_closes_its_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind PostgreSQL fixture");
+        let address = listener.local_addr().expect("PostgreSQL fixture address");
+        let (query_tx, query_rx) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let length = stream.read_u32().await.expect("startup length");
+            let mut startup = vec![0; (length - 4) as usize];
+            stream
+                .read_exact(&mut startup)
+                .await
+                .expect("startup payload");
+            // Authenticate and become ready, then leave the first backend-pid
+            // query unanswered. Dropping Client alone cannot finish the driver
+            // while its pending protocol response never arrives.
+            stream
+                .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                .await
+                .expect("PostgreSQL startup response");
+            stream.read_u8().await.expect("first query message");
+            query_tx.send(()).expect("query started");
+            let mut bytes = [0; 1024];
+            loop {
+                match stream.read(&mut bytes).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        let cfg = SessionConfig {
+            dsn_secret: Some(format!("postgresql://test@{address}/test?sslmode=disable")),
+            ..Default::default()
+        };
+        {
+            let connecting = connect_session(&cfg);
+            tokio::pin!(connecting);
+            tokio::select! {
+                result = &mut connecting => panic!("setup finished before cancellation: {:?}", result.err()),
+                result = query_rx => result.expect("backend-pid query started"),
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer)
+            .await
+            .expect("cancelled setup drops the driver's socket")
+            .expect("peer task completed");
+    }
+
+    struct DriverDropped(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DriverDropped {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _sent = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_session_shutdown_aborts_its_connection_driver() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            let _dropped = DriverDropped(Some(dropped_tx));
+            let _started = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("driver started");
+        let client = SessionClient {
+            client: None,
+            backend_pid: 0,
+            connection_task: Some(driver),
+            ssh_bridge: None,
+            container_bridge: None,
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), client.shutdown(),)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("the driver is aborted when outer shutdown is cancelled")
+            .expect("driver drop notification");
     }
 }

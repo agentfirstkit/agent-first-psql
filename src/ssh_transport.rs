@@ -167,19 +167,25 @@ impl SshBridgeGuard {
     }
 
     pub async fn shutdown(mut self, timeout: Duration) {
-        if let Some(task) = self.connection_task.take() {
-            let mut task = task;
-            if tokio::time::timeout(timeout, &mut task).await.is_err() {
-                task.abort();
-            }
-        }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(timeout, child.wait()).await;
-        }
-        if let Some(task) = self.stderr_task.take() {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Retain ownership across every await so cancellation still runs Drop.
+        if let Some(task) = self.connection_task.as_mut()
+            && tokio::time::timeout_at(deadline, &mut *task).await.is_err()
+        {
             task.abort();
+            let _ = task.await;
         }
+        drop(self.connection_task.take());
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+        }
+        drop(self.child.take());
+        if let Some(task) = self.stderr_task.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(self.stderr_task.take());
     }
 }
 
@@ -239,8 +245,45 @@ struct SshSettings {
     sudo_user: Option<String>,
 }
 
-pub fn needs_stdio_bridge(cfg: &SessionConfig) -> bool {
-    resolve_ssh_settings(cfg).ok().flatten().is_some()
+/// Whether this session connects through the SSH stdio bridge.
+///
+/// Invalid SSH settings are an error, never `false`: answering "no bridge" for
+/// a destination that was refused would send the caller's query straight to
+/// the PostgreSQL host named for the far side of the tunnel.
+pub fn needs_stdio_bridge(cfg: &SessionConfig) -> Result<bool, String> {
+    Ok(resolve_ssh_settings(cfg)?.is_some())
+}
+
+/// Whether a caller-supplied value may sit in `ssh` argv as a positional.
+///
+/// `ssh` reads any argument that starts with `-` as an option wherever it
+/// appears, so a destination or hop of that shape is not a host at all.
+fn is_ssh_host_argument(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.starts_with('-')
+}
+
+/// The one check every path that hands a destination to `ssh` goes through.
+pub(crate) fn validate_ssh_destination(destination: &str) -> Result<(), String> {
+    if is_ssh_host_argument(destination) {
+        Ok(())
+    } else {
+        Err(
+            "--ssh requires a non-empty USER@HOST destination that does not start with `-`"
+                .to_string(),
+        )
+    }
+}
+
+fn validate_ssh_via(via: &[String]) -> Result<(), String> {
+    if via.iter().all(|hop| is_ssh_host_argument(hop)) {
+        Ok(())
+    } else {
+        Err(
+            "--ssh-via requires non-empty USER@HOST hop values that do not start with `-`"
+                .to_string(),
+        )
+    }
 }
 
 pub async fn connect_stdio_bridge(
@@ -251,6 +294,7 @@ pub async fn connect_stdio_bridge(
         return Err("--ssh is required for SSH stdio bridge mode".to_string());
     };
     let endpoint = resolve_single_postgres_endpoint(pg_cfg, "SSH transport")?;
+    validate_stdio_bridge_config(pg_cfg)?;
     let target = bridge_target(&settings, &endpoint)?;
     let command = remote_stream_bridge_command(&settings, &target);
     let args = build_bridge_ssh_args(&settings, &command);
@@ -323,6 +367,41 @@ pub async fn connect_stdio_bridge(
     ))
 }
 
+// The bridge carries the PostgreSQL protocol over `ssh` stdio, so the socket
+// the driver would have configured never exists locally. Options that only take
+// effect on that socket cannot be honored here, and honoring them silently as
+// no-ops is the failure mode this crate refuses elsewhere: reject them instead,
+// naming the option so the caller knows which one to drop.
+fn validate_stdio_bridge_config(pg_cfg: &Config) -> Result<(), String> {
+    let defaults = Config::new();
+    let unsupported = if pg_cfg.get_connect_timeout().is_some() {
+        Some("connect_timeout")
+    } else if pg_cfg.get_tcp_user_timeout().is_some() {
+        Some("tcp_user_timeout")
+    } else if pg_cfg.get_keepalives() != defaults.get_keepalives() {
+        Some("keepalives")
+    } else if pg_cfg.get_target_session_attrs() != defaults.get_target_session_attrs() {
+        Some("target_session_attrs")
+    } else if pg_cfg.get_load_balance_hosts() != defaults.get_load_balance_hosts() {
+        Some("load_balance_hosts")
+    } else if pg_cfg.get_keepalives_idle() != defaults.get_keepalives_idle() {
+        Some("keepalives_idle")
+    } else if pg_cfg.get_keepalives_interval().is_some() {
+        Some("keepalives_interval")
+    } else if pg_cfg.get_keepalives_retries().is_some() {
+        Some("keepalives_retries")
+    } else {
+        None
+    };
+
+    match unsupported {
+        Some(option) => Err(format!(
+            "SSH stdio bridge does not support PostgreSQL connection option `{option}`"
+        )),
+        None => Ok(()),
+    }
+}
+
 enum BridgeTarget {
     Tcp { host: String, port: u16 },
     UnixSocket { paths: Vec<String> },
@@ -381,20 +460,14 @@ fn resolve_ssh_settings(cfg: &SessionConfig) -> Result<Option<SshSettings>, Stri
         }
         return Ok(None);
     };
-    if destination.trim().is_empty() {
-        return Err("--ssh requires a non-empty USER@HOST destination".to_string());
-    }
+    validate_ssh_destination(&destination)?;
+    validate_ssh_via(&cfg.ssh.via)?;
     let via = cfg
         .ssh
         .via
         .iter()
-        .map(|hop| hop.trim())
-        .filter(|hop| !hop.is_empty())
-        .map(std::string::ToString::to_string)
+        .map(|hop| hop.trim().to_string())
         .collect::<Vec<_>>();
-    if !cfg.ssh.via.is_empty() && via.len() != cfg.ssh.via.len() {
-        return Err("--ssh-via requires non-empty USER@HOST hop values".to_string());
-    }
     if cfg.ssh.local_host.is_some() || cfg.ssh.local_port.is_some() {
         return Err(
             "--ssh-local-host and --ssh-local-port were removed; SSH now uses a stdio bridge without a local listening port"
@@ -594,6 +667,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssh_destinations_and_hops_cannot_be_options() {
+        for destination in ["-oProxyCommand=x", "  -oProxyCommand=x", "  "] {
+            let mut cfg = SessionConfig::default();
+            cfg.ssh.destination = Some(destination.to_owned());
+            assert!(resolve_ssh_settings(&cfg).is_err());
+            // The refusal must reach the caller: `Ok(false)` here is what
+            // selects a direct connection.
+            assert_eq!(
+                needs_stdio_bridge(&cfg),
+                Err(
+                    "--ssh requires a non-empty USER@HOST destination that does not start with `-`"
+                        .to_owned()
+                )
+            );
+        }
+        for hop in ["-oProxyCommand=x", "  -oProxyCommand=x", "  "] {
+            let mut cfg = SessionConfig::default();
+            cfg.ssh.destination = Some("reviewer@example.test".to_owned());
+            cfg.ssh.via = vec![hop.to_owned()];
+            assert_eq!(
+                needs_stdio_bridge(&cfg),
+                Err(
+                    "--ssh-via requires non-empty USER@HOST hop values that do not start with `-`"
+                        .to_owned()
+                )
+            );
+        }
+        let mut cfg = SessionConfig::default();
+        cfg.ssh.destination = Some("reviewer@example.test".to_owned());
+        cfg.ssh.via = vec!["reviewer@jump.example.test".to_owned()];
+        assert!(resolve_ssh_settings(&cfg).unwrap().is_some());
+        assert_eq!(needs_stdio_bridge(&cfg), Ok(true));
+        assert_eq!(needs_stdio_bridge(&SessionConfig::default()), Ok(false));
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    async fn parked_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped));
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.expect("task started");
+        (task, observed)
+    }
+
+    #[tokio::test]
+    async fn cancelling_ssh_shutdown_aborts_owned_connection_and_stderr_tasks() {
+        let (connection, connection_dropped) = parked_task().await;
+        let (stderr, stderr_dropped) = parked_task().await;
+        let guard = SshBridgeGuard {
+            child: None,
+            connection_task: Some(connection),
+            stderr_task: Some(stderr),
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                guard.shutdown(Duration::from_secs(1))
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), connection_dropped)
+            .await
+            .expect("connection must not detach")
+            .expect("connection dropped");
+        tokio::time::timeout(Duration::from_secs(1), stderr_dropped)
+            .await
+            .expect("stderr must not detach")
+            .expect("stderr dropped");
+    }
+
+    #[test]
     fn bridge_args_use_sudo_noninteractive_python_socket_bridge() {
         let settings = SshSettings {
             destination: "user@example.com".to_string(),
@@ -640,6 +801,28 @@ mod tests {
         assert!(remote.contains("ubuntu@db.internal"));
         assert!(remote.contains("python3 -c"));
         assert!(remote.contains("tcp localhost 5432"));
+    }
+
+    #[test]
+    fn stdio_bridge_rejects_unimplemented_connection_options() -> Result<(), String> {
+        let pg_cfg: Config = "postgresql://app@db/service?connect_timeout=7"
+            .parse()
+            .map_err(|e| format!("test DSN must parse: {e}"))?;
+
+        let Err(err) = validate_stdio_bridge_config(&pg_cfg) else {
+            return Err("connect_timeout must be rejected in stdio bridge mode".to_string());
+        };
+        assert!(err.contains("connect_timeout"));
+        Ok(())
+    }
+
+    #[test]
+    fn stdio_bridge_accepts_a_config_without_socket_only_options() -> Result<(), String> {
+        let pg_cfg: Config = "postgresql://app@db/service"
+            .parse()
+            .map_err(|e| format!("test DSN must parse: {e}"))?;
+
+        validate_stdio_bridge_config(&pg_cfg)
     }
 
     #[test]

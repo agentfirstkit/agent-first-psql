@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-psql"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 default-run = "afpsql"
 description = "A PostgreSQL interface for AI agents: reliable, structured, explicit, and read-only by default."
@@ -26,13 +26,13 @@ name = "afpsql-readonly"
 path = "src/readonly_main.rs"
 
 [dependencies]
-agent-first-data = { version = "0.34.0", default-features = false, features = ["cli", "skill-admin", "stream-redirect", "yaml", "toml", "dotenv", "ini"] }
+agent-first-data = { version = "0.35.0", default-features = false, features = ["cli", "skill-admin", "stream-redirect", "yaml", "toml", "dotenv", "ini"] }
 # `session`: every panel is a window over a served AFUI session, with the
 # frontend overlay and its script guard underneath it. `page` is the other,
 # orthogonal tier: turning a frontend's files into a rendered page — the
 # MiniJinja policy, the render, the rendered-markup guard, the runtime-marker
 # and required-element checks. Both are wanted here; neither implies the other.
-agent-first-ui = { version = "0.5.0", default-features = false, optional = true }
+agent-first-ui = { version = "0.6.1", default-features = false, optional = true }
 async-trait = "0.1"
 axum = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["full"] }
 # What a consumer's tests need to arrange the world AFUI reads from: a frontend
 # on disk and trusted, with AFUI computing the fingerprint through the same
 # code it trusts against rather than this suite keeping a copy of it.
-agent-first-ui = { version = "0.5.0", default-features = false, features = ["test-support"] }
+agent-first-ui = { version = "0.6.1", default-features = false, features = ["test-support"] }
 
 [lints.clippy]
 unwrap_used = "deny"

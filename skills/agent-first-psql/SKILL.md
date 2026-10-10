@@ -59,9 +59,13 @@ matches exactly one registered shape.
   see them.
 - When only reads are needed, prefer `afpsql-readonly` as a narrow client guard.
   It hard-rejects PostgreSQL write permissions, read-write pipe transactions,
-  transaction-control SQL, and psql translation. It still permits SQL/config
-  files, arbitrary explicit secret-env names, SSH options, custom container
-  runtimes, redirects, and skill management; it is not a host sandbox.
+  transaction-control SQL, and psql translation. It permits SQL/config files,
+  arbitrary explicit secret-env names, fixed container runtimes, redirects,
+  and skill management. Explicit SSH options are limited to `ConnectionAttempts`,
+  `ConnectTimeout`, `Port`, `ProxyJump`, `ServerAliveCountMax`,
+  `ServerAliveInterval`, and `TCPKeepAlive`; put other settings in
+  `~/.ssh/config`. Custom runtimes require an administrator-locked profile.
+  It is not a host sandbox.
 - For adversarial isolation, pair `afpsql-readonly` with a dedicated PostgreSQL
   reader role. A host wildcard still authorizes caller-selected database and
   SSH/container targets, network connections, every row that role can read,
@@ -285,8 +289,12 @@ If a `kind:"result"` event carries `result.truncated:true`, the underlying
 statement still ran in full, but `result.rows` is only a prefix
 (see `result.truncated_at_rows` / `result.truncated_at_bytes`). For `UPDATE ...
 RETURNING` this means the writes happened; only the RETURNING projection
-was capped. Either narrow the query (`WHERE` / `LIMIT`) or rerun with
-`--stream-rows` to receive the full set in batches.
+was capped. Read-only queries can be narrowed (`WHERE` / `LIMIT`) or rerun
+with `--stream-rows` to receive the full set in batches. Never rerun a
+successful write merely to recover its truncated RETURNING output. If the
+complete write result is needed, use `--stream-rows` on the first invocation;
+after truncation, use a separate `SELECT` with stable business keys to inspect
+the current rows, without assuming it can reconstruct old RETURNING values.
 
 ## Multi-Statement Atomicity (Pipe Mode)
 
@@ -294,7 +302,7 @@ Each `query` is its own transaction by default. For atomic multi-statement
 work, open an explicit transaction:
 
 ```
-{"code":"begin","id":"b","permission":"write"}
+{"code":"begin","id":"b","permission":"write","read_only":false}
 {"code":"query","id":"q1","sql":"insert into orders ...","options":{"permission":"write"}}
 {"code":"query","id":"q2","sql":"update inventory ...","options":{"permission":"write"}}
 {"code":"commit","id":"c"}
@@ -305,7 +313,13 @@ work, open an explicit transaction:
 - A failed query inside an explicit tx is wrapped in a savepoint and
   rolled back individually — the outer tx is NOT aborted, so the agent
   can retry or move on. Send `rollback` to discard everything since
-  `begin`, or `commit` to persist what worked.
+  `begin`, or `commit` to persist what worked. Check every statement's terminal
+  result; a successful `commit` does not mean every earlier query succeeded.
+- If `begin` fails or the transaction's connection is lost, the session
+  stays in a failed transaction: every query gets `invalid_request` and a
+  new `begin` gets "already in an explicit transaction". Send `rollback`
+  first, then `begin` again. Wait for the `begin` result before sending the
+  transaction's writes.
 - `begin` with `read_only:true` opens `BEGIN READ ONLY` and needs no
   write permission; `read_only` defaults to `true`. Read-write `begin`
   requires explicit `read_only:false` and the matching write permission for

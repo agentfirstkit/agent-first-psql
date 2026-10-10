@@ -50,9 +50,10 @@ a general local-process sandbox.
 | `--mode psql`, `psql status/install/uninstall` | `invalid_request`; use `afpsql psql ...` |
 | `skill status/install/uninstall` | allowed on the ordinary entrypoint |
 | `--stdout-file`, `--stderr-file`, local `--sql-file` | allowed on the ordinary entrypoint |
-| arbitrary explicit `--*-secret-env NAME` | allowed on the ordinary entrypoint |
-| `--*-secret-config FILE --*-secret-config-path DOT_PATH` | allowed on the ordinary entrypoint |
-| SSH options and custom container runtime | allowed on the ordinary entrypoint |
+| `--dsn env:NAME`, `--conninfo env:NAME`, `--password env:NAME` | allowed on the ordinary entrypoint |
+| `--dsn file:PATH#DOT_PATH`, `--conninfo file:PATH#DOT_PATH`, `--password file:PATH#DOT_PATH` | allowed on the ordinary entrypoint |
+| explicit SSH options | only `ConnectionAttempts`, `ConnectTimeout`, `Port`, `ProxyJump`, `ServerAliveCountMax`, `ServerAliveInterval`, `TCPKeepAlive`; other settings belong in `~/.ssh/config` |
+| custom container runtime | `invalid_request` on the ordinary entrypoint; administrator-locked profiles may select one |
 | transaction control sent as query SQL | `invalid_request`; use typed pipe transaction requests |
 
 Every readonly rejection is a structured error event with
@@ -107,7 +108,9 @@ than 64 KiB, and not writable by group or others. For example:
 
 The file uses the flat session fields documented for pipe config. Because this
 is administrator-controlled configuration, it may contain custom container
-runtimes or SSH options such as `IdentityFile`/`ProxyCommand`. A locked profile executable
+runtimes. Explicit SSH options retain the same allowlist as the ordinary
+entrypoint; put settings such as `IdentityFile`/`ProxyCommand` in `~/.ssh/config`.
+A locked profile executable
 rejects all connection/transport flags and all pipe `sessions` patches before
 they can replace the profile.
 
@@ -296,6 +299,12 @@ and supported TLS settings when connecting through the bridge. The source must
 resolve to one PostgreSQL host and port; multi-host failover lists return a
 structured non-retryable connection error.
 
+Options that act on a socket the driver never opens are rejected by name rather
+than accepted as no-ops: `connect_timeout`, `tcp_user_timeout`, `keepalives`,
+`keepalives_idle`, `keepalives_interval`, `keepalives_retries`,
+`target_session_attrs`, and `load_balance_hosts` fail with an error naming the
+option that has to be dropped.
+
 The bridge is carried over the `ssh` child process's stdin/stdout, so afpsql
 opens no local listening port and no other process on the workstation can reach
 the connection. In exchange, the host running the bridge needs `sh` plus one of
@@ -362,6 +371,12 @@ Health check.
 
 Graceful shutdown.
 
+EOF and `close` share a five-second budget for draining all session workers and
+closing database clients. Work still waiting at that deadline is cancelled
+locally. The `close` acknowledgement does not confirm an unfinished write or
+prove a transaction rolled back; verify an operation without its terminal
+result before retrying it.
+
 ```json
 {"code":"close"}
 ```
@@ -422,6 +437,24 @@ PostgreSQL, including when a query supplies a write permission.
 Tx control runs through the same session FIFO as `query`, so the order an
 agent writes events to stdin is the order PostgreSQL sees them.
 
+A `begin` that fails, or an explicit transaction whose connection is lost,
+leaves the session in a failed transaction state rather than back in
+autocommit: every `query` on that session is rejected with `invalid_request`
+without reaching PostgreSQL, and another `begin` is rejected as already in an
+explicit transaction. Send `rollback` to settle it (a `commit` settles it too,
+reporting the transaction as rolled back); the session then accepts `begin`
+and queries again. A caller that queues a transaction's statements ahead of
+their responses should wait for the successful `begin` result before sending
+the write statements.
+
+Each session worker queue has 64 slots. A full queue rejects a new query or
+control operation immediately with a retryable `invalid_request`, so stdin can
+still accept cancellation and shutdown. A configuration patch reserves room
+for every affected session's invalidation before changing any configuration;
+if one queue cannot accept it, the entire patch is rejected. An accepted
+`begin` keeps the endpoint and transport configuration used for its permission
+check, even if a later patch changes that session before it executes.
+
 ## Output
 
 Every output line is an Agent-First Data envelope: a top-level `kind` with the
@@ -467,7 +500,12 @@ Small result returned inline.
 When `truncated: true`, the underlying SQL still executed in full. For
 `UPDATE ... RETURNING`, this means the writes happened and the RETURNING
 projection delivered to the agent is the first N rows. To collect the
-full result, narrow the query with `WHERE` or switch to `--stream-rows`.
+full result of a read-only query, narrow it with `WHERE` or rerun with
+`--stream-rows`. Never rerun a successful write just to recover truncated
+RETURNING output. Choose `--stream-rows` before the first write when its full
+result is needed; after truncation, use a separate `SELECT` with stable
+business keys to inspect the current rows. That SELECT cannot necessarily
+reconstruct old RETURNING values.
 
 Bounded row results are produced through a CTE/JSON wrapper. PostgreSQL does
 not guarantee that an outer read preserves ordering established only inside
@@ -568,6 +606,8 @@ Canonical `error.code` values:
 - `connect_failed`
 - `cancelled`
 - `internal_error`
+- `transaction_lost_rolled_back`
+- `commit_outcome_unknown`
 
 `internal_error` means the failure is `afpsql`'s own, not the request's and not
 PostgreSQL's; the hint asks the caller to retry and then restart the session.

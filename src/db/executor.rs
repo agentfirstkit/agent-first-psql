@@ -189,6 +189,9 @@ impl DbExecutor for PostgresExecutor {
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
+        if session.explicit_tx_failed() {
+            return Err(failed_transaction_error());
+        }
         let explicit_tx_read_only = session.explicit_tx_read_only();
         if explicit_tx_read_only == Some(false) && req.opts.read_only {
             return Err(ExecError::InvalidRequest {
@@ -202,6 +205,11 @@ impl DbExecutor for PostgresExecutor {
             });
         }
         let mut client_guard = session.client.lock().await;
+        if explicit_tx_read_only.is_some() && live_client(&mut client_guard).is_none() {
+            *client_guard = None;
+            session.fail_explicit_tx();
+            return Err(failed_transaction_error());
+        }
         let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
         emit_transport_selected(&req, transport).await?;
         let Some(client) = client_guard.as_mut() else {
@@ -231,8 +239,9 @@ impl DbExecutor for PostgresExecutor {
         };
         if should_drop_connection(&result) {
             *client_guard = None;
-            // Connection dropped means the in-PG explicit tx is also gone.
-            session.set_explicit_tx(None);
+            if explicit_tx_read_only.is_some() {
+                session.fail_explicit_tx();
+            }
         }
         result
     }
@@ -243,6 +252,9 @@ impl DbExecutor for PostgresExecutor {
         sink: &mut (dyn RowSink + Send),
     ) -> Result<StreamOutcome, ExecError> {
         let session = get_session(&self.sessions, req.session_name).await;
+        if session.explicit_tx_failed() {
+            return Err(failed_transaction_error());
+        }
         let explicit_tx_read_only = session.explicit_tx_read_only();
         if explicit_tx_read_only == Some(false) && req.opts.read_only {
             return Err(ExecError::InvalidRequest {
@@ -256,6 +268,11 @@ impl DbExecutor for PostgresExecutor {
             });
         }
         let mut client_guard = session.client.lock().await;
+        if explicit_tx_read_only.is_some() && live_client(&mut client_guard).is_none() {
+            *client_guard = None;
+            session.fail_explicit_tx();
+            return Err(failed_transaction_error());
+        }
         let transport = ensure_connected(&mut client_guard, req.session_cfg).await?;
         emit_transport_selected(&req, transport).await?;
         let Some(client) = client_guard.as_mut() else {
@@ -285,7 +302,9 @@ impl DbExecutor for PostgresExecutor {
         };
         if should_drop_connection(&result) {
             *client_guard = None;
-            session.set_explicit_tx(None);
+            if explicit_tx_read_only.is_some() {
+                session.fail_explicit_tx();
+            }
         }
         result
     }
@@ -303,6 +322,9 @@ impl DbExecutor for PostgresExecutor {
                     .to_string(),
             ));
         }
+        // Mark the attempted transaction before fallible connection/BEGIN work.
+        // Any failure must keep queued queries out of implicit auto-commit.
+        session.fail_explicit_tx();
         let mut client_guard = session.client.lock().await;
         ensure_connected(&mut client_guard, session_cfg).await?;
         let Some(client) = client_guard.as_mut() else {
@@ -340,6 +362,11 @@ impl DbExecutor for PostgresExecutor {
             ));
         }
         let mut client_guard = session.client.lock().await;
+        if session.explicit_tx_failed() {
+            *client_guard = None;
+            session.set_explicit_tx(None);
+            return Err(ExecError::TransactionLostRolledBack);
+        }
         // Deliberately not `ensure_connected`. A transaction lives on one
         // backend, and reconnecting would send `COMMIT` down a connection that
         // never saw the `BEGIN` — where PostgreSQL answers with a warning and a
@@ -381,6 +408,11 @@ impl DbExecutor for PostgresExecutor {
             ));
         }
         let mut client_guard = session.client.lock().await;
+        if session.explicit_tx_failed() {
+            *client_guard = None;
+            session.set_explicit_tx(None);
+            return Ok(());
+        }
         // Same reasoning as `tx_commit`, with a kinder ending: a lost backend
         // has already rolled this transaction back, which is what the caller
         // asked for, so there is nothing left to do and nothing to report as a
@@ -426,6 +458,15 @@ impl DbExecutor for PostgresExecutor {
 
     async fn shutdown(&self) {
         shutdown_all_sessions(&self.sessions).await;
+    }
+}
+
+fn failed_transaction_error() -> ExecError {
+    ExecError::InvalidRequest {
+        message:
+            "the explicit transaction failed or was lost; queued queries cannot run outside it"
+                .to_owned(),
+        hint: Some("send rollback before issuing further queries".to_owned()),
     }
 }
 
@@ -1095,6 +1136,21 @@ mod tests {
             inline_max_rows: 100,
             inline_max_bytes: 1 << 20,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiting_for_a_session_client_lock_is_cancellable() {
+        let executor = PostgresExecutor::new();
+        let entry = get_session(&executor.sessions, "default").await;
+        let held = entry.client.lock().await;
+        let stopped =
+            tokio::time::timeout(std::time::Duration::from_millis(20), executor.shutdown()).await;
+        assert!(
+            stopped.is_err(),
+            "the fixture holds the client lock past its deadline"
+        );
+        assert!(executor.sessions.read().await.is_empty());
+        drop(held);
     }
 
     #[test]

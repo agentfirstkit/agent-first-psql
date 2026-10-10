@@ -93,9 +93,10 @@ jobs:
 
       # Run the release gate itself, not a hand-written command list: Step 0 of
       # the release is `projects.sh test agent-first-psql all`, so anything that
-      # can fail a release fails here first. `all` covers static, integration
-      # against the service container, the container e2e, and the release smoke.
-      - name: Release gate
+      # can fail a release fails here first. `all` covers static, minimal builds
+      # and CLI discovery, integration against the service container, the
+      # container e2e, and the release smoke.
+      - name: Default and minimal release gate
         run: ./scripts/test.sh all
 
       - name: PostgreSQL smoke

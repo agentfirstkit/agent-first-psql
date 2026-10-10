@@ -25,19 +25,27 @@ fn bin() -> PathBuf {
     not(feature = "db-tests"),
     ignore = "requires PostgreSQL test database"
 )]
-#[test]
-fn stream_rows_keeps_the_whole_result_stream_on_stdout() {
+#[tokio::test]
+async fn stream_rows_keeps_the_whole_result_stream_on_stdout() {
+    use tokio::process::Command;
     // A streamed query is an ordered event stream: the row batches carry the
     // payload the caller captures, so they must not land on the diagnostic
     // stream while only the terminator reaches stdout.
-    let out = Command::new(bin())
-        .arg("--dsn")
-        .arg(test_dsn())
-        .arg("--stream-rows")
-        .arg("--sql")
-        .arg("select generate_series(1,3) as n")
-        .output()
-        .expect("run afpsql stream-rows");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        Command::new(bin())
+            .kill_on_drop(true)
+            .arg("--dsn")
+            .arg(test_dsn())
+            .arg("--stream-rows")
+            .args(["--batch-rows", "1"])
+            .arg("--sql")
+            .arg("select generate_series(1,5000) as n")
+            .output(),
+    )
+    .await
+    .expect("streaming must drain beyond the output channel capacity")
+    .expect("run afpsql stream-rows");
     assert!(out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).trim().is_empty(),
@@ -64,7 +72,8 @@ fn stream_rows_keeps_the_whole_result_stream_on_stdout() {
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 3, "row batches missing from stdout: {text}");
+    assert_eq!(rows.len(), 5000, "row batches missing from stdout: {text}");
+    assert_eq!(events.last().unwrap()["trace"]["row_count"], 5000);
 
     // Exactly one terminal event, and it comes last.
     let terminal = events
@@ -420,6 +429,51 @@ fn pipe_rejects_duplicate_active_query_id() {
         })
     );
     assert!(text.contains("duplicate active query id"));
+}
+
+/// A refused `--ssh` destination ends the attempt. It must not degrade into a
+/// direct connection to the host and port that were meant for the far side of
+/// the SSH hop — here a local listener that records whether anything arrived.
+#[test]
+fn a_refused_ssh_destination_never_falls_back_to_a_direct_connection() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("local listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(connection);
+        }
+    });
+
+    for destination in ["-oProxyCommand=false", "  "] {
+        let output = Command::new(bin())
+            .arg(format!("--ssh={destination}"))
+            .args(["--host", "127.0.0.1", "--port", &port.to_string()])
+            .args(["--user", "reviewer", "--dbname", "reviewer"])
+            .args(["--sql", "select 1"])
+            .env_remove("AFPSQL_SSH")
+            .output()
+            .expect("run afpsql");
+        assert!(!output.status.success(), "destination {destination:?}");
+        let event: Value = serde_json::from_slice(&output.stderr).expect("error event on stderr");
+        assert_eq!(event["error"]["code"], "connect_failed", "{event}");
+        assert_eq!(
+            event["error"]["message"],
+            "--ssh requires a non-empty USER@HOST destination that does not start with `-`",
+            "{event}"
+        );
+        assert_eq!(event["error"]["retryable"], false, "{event}");
+    }
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        0,
+        "a refused SSH destination reached the direct endpoint"
+    );
 }
 
 #[test]
