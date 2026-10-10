@@ -1996,13 +1996,24 @@ fn pipe_cancel_race_and_long_query() {
     assert!(text.contains("\"code\":\"close\""));
     // The CAS guarantees exactly one *outcome* event for qrace (either
     // `result`/`sql_error` if the handler won the race, or
-    // `error_code:cancelled` if the cancel dispatcher won). The second
-    // cancel request gets a separate "no matching in-flight query"
-    // acknowledgement, which is dispatch-level — not a query outcome.
-    let outcomes_for_qrace = text
+    // `error_code:cancelled` if the cancel dispatcher won). A cancel that
+    // finds the query running is acknowledged with `cancel_requested`, once
+    // per cancel request and depending on timing; that acknowledgement is
+    // dispatch-level, not a query outcome.
+    let events_for_qrace: Vec<Value> = text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|v| v["result"]["id"] == "qrace" || v["error"]["id"] == "qrace")
+        .collect();
+    let is_ack = |v: &Value| v["kind"] == "result" && v["result"]["code"] == "cancel_requested";
+    let acks_for_qrace = events_for_qrace.iter().filter(|v| is_ack(v)).count();
+    assert!(
+        acks_for_qrace <= 2,
+        "expected at most one acknowledgement per cancel, got {acks_for_qrace}; output: {text}"
+    );
+    let outcomes_for_qrace = events_for_qrace
+        .iter()
+        .filter(|v| !is_ack(v))
         .filter(|v| {
             v["kind"] == "result"
                 || (v["kind"] == "error"
